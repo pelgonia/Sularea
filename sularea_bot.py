@@ -29,7 +29,7 @@ async def answer(
     content: str | None = None,
     *,
     embed: discord.Embed | None = None,
-    ephemeral: bool = True,
+    ephemeral: bool = False,
 ) -> None:
     if interaction.response.is_done():
         await interaction.followup.send(content, embed=embed, ephemeral=ephemeral)
@@ -185,6 +185,7 @@ async def inventario(interaction: discord.Interaction) -> None:
     rows = await bot.db.list_badges(guild.id)
     owned = [row for row in rows if guild.get_role(row["badge_role_id"]) in member.roles]
     embed = discord.Embed(title=f"Insignias de {member.display_name}", color=0x8B5CF6)
+    embed.set_thumbnail(url=member.display_avatar.url)
     if owned:
         embed.description = "\n".join(
             f"• **{row['name']}** (<@&{row['color_role_id']}>)"
@@ -262,7 +263,9 @@ async def insignias(
 async def tienda(interaction: discord.Interaction) -> None:
     assert interaction.guild_id is not None
     rows = await bot.db.list_badges(interaction.guild_id, purchasable_only=True)
-    embed = discord.Embed(title="Tienda de insignias", color=0xF59E0B)
+    embed = discord.Embed(title="Mercado de Sularea", color=0xF59E0B)
+    if interaction.guild is not None and interaction.guild.icon is not None:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
     if rows:
         embed.description = "\n".join(
             f"• **{row['name']}** (<@&{row['color_role_id']}>) — "
