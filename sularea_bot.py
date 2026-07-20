@@ -187,8 +187,14 @@ async def insignias(interaction: discord.Interaction) -> None:
     embed = discord.Embed(title=f"Insignias de {member.display_name}", color=0x8B5CF6)
     if owned:
         embed.description = "\n".join(f"• **{row['name']}**" for row in owned)[:4000]
+        embed.set_footer(
+            text="Usa /usar para activar una insignia y /quitar para quitar el rol de color."
+        )
     else:
-        embed.description = "Todavía no tienes insignias configuradas."
+        embed.description = (
+            "No tienes insignias activas. Puedes comprar una en **/tienda** "
+            "y consultar tus monedas con **/balance**."
+        )
 
     if member.guild_permissions.administrator:
         details = []
