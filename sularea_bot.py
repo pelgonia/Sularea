@@ -175,9 +175,9 @@ async def quitar(interaction: discord.Interaction) -> None:
     await answer(interaction, "Quité tu rol de color. Tus insignias siguen intactas.")
 
 
-@bot.tree.command(name="insignias", description="Muestra tus insignias disponibles.")
+@bot.tree.command(name="inventario", description="Muestra tus insignias disponibles.")
 @app_commands.guild_only()
-async def insignias(interaction: discord.Interaction) -> None:
+async def inventario(interaction: discord.Interaction) -> None:
     member = guild_member(interaction)
     guild = interaction.guild
     if member is None or guild is None:
@@ -186,7 +186,10 @@ async def insignias(interaction: discord.Interaction) -> None:
     owned = [row for row in rows if guild.get_role(row["badge_role_id"]) in member.roles]
     embed = discord.Embed(title=f"Insignias de {member.display_name}", color=0x8B5CF6)
     if owned:
-        embed.description = "\n".join(f"• **{row['name']}**" for row in owned)[:4000]
+        embed.description = "\n".join(
+            f"• **{row['name']}** (<@&{row['color_role_id']}>)"
+            for row in owned
+        )[:4000]
         embed.set_footer(
             text="Usa /usar para activar una insignia y /quitar para quitar el rol de color."
         )
@@ -195,20 +198,62 @@ async def insignias(interaction: discord.Interaction) -> None:
             "No tienes insignias activas. Puedes comprar una en **/tienda** "
             "y consultar tus monedas con **/balance**."
         )
+    await answer(interaction, embed=embed)
 
-    if member.guild_permissions.administrator:
+
+@bot.tree.command(name="insignias", description="Consulta insignias y configuraciones del servidor.")
+@app_commands.describe(miembro="Miembro que quieres consultar (opcional)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def insignias(
+    interaction: discord.Interaction,
+    miembro: discord.Member | None = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    rows = await bot.db.list_badges(guild.id)
+
+    if miembro is not None:
+        owned = [
+            row
+            for row in rows
+            if guild.get_role(row["badge_role_id"]) in miembro.roles
+        ]
+        embed = discord.Embed(
+            title=f"Insignias de {miembro.display_name}",
+            color=0x3B82F6,
+        )
+        if owned:
+            embed.description = "\n".join(
+                f"• **{row['name']}** — <@&{row['badge_role_id']}> "
+                f"(color: <@&{row['color_role_id']}>)"
+                for row in owned
+            )[:4000]
+        else:
+            embed.description = f"{miembro.mention} no tiene insignias."
+        await answer(interaction, embed=embed)
+        return
+
+    embed = discord.Embed(title="Configuración de insignias", color=0x3B82F6)
+    if rows:
         details = []
         for row in rows:
-            sale = f"Sí, {money(row['price'])} monedas" if row["purchasable"] else "No"
-            details.append(
-                f"**{row['name']}** · insignia <@&{row['badge_role_id']}> · "
-                f"color <@&{row['color_role_id']}> · comprable: {sale}"
+            sale = (
+                f"Sí — {money(row['price'])} monedas"
+                if row["purchasable"]
+                else "No"
             )
-        embed.add_field(
-            name="Configuración para administradores",
-            value=("\n".join(details)[:1024] if details else "No hay insignias configuradas."),
-            inline=False,
-        )
+            details.append(
+                f"• **{row['name']}**\n"
+                f"  Insignia: <@&{row['badge_role_id']}> · "
+                f"Color: <@&{row['color_role_id']}> · Comprable: {sale}"
+            )
+        embed.description = "\n".join(details)[:4000]
+    else:
+        embed.description = "No hay insignias configuradas en este servidor."
+    embed.set_footer(text="Usa /insignias miembro para consultar a un jugador.")
     await answer(interaction, embed=embed)
 
 
