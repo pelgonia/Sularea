@@ -21,7 +21,8 @@ def normalize_name(value: str) -> str:
 
 
 def money(value: int) -> str:
-    return f"{value:,}".replace(",", ".")
+    formatted = f"{value:,}".replace(",", ".")
+    return f"🪙 {formatted}"
 
 
 async def answer(
@@ -102,17 +103,35 @@ async def badge_autocomplete(
     ][:25]
 
 
+async def owned_badge_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    member = guild_member(interaction)
+    if interaction.guild_id is None or member is None or not hasattr(bot, "db"):
+        return []
+    rows = await bot.db.list_badges(interaction.guild_id)
+    owned_role_ids = {role.id for role in member.roles}
+    search = normalize_name(current)
+    return [
+        app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
+        for row in rows
+        if row["badge_role_id"] in owned_role_ids and search in row["name_key"]
+    ][:25]
+
+
 async def shop_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
     rows = await bot.db.list_badges(interaction.guild_id, purchasable_only=True)
+    member = guild_member(interaction)
+    owned_role_ids = {role.id for role in member.roles} if member is not None else set()
     search = normalize_name(current)
     return [
         app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
         for row in rows
-        if search in row["name_key"]
+        if row["badge_role_id"] not in owned_role_ids and search in row["name_key"]
     ][:25]
 
 
@@ -135,7 +154,7 @@ async def say(interaction: discord.Interaction, mensaje: str) -> None:
 
 @bot.tree.command(name="usar", description="Activa el color de una insignia que posees.")
 @app_commands.describe(insignia="Nombre de la insignia que quieres usar")
-@app_commands.autocomplete(insignia=badge_autocomplete)
+@app_commands.autocomplete(insignia=owned_badge_autocomplete)
 @app_commands.guild_only()
 async def usar(interaction: discord.Interaction, insignia: str) -> None:
     member = guild_member(interaction)
