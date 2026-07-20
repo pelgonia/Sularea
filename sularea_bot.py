@@ -147,9 +147,17 @@ async def on_ready() -> None:
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def say(interaction: discord.Interaction, mensaje: str) -> None:
-    await interaction.response.send_message(
-        mensaje, allowed_mentions=discord.AllowedMentions.none()
+    await interaction.response.defer(ephemeral=True)
+    if interaction.channel is None:
+        await interaction.edit_original_response(
+            content="No pude encontrar el canal donde enviar el mensaje."
+        )
+        return
+    await interaction.channel.send(
+        mensaje,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
+    await interaction.delete_original_response()
 
 
 @bot.tree.command(name="usar", description="Activa el color de una insignia que posees.")
