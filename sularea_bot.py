@@ -330,6 +330,23 @@ async def balance(interaction: discord.Interaction) -> None:
     await answer(interaction, f"Tu balance es **{money(value)} monedas**.")
 
 
+@bot.tree.command(name="revisarbalance", description="Consulta el balance de un miembro.")
+@app_commands.describe(miembro="Miembro cuyo balance quieres consultar")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def revisarbalance(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+) -> None:
+    assert interaction.guild_id is not None
+    value = await bot.db.get_balance(interaction.guild_id, miembro.id)
+    await answer(
+        interaction,
+        f"El balance de {miembro.mention} es **{money(value)} monedas**.",
+    )
+
+
 @bot.tree.command(name="añadirbalance", description="Añade monedas a un miembro.")
 @app_commands.describe(miembro="Miembro que recibirá las monedas", cantidad="Cantidad a añadir")
 @app_commands.guild_only()
