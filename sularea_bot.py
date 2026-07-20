@@ -41,7 +41,9 @@ class SulareaBot(commands.Bot):
     db: Database
 
     def __init__(self) -> None:
-        super().__init__(command_prefix="!", intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        intents.members = True
+        super().__init__(command_prefix="!", intents=intents)
         self.purchase_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
     async def setup_hook(self) -> None:
@@ -70,6 +72,14 @@ def guild_member(interaction: discord.Interaction) -> discord.Member | None:
 
 def role_can_be_managed(role: discord.Role) -> bool:
     return not role.is_default() and not role.managed and role.is_assignable()
+
+
+def members_from_target(
+    target: discord.Member | discord.Role,
+) -> list[discord.Member]:
+    if isinstance(target, discord.Member):
+        return [target]
+    return list(target.members)
 
 
 async def find_badge(interaction: discord.Interaction, name: str):
@@ -347,53 +357,123 @@ async def revisarbalance(
     )
 
 
-@bot.tree.command(name="añadirbalance", description="Añade monedas a un miembro.")
-@app_commands.describe(miembro="Miembro que recibirá las monedas", cantidad="Cantidad a añadir")
+@bot.tree.command(name="añadirbalance", description="Añade monedas a un miembro o rol completo.")
+@app_commands.describe(
+    objetivo="Miembro o rol que recibirá las monedas",
+    cantidad="Cantidad a añadir",
+)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def añadirbalance(
     interaction: discord.Interaction,
-    miembro: discord.Member,
+    objetivo: discord.Member | discord.Role,
     cantidad: app_commands.Range[int, 1, MAX_MONEY],
 ) -> None:
     assert interaction.guild_id is not None
-    value = await bot.db.add_balance(interaction.guild_id, miembro.id, cantidad)
-    await answer(interaction, f"Añadiste **{money(cantidad)}** a {miembro.mention}. Balance: **{money(value)}**.")
+    members = members_from_target(objetivo)
+    if not members:
+        await answer(interaction, f"El rol {objetivo.mention} no tiene miembros.")
+        return
+    await interaction.response.defer()
+    affected = await bot.db.add_balance_many(
+        interaction.guild_id,
+        [member.id for member in members],
+        cantidad,
+    )
+    if isinstance(objetivo, discord.Member):
+        value = await bot.db.get_balance(interaction.guild_id, objetivo.id)
+        await answer(
+            interaction,
+            f"Añadiste **{money(cantidad)}** monedas a {objetivo.mention}. "
+            f"Nuevo balance: **{money(value)}**. Se aplicó a **1 miembro**.",
+        )
+        return
+    await answer(
+        interaction,
+        f"Añadiste **{money(cantidad)}** monedas a **{affected} miembros** "
+        f"con el rol {objetivo.mention}.",
+    )
 
 
-@bot.tree.command(name="quitarbalance", description="Quita monedas a un miembro.")
-@app_commands.describe(miembro="Miembro al que se quitarán monedas", cantidad="Cantidad a quitar")
+@bot.tree.command(name="quitarbalance", description="Quita monedas a un miembro o rol completo.")
+@app_commands.describe(
+    objetivo="Miembro o rol al que se quitarán monedas",
+    cantidad="Cantidad a quitar",
+)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def quitarbalance(
     interaction: discord.Interaction,
-    miembro: discord.Member,
+    objetivo: discord.Member | discord.Role,
     cantidad: app_commands.Range[int, 1, MAX_MONEY],
 ) -> None:
     assert interaction.guild_id is not None
-    value = await bot.db.remove_balance(interaction.guild_id, miembro.id, cantidad)
-    if value is None:
-        current = await bot.db.get_balance(interaction.guild_id, miembro.id)
-        await answer(interaction, f"{miembro.mention} solo tiene **{money(current)}** monedas.")
+    members = members_from_target(objetivo)
+    if not members:
+        await answer(interaction, f"El rol {objetivo.mention} no tiene miembros.")
         return
-    await answer(interaction, f"Quitaste **{money(cantidad)}** a {miembro.mention}. Balance: **{money(value)}**.")
+    await interaction.response.defer()
+    affected = await bot.db.remove_balance_many(
+        interaction.guild_id,
+        [member.id for member in members],
+        cantidad,
+    )
+    if isinstance(objetivo, discord.Member):
+        current = await bot.db.get_balance(interaction.guild_id, objetivo.id)
+        if affected == 0:
+            await answer(
+                interaction,
+                f"{objetivo.mention} no tiene suficiente dinero. "
+                f"Su balance es **{money(current)}**.",
+            )
+            return
+        await answer(
+            interaction,
+            f"Quitaste **{money(cantidad)}** monedas a {objetivo.mention}. "
+            f"Nuevo balance: **{money(current)}**. Se aplicó a **1 miembro**.",
+        )
+        return
+    skipped = len(members) - affected
+    message = (
+        f"Quitaste **{money(cantidad)}** monedas a **{affected} de "
+        f"{len(members)} miembros** con el rol {objetivo.mention}."
+    )
+    if skipped:
+        message += f" Se omitieron **{skipped}** porque no tenían saldo suficiente."
+    await answer(interaction, message)
 
 
-@bot.tree.command(name="setbalance", description="Establece el balance exacto de un miembro.")
-@app_commands.describe(miembro="Miembro cuyo balance cambiará", cantidad="Nuevo balance")
+@bot.tree.command(name="setbalance", description="Establece el balance de un miembro o rol completo.")
+@app_commands.describe(
+    objetivo="Miembro o rol cuyo balance cambiará",
+    cantidad="Nuevo balance",
+)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def setbalance(
     interaction: discord.Interaction,
-    miembro: discord.Member,
+    objetivo: discord.Member | discord.Role,
     cantidad: app_commands.Range[int, 0, MAX_MONEY],
 ) -> None:
     assert interaction.guild_id is not None
-    await bot.db.set_balance(interaction.guild_id, miembro.id, cantidad)
-    await answer(interaction, f"El balance de {miembro.mention} ahora es **{money(cantidad)}**.")
+    members = members_from_target(objetivo)
+    if not members:
+        await answer(interaction, f"El rol {objetivo.mention} no tiene miembros.")
+        return
+    await interaction.response.defer()
+    affected = await bot.db.set_balance_many(
+        interaction.guild_id,
+        [member.id for member in members],
+        cantidad,
+    )
+    await answer(
+        interaction,
+        f"Establecí el balance de {objetivo.mention} en **{money(cantidad)} monedas**. "
+        f"Se aplicó a **{affected} {'miembro' if affected == 1 else 'miembros'}**.",
+    )
 
 
 @bot.tree.command(name="darinsignia", description="Entrega una insignia a un miembro.")
