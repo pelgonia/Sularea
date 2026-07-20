@@ -220,7 +220,9 @@ async def tienda(interaction: discord.Interaction) -> None:
     embed = discord.Embed(title="Tienda de insignias", color=0xF59E0B)
     if rows:
         embed.description = "\n".join(
-            f"• **{row['name']}** — {money(row['price'])} monedas" for row in rows
+            f"• **{row['name']}** (<@&{row['color_role_id']}>) — "
+            f"{money(row['price'])} monedas"
+            for row in rows
         )[:4000]
         embed.set_footer(text="Usa /comprar para obtener una insignia.")
     else:
