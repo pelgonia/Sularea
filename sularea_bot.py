@@ -155,7 +155,7 @@ async def say(interaction: discord.Interaction, mensaje: str) -> None:
         return
     await interaction.channel.send(
         mensaje,
-        allowed_mentions=discord.AllowedMentions.none(),
+        allowed_mentions=discord.AllowedMentions.all(),
     )
     await interaction.delete_original_response()
 
