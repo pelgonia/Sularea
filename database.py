@@ -78,6 +78,28 @@ class Database:
             amount,
         )
 
+    async def add_balance_many(
+        self,
+        guild_id: int,
+        user_ids: list[int],
+        amount: int,
+    ) -> int:
+        if not user_ids:
+            return 0
+        await self._pool().execute(
+            """
+            INSERT INTO balances (guild_id, user_id, balance)
+            SELECT $1, user_id, $3
+            FROM UNNEST($2::BIGINT[]) AS users(user_id)
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET balance = balances.balance + EXCLUDED.balance
+            """,
+            guild_id,
+            user_ids,
+            amount,
+        )
+        return len(user_ids)
+
     async def remove_balance(
         self,
         guild_id: int,
@@ -115,6 +137,28 @@ class Database:
     ) -> int | None:
         return await self.remove_balance(guild_id, user_id, amount)
 
+    async def remove_balance_many(
+        self,
+        guild_id: int,
+        user_ids: list[int],
+        amount: int,
+    ) -> int:
+        if not user_ids:
+            return 0
+        result = await self._pool().execute(
+            """
+            UPDATE balances
+            SET balance = balance - $3
+            WHERE guild_id = $1
+              AND user_id = ANY($2::BIGINT[])
+              AND balance >= $3
+            """,
+            guild_id,
+            user_ids,
+            amount,
+        )
+        return int(result.rsplit(" ", 1)[-1])
+
     async def set_balance(self, guild_id: int, user_id: int, amount: int) -> int:
         return await self._pool().fetchval(
             """
@@ -128,6 +172,28 @@ class Database:
             user_id,
             amount,
         )
+
+    async def set_balance_many(
+        self,
+        guild_id: int,
+        user_ids: list[int],
+        amount: int,
+    ) -> int:
+        if not user_ids:
+            return 0
+        await self._pool().execute(
+            """
+            INSERT INTO balances (guild_id, user_id, balance)
+            SELECT $1, user_id, $3
+            FROM UNNEST($2::BIGINT[]) AS users(user_id)
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET balance = EXCLUDED.balance
+            """,
+            guild_id,
+            user_ids,
+            amount,
+        )
+        return len(user_ids)
 
     async def get_badge(self, guild_id: int, name_key: str):
         return await self._pool().fetchrow(
