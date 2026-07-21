@@ -1,7 +1,10 @@
 import asyncio
+import io
+import json
 import os
 import traceback
 import unicodedata
+from datetime import datetime, timezone
 
 import asyncpg
 import discord
@@ -83,6 +86,243 @@ def members_from_target(
     return list(target.members)
 
 
+async def send_audit_log(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    *,
+    color: int = 0x5865F2,
+) -> None:
+    settings = await bot.db.get_log_settings(guild.id)
+    if not settings or not settings["logs_enabled"] or not settings["log_channel_id"]:
+        return
+    channel = guild.get_channel(settings["log_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Servidor: {guild.name}")
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        traceback.print_exc()
+
+
+async def apply_balance_change(
+    guild: discord.Guild,
+    members: list[discord.Member],
+    target_mention: str,
+    action: str,
+    amount: int,
+    actor: discord.Member | discord.User,
+) -> str:
+    user_ids = [member.id for member in members]
+    if action == "add":
+        await bot.db.add_balance_many(guild.id, user_ids, amount)
+        affected_ids = user_ids
+        movement_action = "balance_add"
+        movement_amount = amount
+        verb = "Añadió"
+        history_text = f"Un administrador añadió {money(amount)} monedas."
+    elif action == "remove":
+        affected_ids = await bot.db.remove_balance_many(guild.id, user_ids, amount)
+        movement_action = "balance_remove"
+        movement_amount = -amount
+        verb = "Quitó"
+        history_text = f"Un administrador quitó {money(amount)} monedas."
+    else:
+        await bot.db.set_balance_many(guild.id, user_ids, amount)
+        affected_ids = user_ids
+        movement_action = "balance_set"
+        movement_amount = amount
+        verb = "Estableció"
+        history_text = f"Un administrador estableció el balance en {money(amount)} monedas."
+
+    await bot.db.record_movements(
+        guild.id,
+        affected_ids,
+        actor.id,
+        movement_action,
+        movement_amount,
+        history_text,
+    )
+    affected = len(affected_ids)
+    skipped = len(members) - affected
+
+    if len(members) == 1:
+        current_balance = await bot.db.get_balance(guild.id, members[0].id)
+        if action == "remove" and affected == 0:
+            result = (
+                f"{members[0].mention} no tiene saldo suficiente. "
+                f"Su balance es **{money(current_balance)} monedas**."
+            )
+        elif action == "set":
+            result = (
+                f"El balance de {members[0].mention} ahora es "
+                f"**{money(current_balance)} monedas**. Se aplicó a **1 miembro**."
+            )
+        else:
+            action_result = "Añadiste" if action == "add" else "Quitaste"
+            result = (
+                f"{action_result} **{money(amount)} monedas** a {members[0].mention}. "
+                f"Nuevo balance: **{money(current_balance)} monedas**."
+            )
+    elif action == "set":
+        result = (
+            f"Establecí el balance de {target_mention} en **{money(amount)} monedas**. "
+            f"Se aplicó a **{affected} {'miembro' if affected == 1 else 'miembros'}**."
+        )
+    else:
+        result = (
+            f"{verb} **{money(amount)} monedas** a **{affected} de "
+            f"{len(members)} {'miembro' if len(members) == 1 else 'miembros'}** "
+            f"de {target_mention}."
+        )
+        if skipped:
+            result += f" Se omitieron **{skipped}** por saldo insuficiente."
+
+    await send_audit_log(
+        guild,
+        "Movimiento de balance",
+        f"**Administrador:** {actor.mention}\n"
+        f"**Objetivo:** {target_mention}\n"
+        f"**Acción:** {verb} {money(amount)} monedas\n"
+        f"**Aplicado a:** {affected} miembros"
+        + (f"\n**Omitidos:** {skipped}" if skipped else ""),
+        color=0x22C55E if action == "add" else 0xEF4444 if action == "remove" else 0x3B82F6,
+    )
+    return result
+
+
+class MassBalanceConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        author_id: int,
+        guild: discord.Guild,
+        role: discord.Role,
+        action: str,
+        amount: int,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.guild = guild
+        self.role = role
+        self.action = action
+        self.amount = amount
+        self.message: discord.InteractionMessage | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Solo el administrador que inició esta operación puede confirmarla.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(content="La confirmación expiró sin realizar cambios.", view=self)
+            except discord.HTTPException:
+                pass
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        await answer(interaction, "Ocurrió un error al aplicar la operación masiva.")
+
+    @discord.ui.button(label="Confirmar", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Aplicando cambios...", view=self)
+        members = list(self.role.members)
+        result = await apply_balance_change(
+            self.guild,
+            members,
+            self.role.mention,
+            self.action,
+            self.amount,
+            interaction.user,
+        )
+        await interaction.edit_original_response(content=result, view=self)
+        self.stop()
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.danger, emoji="✖️")
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="Operación cancelada. No se modificó ningún balance.",
+            view=self,
+        )
+        self.stop()
+
+
+async def handle_balance_command(
+    interaction: discord.Interaction,
+    target: discord.Member | discord.Role,
+    amount: int,
+    action: str,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    members = members_from_target(target)
+    if not members:
+        await answer(interaction, f"El rol {target.mention} no tiene miembros.")
+        return
+    if isinstance(target, discord.Role):
+        action_text = {
+            "add": "añadir",
+            "remove": "quitar",
+            "set": "establecer",
+        }[action]
+        view = MassBalanceConfirmView(
+            interaction.user.id,
+            guild,
+            target,
+            action,
+            amount,
+        )
+        await interaction.response.send_message(
+            f"⚠️ Vas a **{action_text} {money(amount)} monedas** para "
+            f"**{len(members)} miembros** con el rol {target.mention}. ¿Confirmar?",
+            view=view,
+        )
+        view.message = await interaction.original_response()
+        return
+    await interaction.response.defer()
+    result = await apply_balance_change(
+        guild,
+        members,
+        target.mention,
+        action,
+        amount,
+        interaction.user,
+    )
+    await answer(interaction, result)
+
+
 async def find_badge(interaction: discord.Interaction, name: str):
     if interaction.guild_id is None:
         return None
@@ -135,6 +375,74 @@ async def shop_autocomplete(
     ][:25]
 
 
+async def process_purchase(
+    interaction: discord.Interaction,
+    badge_name: str,
+) -> None:
+    member = guild_member(interaction)
+    guild = interaction.guild
+    badge = await find_badge(interaction, badge_name)
+    if member is None or guild is None or badge is None or not badge["purchasable"]:
+        await answer(interaction, "Esa insignia no está disponible en la tienda.")
+        return
+    role = guild.get_role(badge["badge_role_id"])
+    if role is None:
+        await answer(interaction, "El rol de esa insignia ya no existe.")
+        return
+    if role in member.roles:
+        await answer(interaction, "Ya tienes esa insignia.")
+        return
+    if not role_can_be_managed(role):
+        await answer(
+            interaction,
+            "No puedo entregar esa insignia. Coloca su rol debajo del rol del bot.",
+        )
+        return
+
+    await interaction.response.defer()
+    lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
+    async with lock:
+        if role in member.roles:
+            await answer(interaction, "Ya tienes esa insignia.")
+            return
+        new_balance = await bot.db.spend_balance(guild.id, member.id, badge["price"])
+        if new_balance is None:
+            current = await bot.db.get_balance(guild.id, member.id)
+            await answer(
+                interaction,
+                f"No tienes suficiente dinero. Tienes **{money(current)} monedas**.",
+            )
+            return
+        try:
+            await member.add_roles(role, reason=f"Compra: {badge['name']}")
+        except Exception:
+            await bot.db.add_balance(guild.id, member.id, badge["price"])
+            raise
+
+    await bot.db.record_movement(
+        guild.id,
+        member.id,
+        member.id,
+        "purchase",
+        -badge["price"],
+        f"Compró la insignia {badge['name']} por {money(badge['price'])} monedas.",
+    )
+    await send_audit_log(
+        guild,
+        "Compra en el Mercado de Sularea",
+        f"{member.mention} compró **{badge['name']}** (<@&{badge['color_role_id']}>) "
+        f"por **{money(badge['price'])} monedas**.\n"
+        f"**Nuevo balance:** {money(new_balance)} monedas",
+        color=0xF59E0B,
+    )
+    await answer(
+        interaction,
+        f"{member.mention} compró **{badge['name']}** por "
+        f"**{money(badge['price'])} monedas**. Su nuevo balance es "
+        f"**{money(new_balance)} monedas**.",
+    )
+
+
 @bot.event
 async def on_ready() -> None:
     if bot.user:
@@ -157,6 +465,14 @@ async def say(interaction: discord.Interaction, mensaje: str) -> None:
         mensaje,
         allowed_mentions=discord.AllowedMentions.all(),
     )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Mensaje enviado con /say",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Canal:** {interaction.channel.mention}\n"
+            f"**Mensaje:** {mensaje[:1000]}",
+        )
     await interaction.delete_original_response()
 
 
@@ -183,6 +499,7 @@ async def usar(interaction: discord.Interaction, insignia: str) -> None:
         await answer(interaction, "No puedo asignar ese color. Coloca su rol debajo del rol del bot.")
         return
 
+    await interaction.response.defer()
     rows = await bot.db.list_badges(guild.id)
     color_ids = {row["color_role_id"] for row in rows}
     old_colors = [
@@ -193,6 +510,12 @@ async def usar(interaction: discord.Interaction, insignia: str) -> None:
         await member.remove_roles(*old_colors, reason="Cambio de color de insignia")
     if color_role not in member.roles:
         await member.add_roles(color_role, reason=f"Insignia activada: {badge['name']}")
+    await send_audit_log(
+        guild,
+        "Color de insignia activado",
+        f"{member.mention} activó **{badge['name']}** ({color_role.mention}).",
+        color=0x8B5CF6,
+    )
     await answer(interaction, f"Activaste el color de **{badge['name']}**.")
 
 
@@ -208,7 +531,16 @@ async def quitar(interaction: discord.Interaction) -> None:
     if not roles:
         await answer(interaction, "No tienes ningún rol de color activo.")
         return
+    await interaction.response.defer()
     await member.remove_roles(*roles, reason="El usuario quitó su color")
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Rol de color retirado",
+            f"{member.mention} retiró sus roles de color: "
+            + ", ".join(role.mention for role in roles),
+            color=0x6B7280,
+        )
     await answer(interaction, "Quité tu rol de color. Tus insignias siguen intactas.")
 
 
@@ -298,10 +630,10 @@ async def insignias(
 @bot.tree.command(name="tienda", description="Muestra las insignias disponibles para comprar.")
 @app_commands.guild_only()
 async def tienda(interaction: discord.Interaction) -> None:
-    assert interaction.guild_id is not None
+    assert interaction.guild_id is not None and interaction.guild is not None
     rows = await bot.db.list_badges(interaction.guild_id, purchasable_only=True)
     embed = discord.Embed(title="Mercado de Sularea", color=0xF59E0B)
-    if interaction.guild is not None and interaction.guild.icon is not None:
+    if interaction.guild.icon is not None:
         embed.set_thumbnail(url=interaction.guild.icon.url)
     if rows:
         embed.description = "\n".join(
@@ -320,43 +652,7 @@ async def tienda(interaction: discord.Interaction) -> None:
 @app_commands.autocomplete(insignia=shop_autocomplete)
 @app_commands.guild_only()
 async def comprar(interaction: discord.Interaction, insignia: str) -> None:
-    member = guild_member(interaction)
-    guild = interaction.guild
-    badge = await find_badge(interaction, insignia)
-    if member is None or guild is None or badge is None or not badge["purchasable"]:
-        await answer(interaction, "Esa insignia no está disponible en la tienda.")
-        return
-    role = guild.get_role(badge["badge_role_id"])
-    if role is None:
-        await answer(interaction, "El rol de esa insignia ya no existe.")
-        return
-    if role in member.roles:
-        await answer(interaction, "Ya tienes esa insignia.")
-        return
-    if not role_can_be_managed(role):
-        await answer(interaction, "No puedo entregar esa insignia. Coloca su rol debajo del rol del bot.")
-        return
-
-    lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
-    async with lock:
-        if role in member.roles:
-            await answer(interaction, "Ya tienes esa insignia.")
-            return
-        new_balance = await bot.db.spend_balance(guild.id, member.id, badge["price"])
-        if new_balance is None:
-            current = await bot.db.get_balance(guild.id, member.id)
-            await answer(interaction, f"No tienes suficiente dinero. Tienes **{money(current)}**.")
-            return
-        try:
-            await member.add_roles(role, reason=f"Compra: {badge['name']}")
-        except Exception:
-            await bot.db.add_balance(guild.id, member.id, badge["price"])
-            raise
-    await answer(
-        interaction,
-        f"Compraste **{badge['name']}** por **{money(badge['price'])}** monedas. "
-        f"Tu nuevo balance es **{money(new_balance)}**.",
-    )
+    await process_purchase(interaction, insignia)
 
 
 @bot.tree.command(name="balance", description="Muestra tu balance de monedas.")
@@ -364,7 +660,62 @@ async def comprar(interaction: discord.Interaction, insignia: str) -> None:
 async def balance(interaction: discord.Interaction) -> None:
     assert interaction.guild_id is not None
     value = await bot.db.get_balance(interaction.guild_id, interaction.user.id)
-    await answer(interaction, f"Tu balance es **{money(value)} monedas**.")
+    await answer(
+        interaction,
+        f"Tu balance es **{money(value)} monedas**. Puedes conseguir dinero "
+        "participando en los eventos de Sularea.",
+    )
+
+
+@bot.tree.command(name="historial", description="Muestra tus últimos 10 movimientos.")
+@app_commands.guild_only()
+async def historial(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id is not None
+    rows = await bot.db.get_history(interaction.guild_id, interaction.user.id, 10)
+    embed = discord.Embed(title="Tus últimos movimientos", color=0x6366F1)
+    if isinstance(interaction.user, discord.Member):
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    if not rows:
+        embed.description = (
+            "Todavía no has tenido movimientos. Puedes conseguir dinero "
+            "participando en los eventos de Sularea."
+        )
+        await answer(interaction, embed=embed)
+        return
+    icons = {
+        "balance_add": "➕",
+        "balance_remove": "➖",
+        "balance_set": "⚙️",
+        "purchase": "🛍️",
+        "badge_grant": "🏅",
+        "badge_remove": "🗑️",
+    }
+    embed.description = "\n".join(
+        f"{icons.get(row['action'], '•')} {row['description']} "
+        f"— <t:{int(row['created_at'].timestamp())}:R>"
+        for row in rows
+    )[:4000]
+    await answer(interaction, embed=embed)
+
+
+@bot.tree.command(name="ranking", description="Muestra los 10 balances más altos.")
+@app_commands.guild_only()
+async def ranking(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id is not None
+    rows = await bot.db.get_ranking(interaction.guild_id, 10)
+    embed = discord.Embed(title="Ranking de monedas", color=0xF59E0B)
+    if interaction.guild is not None and interaction.guild.icon is not None:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+    if not rows:
+        embed.description = "Todavía no hay miembros con dinero registrado."
+    else:
+        medals = ["🥇", "🥈", "🥉"]
+        embed.description = "\n".join(
+            f"{medals[index] if index < 3 else f'**{index + 1}.**'} "
+            f"<@{row['user_id']}> — **{money(row['balance'])} monedas**"
+            for index, row in enumerate(rows)
+        )
+    await answer(interaction, embed=embed)
 
 
 @bot.tree.command(name="revisarbalance", description="Consulta el balance de un miembro.")
@@ -384,6 +735,114 @@ async def revisarbalance(
     )
 
 
+@bot.tree.command(name="configurarregistro", description="Configura el canal de movimientos.")
+@app_commands.describe(
+    activado="Activa o desactiva el registro de movimientos",
+    canal="Canal donde se enviarán los registros",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configurarregistro(
+    interaction: discord.Interaction,
+    activado: bool,
+    canal: discord.TextChannel | None = None,
+) -> None:
+    assert interaction.guild_id is not None and interaction.guild is not None
+    current = await bot.db.get_log_settings(interaction.guild_id)
+    channel_id = canal.id if canal is not None else (
+        current["log_channel_id"] if current else None
+    )
+    if activado and channel_id is None:
+        await answer(interaction, "Selecciona un canal para activar los registros.")
+        return
+    selected_channel = interaction.guild.get_channel(channel_id) if channel_id else None
+    if activado and not isinstance(selected_channel, discord.TextChannel):
+        await answer(interaction, "Selecciona un canal de texto válido para los registros.")
+        return
+    if activado and isinstance(selected_channel, discord.TextChannel):
+        bot_member = interaction.guild.me
+        permissions = selected_channel.permissions_for(bot_member)
+        if not permissions.send_messages or not permissions.embed_links:
+            await answer(
+                interaction,
+                "Necesito **Enviar mensajes** e **Insertar enlaces** en ese canal.",
+            )
+            return
+    await bot.db.set_log_settings(interaction.guild_id, channel_id, activado)
+    if activado:
+        await answer(
+            interaction,
+            f"Registro de movimientos activado en "
+            f"{selected_channel.mention if selected_channel else 'el canal seleccionado'}.",
+        )
+        await send_audit_log(
+            interaction.guild,
+            "Registro de movimientos activado",
+            f"{interaction.user.mention} activó los registros en <#{channel_id}>.",
+            color=0x22C55E,
+        )
+    else:
+        await answer(interaction, "Registro de movimientos desactivado.")
+
+
+@bot.tree.command(name="estadisticas", description="Muestra estadísticas generales del sistema.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def estadisticas(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id is not None
+    stats = await bot.db.get_statistics(interaction.guild_id)
+    embed = discord.Embed(title="Estadísticas de Sularea", color=0x14B8A6)
+    if interaction.guild is not None and interaction.guild.icon is not None:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+    embed.add_field(name="Miembros registrados", value=str(stats["users"]))
+    embed.add_field(name="Dinero total", value=f"{money(stats['total_money'])} monedas")
+    embed.add_field(name="Insignias configuradas", value=str(stats["badges"]))
+    embed.add_field(name="Compras realizadas", value=str(stats["purchases"]))
+    embed.add_field(name="Movimientos guardados", value=str(stats["movements"]))
+    await answer(interaction, embed=embed)
+
+
+@bot.tree.command(name="exportardatos", description="Exporta un respaldo de los datos del servidor.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def exportardatos(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id is not None
+    await interaction.response.defer()
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "data_export",
+        None,
+        "Generó un respaldo de los datos del servidor.",
+    )
+    data = await bot.db.export_guild_data(interaction.guild_id)
+    payload = json.dumps(
+        data,
+        ensure_ascii=False,
+        indent=2,
+        default=lambda value: value.isoformat() if hasattr(value, "isoformat") else str(value),
+    ).encode("utf-8")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    file = discord.File(
+        io.BytesIO(payload),
+        filename=f"sularea_respaldo_{timestamp}.json",
+    )
+    await interaction.followup.send(
+        "Respaldo generado. Guárdalo en un lugar seguro.",
+        file=file,
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Respaldo exportado",
+            f"{interaction.user.mention} generó un respaldo de los datos del servidor.",
+        )
+
+
 @bot.tree.command(name="añadirbalance", description="Añade monedas a un miembro o rol completo.")
 @app_commands.describe(
     objetivo="Miembro o rol que recibirá las monedas",
@@ -397,30 +856,7 @@ async def añadirbalance(
     objetivo: discord.Member | discord.Role,
     cantidad: app_commands.Range[int, 1, MAX_MONEY],
 ) -> None:
-    assert interaction.guild_id is not None
-    members = members_from_target(objetivo)
-    if not members:
-        await answer(interaction, f"El rol {objetivo.mention} no tiene miembros.")
-        return
-    await interaction.response.defer()
-    affected = await bot.db.add_balance_many(
-        interaction.guild_id,
-        [member.id for member in members],
-        cantidad,
-    )
-    if isinstance(objetivo, discord.Member):
-        value = await bot.db.get_balance(interaction.guild_id, objetivo.id)
-        await answer(
-            interaction,
-            f"Añadiste **{money(cantidad)}** monedas a {objetivo.mention}. "
-            f"Nuevo balance: **{money(value)}**. Se aplicó a **1 miembro**.",
-        )
-        return
-    await answer(
-        interaction,
-        f"Añadiste **{money(cantidad)}** monedas a **{affected} miembros** "
-        f"con el rol {objetivo.mention}.",
-    )
+    await handle_balance_command(interaction, objetivo, cantidad, "add")
 
 
 @bot.tree.command(name="quitarbalance", description="Quita monedas a un miembro o rol completo.")
@@ -436,40 +872,7 @@ async def quitarbalance(
     objetivo: discord.Member | discord.Role,
     cantidad: app_commands.Range[int, 1, MAX_MONEY],
 ) -> None:
-    assert interaction.guild_id is not None
-    members = members_from_target(objetivo)
-    if not members:
-        await answer(interaction, f"El rol {objetivo.mention} no tiene miembros.")
-        return
-    await interaction.response.defer()
-    affected = await bot.db.remove_balance_many(
-        interaction.guild_id,
-        [member.id for member in members],
-        cantidad,
-    )
-    if isinstance(objetivo, discord.Member):
-        current = await bot.db.get_balance(interaction.guild_id, objetivo.id)
-        if affected == 0:
-            await answer(
-                interaction,
-                f"{objetivo.mention} no tiene suficiente dinero. "
-                f"Su balance es **{money(current)}**.",
-            )
-            return
-        await answer(
-            interaction,
-            f"Quitaste **{money(cantidad)}** monedas a {objetivo.mention}. "
-            f"Nuevo balance: **{money(current)}**. Se aplicó a **1 miembro**.",
-        )
-        return
-    skipped = len(members) - affected
-    message = (
-        f"Quitaste **{money(cantidad)}** monedas a **{affected} de "
-        f"{len(members)} miembros** con el rol {objetivo.mention}."
-    )
-    if skipped:
-        message += f" Se omitieron **{skipped}** porque no tenían saldo suficiente."
-    await answer(interaction, message)
+    await handle_balance_command(interaction, objetivo, cantidad, "remove")
 
 
 @bot.tree.command(name="setbalance", description="Establece el balance de un miembro o rol completo.")
@@ -485,22 +888,7 @@ async def setbalance(
     objetivo: discord.Member | discord.Role,
     cantidad: app_commands.Range[int, 0, MAX_MONEY],
 ) -> None:
-    assert interaction.guild_id is not None
-    members = members_from_target(objetivo)
-    if not members:
-        await answer(interaction, f"El rol {objetivo.mention} no tiene miembros.")
-        return
-    await interaction.response.defer()
-    affected = await bot.db.set_balance_many(
-        interaction.guild_id,
-        [member.id for member in members],
-        cantidad,
-    )
-    await answer(
-        interaction,
-        f"Establecí el balance de {objetivo.mention} en **{money(cantidad)} monedas**. "
-        f"Se aplicó a **{affected} {'miembro' if affected == 1 else 'miembros'}**.",
-    )
+    await handle_balance_command(interaction, objetivo, cantidad, "set")
 
 
 @bot.tree.command(name="darinsignia", description="Entrega una insignia a un miembro.")
@@ -525,7 +913,24 @@ async def darinsignia(interaction: discord.Interaction, miembro: discord.Member,
     if not role_can_be_managed(role):
         await answer(interaction, "No puedo asignar ese rol; colócalo debajo del rol del bot.")
         return
+    await interaction.response.defer()
     await miembro.add_roles(role, reason=f"Insignia entregada por {interaction.user}")
+    await bot.db.record_movement(
+        guild.id,
+        miembro.id,
+        interaction.user.id,
+        "badge_grant",
+        None,
+        f"Recibió la insignia {badge['name']}.",
+    )
+    await send_audit_log(
+        guild,
+        "Insignia entregada",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Miembro:** {miembro.mention}\n"
+        f"**Insignia:** {badge['name']} ({role.mention})",
+        color=0x22C55E,
+    )
     await answer(interaction, f"Entregaste **{badge['name']}** a {miembro.mention}.")
 
 
@@ -549,7 +954,24 @@ async def quitarinsignia(interaction: discord.Interaction, miembro: discord.Memb
     roles = [badge_role]
     if color_role is not None and color_role in miembro.roles:
         roles.append(color_role)
+    await interaction.response.defer()
     await miembro.remove_roles(*roles, reason=f"Insignia retirada por {interaction.user}")
+    await bot.db.record_movement(
+        guild.id,
+        miembro.id,
+        interaction.user.id,
+        "badge_remove",
+        None,
+        f"Se retiró la insignia {badge['name']}.",
+    )
+    await send_audit_log(
+        guild,
+        "Insignia retirada",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Miembro:** {miembro.mention}\n"
+        f"**Insignia:** {badge['name']} ({badge_role.mention})",
+        color=0xEF4444,
+    )
     await answer(interaction, f"Quitaste **{badge['name']}** a {miembro.mention}.")
 
 
@@ -585,6 +1007,7 @@ async def configurarinsignia(
         return
     if not comprable:
         precio = 0
+    await interaction.response.defer()
     try:
         await bot.db.create_badge(
             interaction.guild_id, display_name, normalize_name(display_name),
@@ -593,6 +1016,25 @@ async def configurarinsignia(
     except asyncpg.UniqueViolationError:
         await answer(interaction, "Ya existe una insignia con ese nombre o ese rol.")
         return
+    if interaction.guild is not None:
+        await bot.db.record_movement(
+            interaction.guild_id,
+            None,
+            interaction.user.id,
+            "badge_config_create",
+            None,
+            f"Configuró la insignia {display_name}.",
+        )
+        await send_audit_log(
+            interaction.guild,
+            "Insignia configurada",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Nombre:** {display_name}\n"
+            f"**Rol de insignia:** {rol_insignia.mention}\n"
+            f"**Rol de color:** {rol_color.mention}\n"
+            f"**Comprable:** {'Sí' if comprable else 'No'}\n"
+            f"**Precio:** {money(precio)} monedas",
+        )
     await answer(interaction, f"Configuré la insignia **{display_name}** correctamente.")
 
 
@@ -639,6 +1081,7 @@ async def editarinsignia(
     if any(role is not None and not role_can_be_managed(role) for role in (rol_insignia, rol_color)):
         await answer(interaction, "Los roles deben estar debajo del rol del bot.")
         return
+    await interaction.response.defer()
     try:
         updated = await bot.db.update_badge(
             interaction.guild_id, current["name_key"], final_name,
@@ -651,6 +1094,26 @@ async def editarinsignia(
     if not updated:
         await answer(interaction, "No pude encontrar esa insignia.")
         return
+    if interaction.guild is not None:
+        await bot.db.record_movement(
+            interaction.guild_id,
+            None,
+            interaction.user.id,
+            "badge_config_edit",
+            None,
+            f"Editó la insignia {current['name']} como {final_name}.",
+        )
+        await send_audit_log(
+            interaction.guild,
+            "Insignia editada",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Nombre anterior:** {current['name']}\n"
+            f"**Nombre actual:** {final_name}\n"
+            f"**Rol de insignia:** <@&{final_badge_role}>\n"
+            f"**Rol de color:** <@&{final_color_role}>\n"
+            f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
+            f"**Precio:** {money(final_price)} monedas",
+        )
     await answer(interaction, f"Actualicé la insignia **{final_name}**.")
 
 
@@ -662,11 +1125,78 @@ async def editarinsignia(
 @app_commands.checks.has_permissions(administrator=True)
 async def borrarinsignia(interaction: discord.Interaction, insignia: str) -> None:
     assert interaction.guild_id is not None
+    await interaction.response.defer()
     deleted = await bot.db.delete_badge(interaction.guild_id, normalize_name(insignia))
     if deleted is None:
         await answer(interaction, "Esa insignia no existe.")
         return
+    if interaction.guild is not None:
+        await bot.db.record_movement(
+            interaction.guild_id,
+            None,
+            interaction.user.id,
+            "badge_config_delete",
+            None,
+            f"Borró la configuración de {deleted['name']}.",
+        )
+        await send_audit_log(
+            interaction.guild,
+            "Configuración de insignia borrada",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Insignia:** {deleted['name']}\n"
+            "Los roles de Discord no fueron eliminados.",
+            color=0xEF4444,
+        )
     await answer(interaction, f"Borré **{deleted['name']}**. No eliminé ningún rol del servidor.")
+
+
+@bot.tree.command(name="ayuda", description="Muestra la guía de comandos de Sularea.")
+@app_commands.guild_only()
+async def ayuda(interaction: discord.Interaction) -> None:
+    member = guild_member(interaction)
+    embed = discord.Embed(
+        title="Ayuda de Sularea",
+        description=(
+            "Participa en eventos para conseguir monedas e insignias. "
+            "Después puedes comprar y activar roles de color especiales."
+        ),
+        color=0x8B5CF6,
+    )
+    if interaction.guild is not None and interaction.guild.icon is not None:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+    embed.add_field(
+        name="Insignias",
+        value=(
+            "`/inventario` — Ver tus insignias.\n"
+            "`/usar` — Activar un rol de color.\n"
+            "`/quitar` — Quitar tu rol de color."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Monedas y mercado",
+        value=(
+            "`/balance` — Consultar tus monedas.\n"
+            "`/historial` — Ver tus últimos 10 movimientos.\n"
+            "`/ranking` — Ver los balances más altos.\n"
+            "`/tienda` — Ver las insignias del mercado.\n"
+            "`/comprar` — Comprar escribiendo el nombre."
+        ),
+        inline=False,
+    )
+    if member is not None and member.guild_permissions.administrator:
+        embed.add_field(
+            name="Administración",
+            value=(
+                "`/insignias [miembro]` · `/darinsignia` · `/quitarinsignia`\n"
+                "`/configurarinsignia` · `/editarinsignia` · `/borrarinsignia`\n"
+                "`/revisarbalance` · `/añadirbalance` · `/quitarbalance` · `/setbalance`\n"
+                "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="Los comandos administrativos requieren permiso de Administrador.")
+    await answer(interaction, embed=embed)
 
 
 @bot.tree.error

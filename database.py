@@ -25,6 +25,29 @@ CREATE TABLE IF NOT EXISTS badges (
 
 CREATE INDEX IF NOT EXISTS badges_shop_index
 ON badges (guild_id, purchasable, price);
+
+CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id BIGINT PRIMARY KEY,
+    log_channel_id BIGINT,
+    logs_enabled BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS movements (
+    id BIGSERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT,
+    actor_id BIGINT,
+    action TEXT NOT NULL,
+    amount BIGINT,
+    description TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS movements_user_history_index
+ON movements (guild_id, user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS movements_action_index
+ON movements (guild_id, action);
 """
 
 
@@ -142,22 +165,23 @@ class Database:
         guild_id: int,
         user_ids: list[int],
         amount: int,
-    ) -> int:
+    ) -> list[int]:
         if not user_ids:
-            return 0
-        result = await self._pool().execute(
+            return []
+        rows = await self._pool().fetch(
             """
             UPDATE balances
             SET balance = balance - $3
             WHERE guild_id = $1
               AND user_id = ANY($2::BIGINT[])
               AND balance >= $3
+            RETURNING user_id
             """,
             guild_id,
             user_ids,
             amount,
         )
-        return int(result.rsplit(" ", 1)[-1])
+        return [row["user_id"] for row in rows]
 
     async def set_balance(self, guild_id: int, user_id: int, amount: int) -> int:
         return await self._pool().fetchval(
@@ -287,3 +311,150 @@ class Database:
             guild_id,
             name_key,
         )
+
+    async def get_log_settings(self, guild_id: int):
+        return await self._pool().fetchrow(
+            """
+            SELECT log_channel_id, logs_enabled
+            FROM guild_settings
+            WHERE guild_id = $1
+            """,
+            guild_id,
+        )
+
+    async def set_log_settings(
+        self,
+        guild_id: int,
+        channel_id: int | None,
+        enabled: bool,
+    ) -> None:
+        await self._pool().execute(
+            """
+            INSERT INTO guild_settings (guild_id, log_channel_id, logs_enabled)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET
+                log_channel_id = COALESCE(EXCLUDED.log_channel_id, guild_settings.log_channel_id),
+                logs_enabled = EXCLUDED.logs_enabled
+            """,
+            guild_id,
+            channel_id,
+            enabled,
+        )
+
+    async def record_movement(
+        self,
+        guild_id: int,
+        user_id: int | None,
+        actor_id: int | None,
+        action: str,
+        amount: int | None,
+        description: str,
+    ) -> None:
+        await self._pool().execute(
+            """
+            INSERT INTO movements (
+                guild_id, user_id, actor_id, action, amount, description
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            guild_id,
+            user_id,
+            actor_id,
+            action,
+            amount,
+            description,
+        )
+
+    async def record_movements(
+        self,
+        guild_id: int,
+        user_ids: list[int],
+        actor_id: int | None,
+        action: str,
+        amount: int | None,
+        description: str,
+    ) -> None:
+        if not user_ids:
+            return
+        await self._pool().executemany(
+            """
+            INSERT INTO movements (
+                guild_id, user_id, actor_id, action, amount, description
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            [
+                (guild_id, user_id, actor_id, action, amount, description)
+                for user_id in user_ids
+            ],
+        )
+
+    async def get_history(self, guild_id: int, user_id: int, limit: int = 10):
+        return await self._pool().fetch(
+            """
+            SELECT action, amount, description, actor_id, created_at
+            FROM movements
+            WHERE guild_id = $1 AND user_id = $2
+            ORDER BY created_at DESC
+            LIMIT $3
+            """,
+            guild_id,
+            user_id,
+            limit,
+        )
+
+    async def get_ranking(self, guild_id: int, limit: int = 10):
+        return await self._pool().fetch(
+            """
+            SELECT user_id, balance
+            FROM balances
+            WHERE guild_id = $1
+            ORDER BY balance DESC, user_id
+            LIMIT $2
+            """,
+            guild_id,
+            limit,
+        )
+
+    async def get_statistics(self, guild_id: int) -> dict[str, int]:
+        row = await self._pool().fetchrow(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM balances WHERE guild_id = $1) AS users,
+                (SELECT COALESCE(SUM(balance), 0) FROM balances WHERE guild_id = $1) AS total_money,
+                (SELECT COUNT(*) FROM badges WHERE guild_id = $1) AS badges,
+                (SELECT COUNT(*) FROM movements WHERE guild_id = $1) AS movements,
+                (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action = 'purchase') AS purchases
+            """,
+            guild_id,
+        )
+        return {key: int(row[key]) for key in row.keys()}
+
+    async def export_guild_data(self, guild_id: int) -> dict:
+        balances = await self._pool().fetch(
+            "SELECT user_id, balance FROM balances WHERE guild_id = $1 ORDER BY user_id",
+            guild_id,
+        )
+        badges = await self._pool().fetch(
+            """
+            SELECT name, name_key, badge_role_id, color_role_id, purchasable, price
+            FROM badges WHERE guild_id = $1 ORDER BY name
+            """,
+            guild_id,
+        )
+        settings = await self.get_log_settings(guild_id)
+        movements = await self._pool().fetch(
+            """
+            SELECT user_id, actor_id, action, amount, description, created_at
+            FROM movements WHERE guild_id = $1 ORDER BY created_at
+            """,
+            guild_id,
+        )
+        return {
+            "guild_id": guild_id,
+            "balances": [dict(row) for row in balances],
+            "badges": [dict(row) for row in badges],
+            "settings": dict(settings) if settings else None,
+            "movements": [dict(row) for row in movements],
+        }
