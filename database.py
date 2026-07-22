@@ -53,8 +53,20 @@ CREATE TABLE IF NOT EXISTS modifiers (
     shop_section TEXT,
     emoji TEXT,
     messages TEXT[] NOT NULL CHECK (CARDINALITY(messages) > 0),
+    trigger_denominator INTEGER NOT NULL DEFAULT 10 CHECK (trigger_denominator >= 1),
+    cooldown_seconds INTEGER NOT NULL DEFAULT 10 CHECK (cooldown_seconds >= 0),
+    duration_minutes INTEGER NOT NULL DEFAULT 5 CHECK (duration_minutes >= 1),
     UNIQUE (guild_id, name_key)
 );
+
+ALTER TABLE modifiers
+ADD COLUMN IF NOT EXISTS trigger_denominator INTEGER NOT NULL DEFAULT 10;
+
+ALTER TABLE modifiers
+ADD COLUMN IF NOT EXISTS cooldown_seconds INTEGER NOT NULL DEFAULT 10;
+
+ALTER TABLE modifiers
+ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 5;
 
 CREATE INDEX IF NOT EXISTS modifiers_shop_index
 ON modifiers (guild_id, purchasable, price);
@@ -102,11 +114,15 @@ CREATE TABLE IF NOT EXISTS active_modifiers (
     channel_id BIGINT,
     expires_at TIMESTAMPTZ NOT NULL,
     last_trigger_at TIMESTAMPTZ,
+    duration_minutes INTEGER NOT NULL DEFAULT 5,
     PRIMARY KEY (guild_id, user_id)
 );
 
 ALTER TABLE active_modifiers
 ADD COLUMN IF NOT EXISTS channel_id BIGINT;
+
+ALTER TABLE active_modifiers
+ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 5;
 
 CREATE INDEX IF NOT EXISTS active_modifiers_expiration_index
 ON active_modifiers (expires_at);
@@ -486,7 +502,10 @@ class Database:
                 'badge' AS item_type, name, name_key, price, shop_section,
                 emoji, badge_role_id, color_role_id, NULL::BIGINT AS modifier_id,
                 NULL::BIGINT AS ticket_id, NULL::TEXT AS description,
-                NULL::BOOLEAN AS active
+                NULL::BOOLEAN AS active,
+                NULL::INTEGER AS trigger_denominator,
+                NULL::INTEGER AS cooldown_seconds,
+                NULL::INTEGER AS duration_minutes
             FROM badges
             WHERE guild_id = $1 AND purchasable = TRUE
             UNION ALL
@@ -495,7 +514,8 @@ class Database:
                 emoji, NULL::BIGINT AS badge_role_id,
                 NULL::BIGINT AS color_role_id, id AS modifier_id,
                 NULL::BIGINT AS ticket_id, NULL::TEXT AS description,
-                NULL::BOOLEAN AS active
+                NULL::BOOLEAN AS active, trigger_denominator,
+                cooldown_seconds, duration_minutes
             FROM modifiers
             WHERE guild_id = $1 AND purchasable = TRUE
             UNION ALL
@@ -503,7 +523,10 @@ class Database:
                 'ticket' AS item_type, name, name_key, price, shop_section,
                 emoji, NULL::BIGINT AS badge_role_id,
                 NULL::BIGINT AS color_role_id, NULL::BIGINT AS modifier_id,
-                id AS ticket_id, description, active
+                id AS ticket_id, description, active,
+                NULL::INTEGER AS trigger_denominator,
+                NULL::INTEGER AS cooldown_seconds,
+                NULL::INTEGER AS duration_minutes
             FROM tickets
             WHERE guild_id = $1 AND purchasable = TRUE
             ORDER BY shop_section NULLS FIRST, price, name
@@ -521,14 +544,18 @@ class Database:
         shop_section: str | None,
         emoji: str | None,
         messages: list[str],
+        trigger_denominator: int,
+        cooldown_seconds: int,
+        duration_minutes: int,
     ) -> None:
         await self._pool().execute(
             """
             INSERT INTO modifiers (
                 guild_id, name, name_key, purchasable, price,
-                shop_section, emoji, messages
+                shop_section, emoji, messages, trigger_denominator,
+                cooldown_seconds, duration_minutes
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::TEXT[])
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::TEXT[], $9, $10, $11)
             """,
             guild_id,
             name,
@@ -538,6 +565,9 @@ class Database:
             shop_section,
             emoji,
             messages,
+            trigger_denominator,
+            cooldown_seconds,
+            duration_minutes,
         )
 
     async def update_modifier(
@@ -551,6 +581,9 @@ class Database:
         shop_section: str | None,
         emoji: str | None,
         messages: list[str],
+        trigger_denominator: int,
+        cooldown_seconds: int,
+        duration_minutes: int,
     ) -> bool:
         result = await self._pool().execute(
             """
@@ -561,7 +594,10 @@ class Database:
                 price = $6,
                 shop_section = $7,
                 emoji = $8,
-                messages = $9::TEXT[]
+                messages = $9::TEXT[],
+                trigger_denominator = $10,
+                cooldown_seconds = $11,
+                duration_minutes = $12
             WHERE guild_id = $1 AND name_key = $2
             """,
             guild_id,
@@ -573,6 +609,9 @@ class Database:
             shop_section,
             emoji,
             messages,
+            trigger_denominator,
+            cooldown_seconds,
+            duration_minutes,
         )
         return result == "UPDATE 1"
 
@@ -958,10 +997,10 @@ class Database:
     async def activate_modifier(
         self,
         guild_id: int,
-        user_id: int,
+        owner_user_id: int,
+        target_user_id: int,
         name_key: str,
         channel_id: int,
-        duration_minutes: int = 5,
     ) -> dict:
         async with self._pool().acquire() as connection:
             async with connection.transaction():
@@ -974,7 +1013,7 @@ class Database:
                     FOR UPDATE OF a
                     """,
                     guild_id,
-                    user_id,
+                    target_user_id,
                 )
                 if active is not None and active["expires_at"] > await connection.fetchval("SELECT NOW()"):
                     return {
@@ -986,11 +1025,11 @@ class Database:
                     await connection.execute(
                         "DELETE FROM active_modifiers WHERE guild_id = $1 AND user_id = $2",
                         guild_id,
-                        user_id,
+                        target_user_id,
                     )
                 inventory = await connection.fetchrow(
                     """
-                    SELECT i.modifier_id, i.quantity, m.name
+                    SELECT i.modifier_id, i.quantity, m.name, m.duration_minutes
                     FROM modifier_inventory i
                     JOIN modifiers m ON m.id = i.modifier_id
                     WHERE i.guild_id = $1 AND i.user_id = $2
@@ -998,7 +1037,7 @@ class Database:
                     FOR UPDATE OF i
                     """,
                     guild_id,
-                    user_id,
+                    owner_user_id,
                     name_key,
                 )
                 if inventory is None or inventory["quantity"] <= 0:
@@ -1011,31 +1050,33 @@ class Database:
                     RETURNING quantity
                     """,
                     guild_id,
-                    user_id,
+                    owner_user_id,
                     inventory["modifier_id"],
                 )
                 expires_at = await connection.fetchval(
                     """
                     INSERT INTO active_modifiers (
-                        guild_id, user_id, modifier_id, channel_id, expires_at
+                        guild_id, user_id, modifier_id, channel_id, expires_at,
+                        duration_minutes
                     )
                     VALUES (
                         $1, $2, $3, $4,
-                        NOW() + ($5::INTEGER * INTERVAL '1 minute')
+                        NOW() + ($5::INTEGER * INTERVAL '1 minute'), $5
                     )
                     RETURNING expires_at
                     """,
                     guild_id,
-                    user_id,
+                    target_user_id,
                     inventory["modifier_id"],
                     channel_id,
-                    duration_minutes,
+                    inventory["duration_minutes"],
                 )
                 return {
                     "status": "activated",
                     "name": inventory["name"],
                     "quantity": quantity,
                     "expires_at": expires_at,
+                    "duration_minutes": inventory["duration_minutes"],
                 }
 
     async def force_activate_modifier(
@@ -1050,18 +1091,19 @@ class Database:
             """
             INSERT INTO active_modifiers (
                 guild_id, user_id, modifier_id, channel_id, expires_at,
-                last_trigger_at
+                last_trigger_at, duration_minutes
             )
             VALUES (
                 $1, $2, $3, $4,
-                NOW() + ($5::INTEGER * INTERVAL '1 minute'), NULL
+                NOW() + ($5::INTEGER * INTERVAL '1 minute'), NULL, $5
             )
             ON CONFLICT (guild_id, user_id)
             DO UPDATE SET
                 modifier_id = EXCLUDED.modifier_id,
                 channel_id = EXCLUDED.channel_id,
                 expires_at = EXCLUDED.expires_at,
-                last_trigger_at = NULL
+                last_trigger_at = NULL,
+                duration_minutes = EXCLUDED.duration_minutes
             RETURNING expires_at
             """,
             guild_id,
@@ -1091,7 +1133,6 @@ class Database:
         self,
         guild_id: int,
         user_id: int,
-        cooldown_seconds: int = 10,
     ):
         return await self._pool().fetchrow(
             """
@@ -1104,14 +1145,15 @@ class Database:
               AND active.expires_at > NOW()
               AND (
                   active.last_trigger_at IS NULL
-                  OR active.last_trigger_at <= NOW() - ($3::INTEGER * INTERVAL '1 second')
+                  OR active.last_trigger_at <= NOW() - (
+                      modifier.cooldown_seconds * INTERVAL '1 second'
+                  )
               )
-              AND RANDOM() < 0.1
+              AND RANDOM() < (1.0 / modifier.trigger_denominator)
             RETURNING modifier.name, modifier.messages
             """,
             guild_id,
             user_id,
-            cooldown_seconds,
         )
 
     async def pop_expired_modifiers(self):
@@ -1120,9 +1162,10 @@ class Database:
             WITH expired AS (
                 DELETE FROM active_modifiers
                 WHERE expires_at <= NOW()
-                RETURNING guild_id, user_id, modifier_id, channel_id
+                RETURNING guild_id, user_id, modifier_id, channel_id, duration_minutes
             )
-            SELECT expired.guild_id, expired.user_id, expired.channel_id, modifier.name
+            SELECT expired.guild_id, expired.user_id, expired.channel_id,
+                   expired.duration_minutes, modifier.name
             FROM expired
             JOIN modifiers AS modifier ON modifier.id = expired.modifier_id
             """
@@ -1428,7 +1471,8 @@ class Database:
         modifiers = await self._pool().fetch(
             """
             SELECT id, name, name_key, purchasable, price,
-                   shop_section, emoji, messages
+                   shop_section, emoji, messages, trigger_denominator,
+                   cooldown_seconds, duration_minutes
             FROM modifiers WHERE guild_id = $1 ORDER BY name
             """,
             guild_id,
@@ -1459,7 +1503,8 @@ class Database:
         )
         active_modifiers = await self._pool().fetch(
             """
-            SELECT user_id, modifier_id, channel_id, expires_at, last_trigger_at
+            SELECT user_id, modifier_id, channel_id, expires_at, last_trigger_at,
+                   duration_minutes
             FROM active_modifiers WHERE guild_id = $1
             ORDER BY user_id
             """,

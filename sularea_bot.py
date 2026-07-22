@@ -24,6 +24,10 @@ MAX_SHOP_SECTIONS = 25
 MAX_TICKET_ADMINS = 50
 MODIFIER_DURATION_MINUTES = 5
 MODIFIER_COOLDOWN_SECONDS = 10
+MODIFIER_TRIGGER_DENOMINATOR = 10
+MAX_MODIFIER_DURATION_MINUTES = 1440
+MAX_MODIFIER_COOLDOWN_SECONDS = 3600
+MAX_MODIFIER_TRIGGER_DENOMINATOR = 1000
 DEFAULT_COIN_EMOJI = "🪙"
 DEFAULT_WHITELIST_EMOJI = "⭐"
 
@@ -421,7 +425,8 @@ async def modifier_expiration_loop() -> None:
         if notification is not None:
             try:
                 await notification.followup.send(
-                    f"Tu modificador **{expired['name']}** terminó después de 5 minutos.",
+                    f"Tu modificador **{expired['name']}** terminó después de "
+                    f"{expired['duration_minutes']} minutos.",
                     ephemeral=True,
                 )
                 notified_privately = True
@@ -731,6 +736,7 @@ async def handle_balance_command(
             f"⚠️ Vas a **{action_text} {money(amount, guild.id)}** para "
             f"**{len(members)} miembros** con el rol {target.mention}. ¿Confirmar?",
             view=view,
+            ephemeral=True,
         )
         view.message = await interaction.original_response()
         return
@@ -1085,7 +1091,8 @@ def make_shop_embed(
             )
         elif row["item_type"] == "modifier":
             item_lines.append(
-                f"{prefix} (modificador consumible · 5 min) — "
+                f"{prefix} (modificador consumible · {row['duration_minutes']} min · "
+                f"1/{row['trigger_denominator']} · cooldown {row['cooldown_seconds']} s) — "
                 f"{money(row['price'], guild.id)}"
             )
         else:
@@ -1213,9 +1220,90 @@ class ShopView(discord.ui.View):
         await answer(interaction, "No pude cambiar el apartado de la tienda.", ephemeral=True)
 
 
+class InactiveTicketPurchaseConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        author_id: int,
+        ticket_name: str,
+        source_interaction: discord.Interaction,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.ticket_name = ticket_name
+        self.source_interaction = source_interaction
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Solo la persona que inició esta compra puede confirmarla.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        try:
+            await self.source_interaction.edit_original_response(
+                content="La confirmación expiró. No se compró ni se cobró el ticket.",
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        await answer(
+            interaction,
+            "Ocurrió un error al confirmar la compra.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Comprar de todos modos", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=f"Procesando la compra de **{self.ticket_name}**...",
+            view=self,
+        )
+        await process_purchase(
+            interaction,
+            self.ticket_name,
+            confirmed_inactive_ticket=True,
+        )
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.danger, emoji="✖️")
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Compra cancelada. No se cobró ni se entregó el ticket.",
+            view=None,
+        )
+        self.stop()
+
+
 async def process_purchase(
     interaction: discord.Interaction,
     item_name: str,
+    *,
+    confirmed_inactive_ticket: bool = False,
 ) -> None:
     member = guild_member(interaction)
     guild = interaction.guild
@@ -1229,7 +1317,8 @@ async def process_purchase(
         else await find_ticket(interaction, item_name)
     )
     if modifier is not None and modifier["purchasable"]:
-        await interaction.response.defer()
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
         async with lock:
             result = await bot.db.purchase_modifier(
@@ -1274,7 +1363,22 @@ async def process_purchase(
         return
 
     if ticket is not None and ticket["purchasable"]:
-        await interaction.response.defer()
+        if not ticket["active"] and not confirmed_inactive_ticket:
+            view = InactiveTicketPurchaseConfirmView(
+                member.id,
+                ticket["name"],
+                interaction,
+            )
+            await interaction.response.send_message(
+                f"⚠️ El ticket **{ticket['name']}** está **inactivo actualmente**. "
+                "Puedes comprarlo y conservarlo, pero no podrás usarlo hasta que "
+                "un administrador lo reactive. ¿Quieres comprarlo de todos modos?",
+                view=view,
+                ephemeral=True,
+            )
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
         async with lock:
             result = await bot.db.purchase_ticket(
@@ -1343,7 +1447,8 @@ async def process_purchase(
         )
         return
 
-    await interaction.response.defer()
+    if not interaction.response.is_done():
+        await interaction.response.defer()
     lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
     async with lock:
         if role in member.roles:
@@ -1432,7 +1537,6 @@ async def on_message(message: discord.Message) -> None:
         modifier = await bot.db.try_trigger_modifier(
             message.guild.id,
             message.author.id,
-            MODIFIER_COOLDOWN_SECONDS,
         )
         if modifier is not None and modifier["messages"]:
             await send_modifier_webhook_message(
@@ -1611,47 +1715,72 @@ async def cancelarevento(interaction: discord.Interaction) -> None:
 async def activate_owned_modifier(
     interaction: discord.Interaction,
     modifier_name_key: str,
-) -> str:
-    member = guild_member(interaction)
+    target_user_id: int,
+) -> tuple[bool, str]:
+    owner = guild_member(interaction)
     guild = interaction.guild
-    if member is None or guild is None or interaction.channel_id is None:
-        return "No pude identificar el miembro, servidor o canal actual."
+    if owner is None or guild is None or interaction.channel_id is None:
+        return False, "No pude identificar el miembro, servidor o canal actual."
+    target = guild.get_member(target_user_id)
+    if target is None:
+        try:
+            target = await guild.fetch_member(target_user_id)
+        except (discord.HTTPException, discord.NotFound):
+            return False, "El miembro elegido ya no está disponible en el servidor."
+    if target.bot:
+        return False, "No puedes aplicar un modificador a un bot."
     result = await bot.db.activate_modifier(
         guild.id,
-        member.id,
+        owner.id,
+        target.id,
         modifier_name_key,
         interaction.channel_id,
-        MODIFIER_DURATION_MINUTES,
     )
     if result["status"] == "missing":
-        return "No tienes ese modificador en tu inventario."
+        return False, "No tienes ese modificador en tu inventario."
     if result["status"] == "already_active":
-        return (
-            f"Ya tienes activo **{result['name']}**. Termina "
+        subject = "Ya tienes" if target.id == owner.id else f"{target.mention} ya tiene"
+        return False, (
+            f"{subject} activo **{result['name']}**. Termina "
             f"<t:{int(result['expires_at'].timestamp())}:R>. No se consumió otra unidad."
         )
     await bot.db.record_movement(
         guild.id,
-        member.id,
-        member.id,
+        owner.id,
+        owner.id,
         "modifier_use",
         None,
-        f"Usó el modificador {result['name']} durante 5 minutos.",
+        f"Usó el modificador {result['name']} sobre {target} durante "
+        f"{result['duration_minutes']} minutos.",
     )
     await send_audit_log(
         guild,
         "Modificador activado",
-        f"**Miembro:** {member.mention}\n"
+        f"**Propietario:** {owner.mention}\n"
+        f"**Objetivo:** {target.mention}\n"
         f"**Modificador:** {result['name']}\n"
         f"**Restantes:** {result['quantity']}\n"
+        f"**Duración:** {result['duration_minutes']} minutos\n"
         f"**Finaliza:** <t:{int(result['expires_at'].timestamp())}:R>",
         color=0xA855F7,
     )
-    bot.modifier_notification_interactions[(guild.id, member.id)] = interaction
-    return (
-        f"Activaste **{result['name']}** durante **{MODIFIER_DURATION_MINUTES} minutos**. "
-        f"Te quedan **{result['quantity']}**."
-    )
+    notification_key = (guild.id, target.id)
+    if target.id == owner.id:
+        bot.modifier_notification_interactions[notification_key] = interaction
+    else:
+        bot.modifier_notification_interactions.pop(notification_key, None)
+    if target.id == owner.id:
+        public_message = (
+            f"{owner.mention} activó **{result['name']}** sobre sí mismo durante "
+            f"**{result['duration_minutes']} minutos**. Le quedan **{result['quantity']}**."
+        )
+    else:
+        public_message = (
+            f"{owner.mention} usó **{result['name']}** sobre {target.mention} durante "
+            f"**{result['duration_minutes']} minutos**. {owner.mention} tiene "
+            f"**{result['quantity']}** unidades restantes."
+        )
+    return True, public_message
 
 
 class ModifierUseConfirmView(discord.ui.View):
@@ -1660,12 +1789,14 @@ class ModifierUseConfirmView(discord.ui.View):
         author_id: int,
         modifier_name: str,
         modifier_name_key: str,
+        target_user_id: int,
         source_interaction: discord.Interaction,
     ) -> None:
         super().__init__(timeout=60)
         self.author_id = author_id
         self.modifier_name = modifier_name
         self.modifier_name_key = modifier_name_key
+        self.target_user_id = target_user_id
         self.source_interaction = source_interaction
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1711,8 +1842,49 @@ class ModifierUseConfirmView(discord.ui.View):
             content=f"Activando **{self.modifier_name}**...",
             view=self,
         )
-        result = await activate_owned_modifier(interaction, self.modifier_name_key)
-        await interaction.edit_original_response(content=result, view=None)
+        activated, result = await activate_owned_modifier(
+            interaction,
+            self.modifier_name_key,
+            self.target_user_id,
+        )
+        if not activated:
+            await interaction.edit_original_response(content=result, view=None)
+            self.stop()
+            return
+        if interaction.channel is None:
+            await interaction.edit_original_response(
+                content=(
+                    f"{result}\nEl modificador sí se activó, pero no pude encontrar "
+                    "el canal para publicar la confirmación."
+                ),
+                view=None,
+            )
+        else:
+            try:
+                await interaction.channel.send(
+                    result,
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False,
+                        users=True,
+                        roles=False,
+                    ),
+                )
+            except discord.HTTPException:
+                await interaction.edit_original_response(
+                    content=(
+                        f"{result}\nEl modificador sí se activó, pero no pude publicar "
+                        "la confirmación en el canal."
+                    ),
+                    view=None,
+                )
+            else:
+                try:
+                    await interaction.delete_original_response()
+                except discord.HTTPException:
+                    await interaction.edit_original_response(
+                        content="Modificador activado y anunciado en el canal.",
+                        view=None,
+                    )
         self.stop()
 
     @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.danger, emoji="✖️")
@@ -1729,10 +1901,17 @@ class ModifierUseConfirmView(discord.ui.View):
 
 
 @bot.tree.command(name="usar", description="Usa una insignia, modificador o ticket que posees.")
-@app_commands.describe(objeto="Nombre de la insignia, modificador o ticket que quieres usar")
+@app_commands.describe(
+    objeto="Nombre de la insignia, modificador o ticket que quieres usar",
+    miembro="Opcional: miembro al que aplicarás el modificador",
+)
 @app_commands.autocomplete(objeto=owned_object_autocomplete)
 @app_commands.guild_only()
-async def usar(interaction: discord.Interaction, objeto: str) -> None:
+async def usar(
+    interaction: discord.Interaction,
+    objeto: str,
+    miembro: discord.Member | None = None,
+) -> None:
     member = guild_member(interaction)
     guild = interaction.guild
     if member is None or guild is None:
@@ -1741,6 +1920,12 @@ async def usar(interaction: discord.Interaction, objeto: str) -> None:
     if badge is None:
         modifier = await find_modifier(interaction, objeto)
         if modifier is None:
+            if miembro is not None:
+                await answer(
+                    interaction,
+                    "La opción miembro solo se puede usar con modificadores.",
+                )
+                return
             ticket = await find_ticket(interaction, objeto)
             if ticket is None:
                 await answer(interaction, "Ese objeto no existe.")
@@ -1867,17 +2052,30 @@ async def usar(interaction: discord.Interaction, objeto: str) -> None:
                 f"contactado. Te quedan **{result['quantity']}**.",
             )
             return
+        target = miembro or member
+        if target.bot:
+            await answer(interaction, "No puedes aplicar un modificador a un bot.")
+            return
         view = ModifierUseConfirmView(
             member.id,
             modifier["name"],
             modifier["name_key"],
+            target.id,
             interaction,
         )
+        target_text = "sobre ti" if target.id == member.id else f"sobre {target.mention}"
         await interaction.response.send_message(
-            f"¿Seguro que quieres usar **{modifier['name']}**? Consumirá "
-            f"**1 unidad** y permanecerá activo durante **{MODIFIER_DURATION_MINUTES} minutos**.",
+            f"¿Seguro que quieres usar **{modifier['name']}** {target_text}? Consumirá "
+            f"**1 unidad** y permanecerá activo durante "
+            f"**{modifier['duration_minutes']} minutos**.",
             view=view,
             ephemeral=True,
+        )
+        return
+    if miembro is not None:
+        await answer(
+            interaction,
+            "La opción miembro solo se puede usar con modificadores.",
         )
         return
     badge_role = guild.get_role(badge["badge_role_id"])
@@ -2010,7 +2208,8 @@ async def inventario(
     if modifiers:
         modifier_lines = "\n".join(
             f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
-            f"× **{row['quantity']}**"
+            f"× **{row['quantity']}** · {row['duration_minutes']} min · "
+            f"1/{row['trigger_denominator']} · cooldown {row['cooldown_seconds']} s"
             for row in modifiers
         )
         sections.append(f"__**Modificadores consumibles**__\n{modifier_lines}")
@@ -2089,7 +2288,10 @@ async def objetos(interaction: discord.Interaction) -> None:
             modifier_details.append(
                 f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
                 f"  Modificador consumible · Comprable: {sale} · "
-                f"Mensajes: **{len(row['messages'])}**"
+                f"Mensajes: **{len(row['messages'])}**\n"
+                f"  Probabilidad: **1/{row['trigger_denominator']}** · "
+                f"Cooldown: **{row['cooldown_seconds']} s** · "
+                f"Duración: **{row['duration_minutes']} min**"
             )
         sections.append("__**Modificadores**__\n" + "\n".join(modifier_details))
     if tickets:
@@ -3085,6 +3287,9 @@ async def configurarinsignia(
     nombre="Nombre del modificador",
     comprable="Indica si aparecerá en la tienda",
     mensajes="Mensajes posibles separados por el símbolo |",
+    probabilidad="Probabilidad 1 entre N; por ejemplo 10 significa 1/10",
+    cooldown="Segundos mínimos entre intentos de activación",
+    duracion="Minutos que permanecerá activo",
     precio="Precio; usa 0 si no será comprable",
     apartado="Apartado de la tienda; por defecto será General",
     emoji="Emoji opcional: Unicode, :nombre: o ID del servidor/bot",
@@ -3098,6 +3303,9 @@ async def configurarmodificador(
     nombre: str,
     comprable: bool,
     mensajes: str,
+    probabilidad: app_commands.Range[int, 1, MAX_MODIFIER_TRIGGER_DENOMINATOR] = MODIFIER_TRIGGER_DENOMINATOR,
+    cooldown: app_commands.Range[int, 0, MAX_MODIFIER_COOLDOWN_SECONDS] = MODIFIER_COOLDOWN_SECONDS,
+    duracion: app_commands.Range[int, 1, MAX_MODIFIER_DURATION_MINUTES] = MODIFIER_DURATION_MINUTES,
     precio: app_commands.Range[int, 0, MAX_MONEY] = 0,
     apartado: str | None = None,
     emoji: str | None = None,
@@ -3155,6 +3363,9 @@ async def configurarmodificador(
             final_section,
             final_emoji,
             parsed_messages,
+            probabilidad,
+            cooldown,
+            duracion,
         )
     except asyncpg.UniqueViolationError:
         await answer(interaction, "Ya existe un modificador con ese nombre.")
@@ -3176,13 +3387,17 @@ async def configurarmodificador(
         f"**Precio:** {money(precio, interaction.guild_id)}\n"
         f"**Apartado:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}\n"
-        f"**Mensajes:** {len(parsed_messages)}",
+        f"**Mensajes:** {len(parsed_messages)}\n"
+        f"**Probabilidad:** 1/{probabilidad}\n"
+        f"**Cooldown:** {cooldown} segundos\n"
+        f"**Duración:** {duracion} minutos",
         color=0xA855F7,
     )
     await answer(
         interaction,
         f"Configuré el modificador **{display_name}** con "
-        f"**{len(parsed_messages)} mensajes**.",
+        f"**{len(parsed_messages)} mensajes**, probabilidad **1/{probabilidad}**, "
+        f"cooldown de **{cooldown} segundos** y duración de **{duracion} minutos**.",
     )
 
 
@@ -3310,6 +3525,9 @@ async def configurarticket(
     mensajes="Para modificadores: nueva lista separada por |",
     descripcion="Para tickets: nueva descripción",
     activo="Para tickets: permitir o impedir su uso",
+    probabilidad="Para modificadores: probabilidad 1 entre N",
+    cooldown="Para modificadores: segundos entre intentos",
+    duracion="Para modificadores: minutos que permanece activo",
 )
 @app_commands.autocomplete(
     objeto=editable_object_autocomplete,
@@ -3332,6 +3550,9 @@ async def editar(
     mensajes: str | None = None,
     descripcion: str | None = None,
     activo: bool | None = None,
+    probabilidad: int | None = None,
+    cooldown: int | None = None,
+    duracion: int | None = None,
 ) -> None:
     assert interaction.guild_id is not None
     guild = interaction.guild
@@ -3428,6 +3649,36 @@ async def editar(
                 await answer(interaction, messages_error or "Los mensajes no son válidos.")
                 return
             final_messages = parsed_messages
+        final_probability = (
+            probabilidad
+            if probabilidad is not None
+            else current_modifier["trigger_denominator"]
+        )
+        final_cooldown = (
+            cooldown if cooldown is not None else current_modifier["cooldown_seconds"]
+        )
+        final_duration = (
+            duracion if duracion is not None else current_modifier["duration_minutes"]
+        )
+        if not 1 <= final_probability <= MAX_MODIFIER_TRIGGER_DENOMINATOR:
+            await answer(
+                interaction,
+                f"La probabilidad debe ser 1 entre un número de 1 a "
+                f"{MAX_MODIFIER_TRIGGER_DENOMINATOR}.",
+            )
+            return
+        if not 0 <= final_cooldown <= MAX_MODIFIER_COOLDOWN_SECONDS:
+            await answer(
+                interaction,
+                f"El cooldown debe estar entre 0 y {MAX_MODIFIER_COOLDOWN_SECONDS} segundos.",
+            )
+            return
+        if not 1 <= final_duration <= MAX_MODIFIER_DURATION_MINUTES:
+            await answer(
+                interaction,
+                f"La duración debe estar entre 1 y {MAX_MODIFIER_DURATION_MINUTES} minutos.",
+            )
+            return
         await interaction.response.defer()
         try:
             updated = await bot.db.update_modifier(
@@ -3440,6 +3691,9 @@ async def editar(
                 final_section,
                 final_emoji,
                 final_messages,
+                final_probability,
+                final_cooldown,
+                final_duration,
             )
         except asyncpg.UniqueViolationError:
             await answer(interaction, "Ya existe un modificador con ese nombre.")
@@ -3465,7 +3719,10 @@ async def editar(
             f"**Precio:** {money(final_price, interaction.guild_id)}\n"
             f"**Apartado:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}\n"
-            f"**Mensajes:** {len(final_messages)}",
+            f"**Mensajes:** {len(final_messages)}\n"
+            f"**Probabilidad:** 1/{final_probability}\n"
+            f"**Cooldown:** {final_cooldown} segundos\n"
+            f"**Duración:** {final_duration} minutos",
             color=0xA855F7,
         )
         await answer(interaction, f"Actualicé el modificador **{final_name}**.")
@@ -3477,6 +3734,12 @@ async def editar(
             return
         if mensajes is not None:
             await answer(interaction, "La opción mensajes solo se usa con modificadores.")
+            return
+        if probabilidad is not None or cooldown is not None or duracion is not None:
+            await answer(
+                interaction,
+                "Las opciones probabilidad, cooldown y duracion solo se usan con modificadores.",
+            )
             return
         if permitir_whitelist is not None:
             await answer(
@@ -3545,10 +3808,17 @@ async def editar(
         await answer(interaction, f"Actualicé el ticket **{final_name}**.")
         return
 
-    if mensajes is not None or descripcion is not None or activo is not None:
+    if (
+        mensajes is not None
+        or descripcion is not None
+        or activo is not None
+        or probabilidad is not None
+        or cooldown is not None
+        or duracion is not None
+    ):
         await answer(
             interaction,
-            "Las opciones mensajes, descripción y activo no se usan con insignias.",
+            "Las opciones de modificadores o tickets no se usan con insignias.",
         )
         return
     if await bot.db.get_modifier(interaction.guild_id, final_name_key):
@@ -3728,7 +3998,7 @@ async def estadomodificador(
             miembro.id,
             item["id"],
             interaction.channel_id,
-            MODIFIER_DURATION_MINUTES,
+            item["duration_minutes"],
         )
         bot.modifier_notification_interactions.pop(notification_key, None)
         expires_at = activation["expires_at"]
@@ -3738,7 +4008,8 @@ async def estadomodificador(
             interaction.user.id,
             "modifier_admin_activate",
             None,
-            f"Un administrador activó {item['name']} durante 5 minutos.",
+            f"Un administrador activó {item['name']} durante "
+            f"{item['duration_minutes']} minutos.",
         )
         await send_audit_log(
             guild,
@@ -3753,7 +4024,8 @@ async def estadomodificador(
         await answer(
             interaction,
             f"Activaste **{item['name']}** para {miembro.mention} durante "
-            f"**5 minutos**. Finaliza <t:{int(expires_at.timestamp())}:R>. "
+            f"**{item['duration_minutes']} minutos**. "
+            f"Finaliza <t:{int(expires_at.timestamp())}:R>. "
             "No se descontó de su inventario.",
         )
         return
