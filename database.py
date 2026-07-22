@@ -52,6 +52,7 @@ ON movements (guild_id, action);
 CREATE TABLE IF NOT EXISTS active_question_events (
     guild_id BIGINT NOT NULL,
     channel_id BIGINT NOT NULL,
+    message_id BIGINT,
     question TEXT NOT NULL,
     answer_hash TEXT NOT NULL,
     reward BIGINT NOT NULL CHECK (reward > 0),
@@ -60,6 +61,9 @@ CREATE TABLE IF NOT EXISTS active_question_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (guild_id, channel_id)
 );
+
+ALTER TABLE active_question_events
+ADD COLUMN IF NOT EXISTS message_id BIGINT;
 
 CREATE INDEX IF NOT EXISTS active_question_events_expiration_index
 ON active_question_events (expires_at);
@@ -470,7 +474,7 @@ class Database:
         )
         active_events = await self._pool().fetch(
             """
-            SELECT channel_id, question, reward, expires_at, created_by, created_at
+            SELECT channel_id, message_id, question, reward, expires_at, created_by, created_at
             FROM active_question_events
             WHERE guild_id = $1
             ORDER BY created_at
@@ -529,11 +533,30 @@ class Database:
                 )
                 return row["expires_at"] if row is not None else None
 
+    async def set_question_event_message(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+    ) -> bool:
+        result = await self._pool().execute(
+            """
+            UPDATE active_question_events
+            SET message_id = $3
+            WHERE guild_id = $1 AND channel_id = $2
+            """,
+            guild_id,
+            channel_id,
+            message_id,
+        )
+        return result == "UPDATE 1"
+
     async def claim_question_event(
         self,
         guild_id: int,
         channel_id: int,
         answer_hash: str,
+        message_id: int,
         winner_id: int,
     ) -> dict | None:
         async with self._pool().acquire() as connection:
@@ -544,12 +567,14 @@ class Database:
                     WHERE guild_id = $1
                       AND channel_id = $2
                       AND answer_hash = $3
+                      AND message_id = $4
                       AND expires_at > NOW()
-                    RETURNING question, reward, created_by
+                    RETURNING question, reward, created_by, message_id
                     """,
                     guild_id,
                     channel_id,
                     answer_hash,
+                    message_id,
                 )
                 if event is None:
                     return None
@@ -587,6 +612,7 @@ class Database:
                     "question": event["question"],
                     "reward": event["reward"],
                     "created_by": event["created_by"],
+                    "message_id": event["message_id"],
                     "new_balance": new_balance,
                 }
 
@@ -595,7 +621,7 @@ class Database:
             """
             DELETE FROM active_question_events
             WHERE guild_id = $1 AND channel_id = $2
-            RETURNING question, reward, created_by
+            RETURNING question, reward, created_by, message_id
             """,
             guild_id,
             channel_id,
@@ -606,6 +632,6 @@ class Database:
             """
             DELETE FROM active_question_events
             WHERE expires_at <= NOW()
-            RETURNING guild_id, channel_id, question, reward, created_by
+            RETURNING guild_id, channel_id, message_id, question, reward, created_by
             """
         )

@@ -128,6 +128,63 @@ async def send_audit_log(
         traceback.print_exc()
 
 
+def make_question_embed(
+    guild: discord.Guild,
+    question: str,
+    reward: int,
+    *,
+    expires_at: datetime | None = None,
+    final_status: str | None = None,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="❓ Evento de pregunta",
+        description=question,
+        color=0x6B7280 if final_status else 0xEC4899,
+    )
+    embed.add_field(name="Recompensa", value=f"{money(reward)} monedas")
+    if final_status is not None:
+        embed.add_field(name="Finalizado", value=final_status)
+        embed.set_footer(text="Este evento ya terminó.")
+    elif expires_at is not None:
+        embed.add_field(
+            name="Finaliza",
+            value=f"<t:{int(expires_at.timestamp())}:R>",
+        )
+        embed.set_footer(
+            text="Responde directamente a este mensaje. La primera respuesta correcta gana."
+        )
+    if guild.icon is not None:
+        embed.set_thumbnail(url=guild.icon.url)
+    return embed
+
+
+async def finalize_question_embed(
+    guild: discord.Guild,
+    channel_id: int,
+    message_id: int | None,
+    question: str,
+    reward: int,
+    status: str,
+) -> None:
+    if message_id is None:
+        return
+    channel = guild.get_channel(channel_id) or guild.get_thread(channel_id)
+    if channel is None or not hasattr(channel, "get_partial_message"):
+        return
+    try:
+        message = channel.get_partial_message(message_id)
+        await message.edit(
+            embed=make_question_embed(
+                guild,
+                question,
+                reward,
+                final_status=status,
+            )
+        )
+    except discord.HTTPException:
+        traceback.print_exc()
+
+
 @tasks.loop(seconds=15)
 async def event_expiration_loop() -> None:
     if not hasattr(bot, "db"):
@@ -149,6 +206,14 @@ async def event_expiration_loop() -> None:
         guild = bot.get_guild(event["guild_id"])
         if guild is None:
             continue
+        await finalize_question_embed(
+            guild,
+            event["channel_id"],
+            event["message_id"],
+            event["question"],
+            event["reward"],
+            "⌛ Terminó sin ganador.",
+        )
         channel = guild.get_channel(event["channel_id"]) or guild.get_thread(
             event["channel_id"]
         )
@@ -515,13 +580,25 @@ async def on_ready() -> None:
 async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.guild is None or not hasattr(bot, "db"):
         return
+    if message.reference is None or message.reference.message_id is None:
+        await bot.process_commands(message)
+        return
     event = await bot.db.claim_question_event(
         message.guild.id,
         message.channel.id,
         answer_hash(message.content),
+        message.reference.message_id,
         message.author.id,
     )
     if event is not None:
+        await finalize_question_embed(
+            message.guild,
+            message.channel.id,
+            event["message_id"],
+            event["question"],
+            event["reward"],
+            f"✅ Ganado por {message.author.mention}.",
+        )
         await message.channel.send(
             f"🎉 {message.author.mention} respondió correctamente y ganó "
             f"**{money(event['reward'])} monedas**. Su nuevo balance es "
@@ -606,21 +683,13 @@ async def eventopregunta(
         )
         return
 
-    embed = discord.Embed(
-        title="❓ Evento de pregunta",
-        description=pregunta.strip(),
-        color=0xEC4899,
+    assert interaction.guild is not None
+    embed = make_question_embed(
+        interaction.guild,
+        pregunta.strip(),
+        recompensa,
+        expires_at=expires_at,
     )
-    embed.add_field(name="Recompensa", value=f"{money(recompensa)} monedas")
-    embed.add_field(
-        name="Finaliza",
-        value=f"<t:{int(expires_at.timestamp())}:R>",
-    )
-    embed.set_footer(
-        text="La primera persona que escriba la respuesta correcta en este canal gana."
-    )
-    if interaction.guild is not None and interaction.guild.icon is not None:
-        embed.set_thumbnail(url=interaction.guild.icon.url)
     if interaction.channel is None:
         await interaction.edit_original_response(
             content="No pude encontrar el canal donde publicar el evento."
@@ -628,11 +697,22 @@ async def eventopregunta(
         await bot.db.cancel_question_event(interaction.guild_id, interaction.channel_id)
         return
     try:
-        await interaction.channel.send(embed=embed)
+        event_message = await interaction.channel.send(embed=embed)
     except discord.HTTPException:
         await bot.db.cancel_question_event(interaction.guild_id, interaction.channel_id)
         await interaction.edit_original_response(
             content="No pude publicar el evento en este canal. Revisa mis permisos."
+        )
+        return
+    saved = await bot.db.set_question_event_message(
+        interaction.guild_id,
+        interaction.channel_id,
+        event_message.id,
+    )
+    if not saved:
+        await event_message.delete()
+        await interaction.edit_original_response(
+            content="No pude guardar el mensaje del evento. Intenta nuevamente."
         )
         return
     await interaction.delete_original_response()
@@ -671,6 +751,15 @@ async def cancelarevento(interaction: discord.Interaction) -> None:
     if event is None:
         await answer(interaction, "No hay un evento de pregunta activo en este canal.")
         return
+    if interaction.guild is not None:
+        await finalize_question_embed(
+            interaction.guild,
+            interaction.channel_id,
+            event["message_id"],
+            event["question"],
+            event["reward"],
+            "🚫 Cancelado por un administrador.",
+        )
     await answer(interaction, f"Cancelé el evento **{event['question']}**.")
     await bot.db.record_movement(
         interaction.guild_id,
@@ -1376,7 +1465,7 @@ async def ayuda(interaction: discord.Interaction) -> None:
         title="Ayuda de Sularea",
         description=(
             "Participa en eventos para conseguir monedas e insignias. "
-            "Responde las preguntas directamente en el canal. Después puedes "
+            "Responde directamente al mensaje de cada pregunta. Después puedes "
             "comprar y activar roles de color especiales."
         ),
         color=0x8B5CF6,
