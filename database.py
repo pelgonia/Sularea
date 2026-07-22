@@ -48,6 +48,21 @@ ON movements (guild_id, user_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS movements_action_index
 ON movements (guild_id, action);
+
+CREATE TABLE IF NOT EXISTS active_question_events (
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    question TEXT NOT NULL,
+    answer_hash TEXT NOT NULL,
+    reward BIGINT NOT NULL CHECK (reward > 0),
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (guild_id, channel_id)
+);
+
+CREATE INDEX IF NOT EXISTS active_question_events_expiration_index
+ON active_question_events (expires_at);
 """
 
 
@@ -278,7 +293,7 @@ class Database:
         color_role_id: int,
         purchasable: bool,
         price: int,
-    ) -> bool:
+    ):
         result = await self._pool().execute(
             """
             UPDATE badges
@@ -425,7 +440,9 @@ class Database:
                 (SELECT COALESCE(SUM(balance), 0) FROM balances WHERE guild_id = $1) AS total_money,
                 (SELECT COUNT(*) FROM badges WHERE guild_id = $1) AS badges,
                 (SELECT COUNT(*) FROM movements WHERE guild_id = $1) AS movements,
-                (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action = 'purchase') AS purchases
+                (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action = 'purchase') AS purchases,
+                (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action = 'event_reward') AS event_wins,
+                (SELECT COUNT(*) FROM active_question_events WHERE guild_id = $1) AS active_events
             """,
             guild_id,
         )
@@ -451,10 +468,144 @@ class Database:
             """,
             guild_id,
         )
+        active_events = await self._pool().fetch(
+            """
+            SELECT channel_id, question, reward, expires_at, created_by, created_at
+            FROM active_question_events
+            WHERE guild_id = $1
+            ORDER BY created_at
+            """,
+            guild_id,
+        )
         return {
             "guild_id": guild_id,
             "balances": [dict(row) for row in balances],
             "badges": [dict(row) for row in badges],
             "settings": dict(settings) if settings else None,
             "movements": [dict(row) for row in movements],
+            "active_question_events": [dict(row) for row in active_events],
         }
+
+    async def create_question_event(
+        self,
+        guild_id: int,
+        channel_id: int,
+        question: str,
+        answer_hash: str,
+        reward: int,
+        duration_minutes: int,
+        created_by: int,
+    ) -> bool:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    DELETE FROM active_question_events
+                    WHERE guild_id = $1 AND channel_id = $2 AND expires_at <= NOW()
+                    """,
+                    guild_id,
+                    channel_id,
+                )
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO active_question_events (
+                        guild_id, channel_id, question, answer_hash,
+                        reward, expires_at, created_by
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5,
+                        NOW() + ($6::INTEGER * INTERVAL '1 minute'), $7
+                    )
+                    ON CONFLICT (guild_id, channel_id) DO NOTHING
+                    RETURNING expires_at
+                    """,
+                    guild_id,
+                    channel_id,
+                    question,
+                    answer_hash,
+                    reward,
+                    duration_minutes,
+                    created_by,
+                )
+                return row["expires_at"] if row is not None else None
+
+    async def claim_question_event(
+        self,
+        guild_id: int,
+        channel_id: int,
+        answer_hash: str,
+        winner_id: int,
+    ) -> dict | None:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                event = await connection.fetchrow(
+                    """
+                    DELETE FROM active_question_events
+                    WHERE guild_id = $1
+                      AND channel_id = $2
+                      AND answer_hash = $3
+                      AND expires_at > NOW()
+                    RETURNING question, reward, created_by
+                    """,
+                    guild_id,
+                    channel_id,
+                    answer_hash,
+                )
+                if event is None:
+                    return None
+                new_balance = await connection.fetchval(
+                    """
+                    INSERT INTO balances (guild_id, user_id, balance)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (guild_id, user_id)
+                    DO UPDATE SET balance = balances.balance + EXCLUDED.balance
+                    RETURNING balance
+                    """,
+                    guild_id,
+                    winner_id,
+                    event["reward"],
+                )
+                formatted_reward = f"{event['reward']:,}".replace(",", ".")
+                description = (
+                    f"Ganó un evento de pregunta y recibió "
+                    f"🪙 {formatted_reward} monedas: {event['question']}"
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO movements (
+                        guild_id, user_id, actor_id, action, amount, description
+                    )
+                    VALUES ($1, $2, $3, 'event_reward', $4, $5)
+                    """,
+                    guild_id,
+                    winner_id,
+                    event["created_by"],
+                    event["reward"],
+                    description,
+                )
+                return {
+                    "question": event["question"],
+                    "reward": event["reward"],
+                    "created_by": event["created_by"],
+                    "new_balance": new_balance,
+                }
+
+    async def cancel_question_event(self, guild_id: int, channel_id: int):
+        return await self._pool().fetchrow(
+            """
+            DELETE FROM active_question_events
+            WHERE guild_id = $1 AND channel_id = $2
+            RETURNING question, reward, created_by
+            """,
+            guild_id,
+            channel_id,
+        )
+
+    async def pop_expired_question_events(self):
+        return await self._pool().fetch(
+            """
+            DELETE FROM active_question_events
+            WHERE expires_at <= NOW()
+            RETURNING guild_id, channel_id, question, reward, created_by
+            """
+        )

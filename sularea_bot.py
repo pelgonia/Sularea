@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -9,7 +10,7 @@ from datetime import datetime, timezone
 import asyncpg
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from database import Database
@@ -21,6 +22,16 @@ MAX_MONEY = 1_000_000_000_000
 
 def normalize_name(value: str) -> str:
     return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
+def answer_hash(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value)
+    without_accents = "".join(
+        character for character in decomposed
+        if not unicodedata.combining(character)
+    )
+    normalized = " ".join(without_accents.casefold().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def money(value: int) -> str:
@@ -47,6 +58,7 @@ class SulareaBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.members = True
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.purchase_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
@@ -60,8 +72,12 @@ class SulareaBot(commands.Bot):
         self.db = Database(database_url)
         await self.db.connect()
         await self.tree.sync()
+        if not event_expiration_loop.is_running():
+            event_expiration_loop.start()
 
     async def close(self) -> None:
+        if event_expiration_loop.is_running():
+            event_expiration_loop.cancel()
         if hasattr(self, "db"):
             await self.db.close()
         await super().close()
@@ -110,6 +126,52 @@ async def send_audit_log(
         await channel.send(embed=embed)
     except discord.HTTPException:
         traceback.print_exc()
+
+
+@tasks.loop(seconds=15)
+async def event_expiration_loop() -> None:
+    if not hasattr(bot, "db"):
+        return
+    try:
+        expired_events = await bot.db.pop_expired_question_events()
+    except (OSError, asyncpg.PostgresError):
+        traceback.print_exc()
+        return
+    for event in expired_events:
+        await bot.db.record_movement(
+            event["guild_id"],
+            None,
+            event["created_by"],
+            "event_expire",
+            event["reward"],
+            f"Caducó el evento de pregunta: {event['question']}",
+        )
+        guild = bot.get_guild(event["guild_id"])
+        if guild is None:
+            continue
+        channel = guild.get_channel(event["channel_id"]) or guild.get_thread(
+            event["channel_id"]
+        )
+        if channel is not None and hasattr(channel, "send"):
+            try:
+                await channel.send(
+                    f"⌛ El evento **{event['question']}** caducó sin ganador."
+                )
+            except discord.HTTPException:
+                traceback.print_exc()
+        await send_audit_log(
+            guild,
+            "Evento de pregunta caducado",
+            f"**Pregunta:** {event['question']}\n"
+            f"**Recompensa:** {money(event['reward'])} monedas\n"
+            "Terminó sin ganador.",
+            color=0x6B7280,
+        )
+
+
+@event_expiration_loop.before_loop
+async def before_event_expiration_loop() -> None:
+    await bot.wait_until_ready()
 
 
 async def apply_balance_change(
@@ -449,6 +511,34 @@ async def on_ready() -> None:
         print(f"Bot conectado como {bot.user} (ID: {bot.user.id})")
 
 
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot or message.guild is None or not hasattr(bot, "db"):
+        return
+    event = await bot.db.claim_question_event(
+        message.guild.id,
+        message.channel.id,
+        answer_hash(message.content),
+        message.author.id,
+    )
+    if event is not None:
+        await message.channel.send(
+            f"🎉 {message.author.mention} respondió correctamente y ganó "
+            f"**{money(event['reward'])} monedas**. Su nuevo balance es "
+            f"**{money(event['new_balance'])} monedas**!"
+        )
+        await send_audit_log(
+            message.guild,
+            "Evento de pregunta ganado",
+            f"**Ganador:** {message.author.mention}\n"
+            f"**Pregunta:** {event['question']}\n"
+            f"**Recompensa:** {money(event['reward'])} monedas\n"
+            f"**Canal:** {message.channel.mention}",
+            color=0x22C55E,
+        )
+    await bot.process_commands(message)
+
+
 @bot.tree.command(name="say", description="Hace que el bot envíe un mensaje.")
 @app_commands.describe(mensaje="El mensaje que quieres que diga el bot")
 @app_commands.guild_only()
@@ -474,6 +564,131 @@ async def say(interaction: discord.Interaction, mensaje: str) -> None:
             f"**Mensaje:** {mensaje[:1000]}",
         )
     await interaction.delete_original_response()
+
+
+@bot.tree.command(name="eventopregunta", description="Crea una pregunta con recompensa.")
+@app_commands.describe(
+    pregunta="Pregunta o texto que se publicará",
+    respuesta="Respuesta correcta (no se mostrará)",
+    minutos="Minutos antes de que el evento caduque",
+    recompensa="Cantidad de monedas para el ganador",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def eventopregunta(
+    interaction: discord.Interaction,
+    pregunta: app_commands.Range[str, 1, 1000],
+    respuesta: app_commands.Range[str, 1, 200],
+    minutos: app_commands.Range[int, 1, 1440],
+    recompensa: app_commands.Range[int, 1, MAX_MONEY],
+) -> None:
+    assert interaction.guild_id is not None and interaction.channel_id is not None
+    if not " ".join(respuesta.split()):
+        await answer(interaction, "La respuesta no puede estar vacía.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    expires_at = await bot.db.create_question_event(
+        interaction.guild_id,
+        interaction.channel_id,
+        pregunta.strip(),
+        answer_hash(respuesta),
+        recompensa,
+        minutos,
+        interaction.user.id,
+    )
+    if expires_at is None:
+        await interaction.edit_original_response(
+            content=(
+            "Ya hay un evento de pregunta activo en este canal. "
+            "Usa `/cancelarevento` antes de crear otro."
+            ),
+        )
+        return
+
+    embed = discord.Embed(
+        title="❓ Evento de pregunta",
+        description=pregunta.strip(),
+        color=0xEC4899,
+    )
+    embed.add_field(name="Recompensa", value=f"{money(recompensa)} monedas")
+    embed.add_field(
+        name="Finaliza",
+        value=f"<t:{int(expires_at.timestamp())}:R>",
+    )
+    embed.set_footer(
+        text="La primera persona que escriba la respuesta correcta en este canal gana."
+    )
+    if interaction.guild is not None and interaction.guild.icon is not None:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+    if interaction.channel is None:
+        await interaction.edit_original_response(
+            content="No pude encontrar el canal donde publicar el evento."
+        )
+        await bot.db.cancel_question_event(interaction.guild_id, interaction.channel_id)
+        return
+    try:
+        await interaction.channel.send(embed=embed)
+    except discord.HTTPException:
+        await bot.db.cancel_question_event(interaction.guild_id, interaction.channel_id)
+        await interaction.edit_original_response(
+            content="No pude publicar el evento en este canal. Revisa mis permisos."
+        )
+        return
+    await interaction.delete_original_response()
+
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "event_create",
+        recompensa,
+        f"Creó un evento de pregunta: {pregunta.strip()}",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Evento de pregunta creado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Pregunta:** {pregunta.strip()}\n"
+            f"**Recompensa:** {money(recompensa)} monedas\n"
+            f"**Duración:** {minutos} minutos\n"
+            f"**Canal:** <#{interaction.channel_id}>",
+            color=0xEC4899,
+        )
+
+
+@bot.tree.command(name="cancelarevento", description="Cancela la pregunta activa de este canal.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def cancelarevento(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id is not None and interaction.channel_id is not None
+    event = await bot.db.cancel_question_event(
+        interaction.guild_id,
+        interaction.channel_id,
+    )
+    if event is None:
+        await answer(interaction, "No hay un evento de pregunta activo en este canal.")
+        return
+    await answer(interaction, f"Cancelé el evento **{event['question']}**.")
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "event_cancel",
+        event["reward"],
+        f"Canceló el evento de pregunta: {event['question']}",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Evento de pregunta cancelado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Pregunta:** {event['question']}\n"
+            f"**Canal:** <#{interaction.channel_id}>",
+            color=0xEF4444,
+        )
 
 
 @bot.tree.command(name="usar", description="Activa el color de una insignia que posees.")
@@ -687,6 +902,7 @@ async def historial(interaction: discord.Interaction) -> None:
         "balance_remove": "➖",
         "balance_set": "⚙️",
         "purchase": "🛍️",
+        "event_reward": "🎉",
         "badge_grant": "🏅",
         "badge_remove": "🗑️",
     }
@@ -800,6 +1016,8 @@ async def estadisticas(interaction: discord.Interaction) -> None:
     embed.add_field(name="Dinero total", value=f"{money(stats['total_money'])} monedas")
     embed.add_field(name="Insignias configuradas", value=str(stats["badges"]))
     embed.add_field(name="Compras realizadas", value=str(stats["purchases"]))
+    embed.add_field(name="Eventos ganados", value=str(stats["event_wins"]))
+    embed.add_field(name="Eventos activos", value=str(stats["active_events"]))
     embed.add_field(name="Movimientos guardados", value=str(stats["movements"]))
     await answer(interaction, embed=embed)
 
@@ -1158,7 +1376,8 @@ async def ayuda(interaction: discord.Interaction) -> None:
         title="Ayuda de Sularea",
         description=(
             "Participa en eventos para conseguir monedas e insignias. "
-            "Después puedes comprar y activar roles de color especiales."
+            "Responde las preguntas directamente en el canal. Después puedes "
+            "comprar y activar roles de color especiales."
         ),
         color=0x8B5CF6,
     )
@@ -1191,6 +1410,7 @@ async def ayuda(interaction: discord.Interaction) -> None:
                 "`/insignias [miembro]` · `/darinsignia` · `/quitarinsignia`\n"
                 "`/configurarinsignia` · `/editarinsignia` · `/borrarinsignia`\n"
                 "`/revisarbalance` · `/añadirbalance` · `/quitarbalance` · `/setbalance`\n"
+                "`/eventopregunta` · `/cancelarevento`\n"
                 "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`"
             ),
             inline=False,
