@@ -2581,6 +2581,103 @@ async def quitarmodificador(
     )
 
 
+@bot.tree.command(
+    name="estadomodificador",
+    description="Activa o desactiva un modificador para un miembro.",
+)
+@app_commands.describe(
+    miembro="Miembro cuyo modificador quieres cambiar",
+    activado="Activa o desactiva el modificador",
+    modificador="Modificador que se activará; solo es necesario al activar",
+)
+@app_commands.autocomplete(modificador=modifier_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def estadomodificador(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+    activado: bool,
+    modificador: str | None = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None or interaction.channel_id is None:
+        return
+
+    notification_key = (guild.id, miembro.id)
+    if activado:
+        if not modificador or not modificador.strip():
+            await answer(
+                interaction,
+                "Debes elegir un modificador cuando seleccionas **activado: Sí**.",
+            )
+            return
+        item = await find_modifier(interaction, modificador)
+        if item is None:
+            await answer(interaction, "Ese modificador no existe.")
+            return
+        activation = await bot.db.force_activate_modifier(
+            guild.id,
+            miembro.id,
+            item["id"],
+            interaction.channel_id,
+            MODIFIER_DURATION_MINUTES,
+        )
+        bot.modifier_notification_interactions.pop(notification_key, None)
+        expires_at = activation["expires_at"]
+        await bot.db.record_movement(
+            guild.id,
+            miembro.id,
+            interaction.user.id,
+            "modifier_admin_activate",
+            None,
+            f"Un administrador activó {item['name']} durante 5 minutos.",
+        )
+        await send_audit_log(
+            guild,
+            "Modificador activado por administrador",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Miembro:** {miembro.mention}\n"
+            f"**Modificador:** {item['name']}\n"
+            f"**Finaliza:** <t:{int(expires_at.timestamp())}:R>\n"
+            "No se descontó ninguna unidad del inventario.",
+            color=0xA855F7,
+        )
+        await answer(
+            interaction,
+            f"Activaste **{item['name']}** para {miembro.mention} durante "
+            f"**5 minutos**. Finaliza <t:{int(expires_at.timestamp())}:R>. "
+            "No se descontó de su inventario.",
+        )
+        return
+
+    deactivated = await bot.db.deactivate_modifier(guild.id, miembro.id)
+    bot.modifier_notification_interactions.pop(notification_key, None)
+    if deactivated is None:
+        await answer(interaction, f"{miembro.mention} no tiene un modificador activo.")
+        return
+    await bot.db.record_movement(
+        guild.id,
+        miembro.id,
+        interaction.user.id,
+        "modifier_admin_deactivate",
+        None,
+        f"Un administrador desactivó {deactivated['name']}.",
+    )
+    await send_audit_log(
+        guild,
+        "Modificador desactivado por administrador",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Miembro:** {miembro.mention}\n"
+        f"**Modificador:** {deactivated['name']}",
+        color=0xEF4444,
+    )
+    await answer(
+        interaction,
+        f"Desactivaste **{deactivated['name']}** para {miembro.mention}.",
+    )
+
+
 @bot.tree.command(name="borrarmodificador", description="Borra un modificador configurado.")
 @app_commands.describe(modificador="Nombre del modificador que se borrará")
 @app_commands.autocomplete(modificador=modifier_autocomplete)
@@ -2666,6 +2763,7 @@ async def ayuda(interaction: discord.Interaction) -> None:
                 "`/configurarinsignia` · `/configurarmodificador` · `/editar`\n"
                 "`/borrarinsignia` · `/borrarmodificador`\n"
                 "`/darmodificador` · `/quitarmodificador`\n"
+                "`/estadomodificador`\n"
                 "`/revisarbalance` · `/añadirbalance` · `/quitarbalance` · `/setbalance`\n"
                 "`/eventopregunta` · `/cancelarevento`\n"
                 "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`"

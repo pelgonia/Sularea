@@ -721,6 +721,55 @@ class Database:
                     "expires_at": expires_at,
                 }
 
+    async def force_activate_modifier(
+        self,
+        guild_id: int,
+        user_id: int,
+        modifier_id: int,
+        channel_id: int,
+        duration_minutes: int = 5,
+    ):
+        return await self._pool().fetchrow(
+            """
+            INSERT INTO active_modifiers (
+                guild_id, user_id, modifier_id, channel_id, expires_at,
+                last_trigger_at
+            )
+            VALUES (
+                $1, $2, $3, $4,
+                NOW() + ($5::INTEGER * INTERVAL '1 minute'), NULL
+            )
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET
+                modifier_id = EXCLUDED.modifier_id,
+                channel_id = EXCLUDED.channel_id,
+                expires_at = EXCLUDED.expires_at,
+                last_trigger_at = NULL
+            RETURNING expires_at
+            """,
+            guild_id,
+            user_id,
+            modifier_id,
+            channel_id,
+            duration_minutes,
+        )
+
+    async def deactivate_modifier(self, guild_id: int, user_id: int):
+        return await self._pool().fetchrow(
+            """
+            WITH removed AS (
+                DELETE FROM active_modifiers
+                WHERE guild_id = $1 AND user_id = $2
+                RETURNING modifier_id
+            )
+            SELECT modifier.name
+            FROM removed
+            JOIN modifiers AS modifier ON modifier.id = removed.modifier_id
+            """,
+            guild_id,
+            user_id,
+        )
+
     async def try_trigger_modifier(
         self,
         guild_id: int,
