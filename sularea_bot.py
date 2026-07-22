@@ -882,11 +882,23 @@ async def owned_object_autocomplete(
 async def removable_object_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
-    if interaction.guild_id is None or not hasattr(bot, "db"):
+    guild = interaction.guild
+    if interaction.guild_id is None or guild is None or not hasattr(bot, "db"):
         return []
-    member = getattr(interaction.namespace, "miembro", None)
-    if not isinstance(member, discord.Member):
+    selected_member = getattr(interaction.namespace, "miembro", None)
+    member_id = getattr(selected_member, "id", None)
+    if member_id is None:
         return []
+    member = (
+        selected_member
+        if isinstance(selected_member, discord.Member)
+        else guild.get_member(member_id)
+    )
+    if member is None:
+        try:
+            member = await guild.fetch_member(member_id)
+        except (discord.HTTPException, discord.NotFound):
+            return []
 
     badges, modifiers, tickets = await asyncio.gather(
         bot.db.list_badges(interaction.guild_id),
