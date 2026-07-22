@@ -20,12 +20,16 @@ CREATE TABLE IF NOT EXISTS badges (
     purchasable BOOLEAN NOT NULL DEFAULT FALSE,
     price BIGINT NOT NULL DEFAULT 0 CHECK (price >= 0),
     shop_section TEXT,
+    emoji TEXT,
     PRIMARY KEY (guild_id, name_key),
     UNIQUE (guild_id, badge_role_id)
 );
 
 ALTER TABLE badges
 ADD COLUMN IF NOT EXISTS shop_section TEXT;
+
+ALTER TABLE badges
+ADD COLUMN IF NOT EXISTS emoji TEXT;
 
 UPDATE badges
 SET shop_section = 'General'
@@ -279,14 +283,15 @@ class Database:
         purchasable: bool,
         price: int,
         shop_section: str | None,
+        emoji: str | None,
     ) -> None:
         await self._pool().execute(
             """
             INSERT INTO badges (
                 guild_id, name, name_key, badge_role_id,
-                color_role_id, purchasable, price, shop_section
+                color_role_id, purchasable, price, shop_section, emoji
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             """,
             guild_id,
             name,
@@ -296,6 +301,7 @@ class Database:
             purchasable,
             price,
             shop_section,
+            emoji,
         )
 
     async def update_badge(
@@ -309,6 +315,7 @@ class Database:
         purchasable: bool,
         price: int,
         shop_section: str | None,
+        emoji: str | None,
     ):
         result = await self._pool().execute(
             """
@@ -319,7 +326,8 @@ class Database:
                 color_role_id = $6,
                 purchasable = $7,
                 price = $8,
-                shop_section = $9
+                shop_section = $9,
+                emoji = $10
             WHERE guild_id = $1 AND name_key = $2
             """,
             guild_id,
@@ -331,6 +339,7 @@ class Database:
             purchasable,
             price,
             shop_section,
+            emoji,
         )
         return result == "UPDATE 1"
 
@@ -474,7 +483,7 @@ class Database:
         badges = await self._pool().fetch(
             """
             SELECT name, name_key, badge_role_id, color_role_id,
-                   purchasable, price, shop_section
+                   purchasable, price, shop_section, emoji
             FROM badges WHERE guild_id = $1 ORDER BY name
             """,
             guild_id,
