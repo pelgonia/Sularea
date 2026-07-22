@@ -2367,7 +2367,7 @@ async def objetos(interaction: discord.Interaction) -> None:
             modifier_details.append(
                 f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
                 f"  Modificador consumible · Comprable: {sale} · "
-                f"Mensajes: **{len(row['messages'])}**\n"
+                f"Mensajes configurados: **{len(row['messages'])}**\n"
                 f"  Probabilidad: **{modifier_probability_label(row['trigger_numerator'], row['trigger_denominator'])}** · "
                 f"Cooldown: **{row['cooldown_seconds']} s** · "
                 f"Duración: **{row['duration_minutes']} min**"
@@ -2396,6 +2396,79 @@ async def objetos(interaction: discord.Interaction) -> None:
     )
     embed.set_footer(text="Usa /inventario miembro para consultar a un jugador.")
     await answer(interaction, embed=embed)
+
+
+def modifier_message_pages(modifiers: list, guild: discord.Guild) -> list[str]:
+    pages: list[str] = []
+    current = ""
+    max_length = 3900
+
+    def append_block(block: str, continuation_header: str) -> None:
+        nonlocal current
+        separator = "\n\n" if current else ""
+        if len(current) + len(separator) + len(block) <= max_length:
+            current += separator + block
+            return
+        if current:
+            pages.append(current)
+        current = (
+            f"{continuation_header}\n{block}"
+            if continuation_header
+            else block
+        )
+
+    for modifier in modifiers:
+        header = f"__**{badge_emoji(modifier['emoji'], guild)}{modifier['name']}**__"
+        continuation = (
+            f"__**{badge_emoji(modifier['emoji'], guild)}"
+            f"{modifier['name']} (continuación)**__"
+        )
+        messages = modifier["messages"]
+        if not messages:
+            append_block(f"{header}\n*Sin mensajes configurados.*", "")
+            continue
+        append_block(f"{header}\n**1.** {messages[0]}", "")
+        for index, message in enumerate(messages[1:], start=2):
+            append_block(f"**{index}.** {message}", continuation)
+    if current:
+        pages.append(current)
+    return pages
+
+
+@bot.tree.command(
+    name="mensajes",
+    description="Muestra los mensajes configurados de todos los modificadores.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def mensajes(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    modifiers = await bot.db.list_modifiers(guild.id)
+    if not modifiers:
+        embed = discord.Embed(
+            title="Mensajes de modificadores",
+            description="No hay modificadores configurados en este servidor.",
+            color=0xA855F7,
+        )
+        if guild.icon is not None:
+            embed.set_thumbnail(url=guild.icon.url)
+        await answer(interaction, embed=embed)
+        return
+
+    pages = modifier_message_pages(list(modifiers), guild)
+    await interaction.response.defer()
+    for index, page in enumerate(pages, start=1):
+        embed = discord.Embed(
+            title=f"Mensajes de modificadores · {index}/{len(pages)}",
+            description=page,
+            color=0xA855F7,
+        )
+        if guild.icon is not None:
+            embed.set_thumbnail(url=guild.icon.url)
+        await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="tienda", description="Abre el Mercado de Sularea por apartados.")
@@ -4344,7 +4417,7 @@ async def ayuda(interaction: discord.Interaction) -> None:
         embed.add_field(
             name="Administración",
             value=(
-                "`/inventario [miembro]` · `/objetos`\n"
+                "`/inventario [miembro]` · `/objetos` · `/mensajes`\n"
                 "`/darobjeto` · `/quitarobjeto` · `/borrarobjeto`\n"
                 "`/configurarinsignia` · `/configurarmodificador` · `/configurarticket`\n"
                 "`/editar` · `/editarmensajes` · `/estadomodificador`\n"
