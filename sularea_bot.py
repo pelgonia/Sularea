@@ -555,8 +555,8 @@ async def apply_balance_change(
         affected_ids = await bot.db.remove_balance_many(guild.id, user_ids, amount)
         movement_action = "balance_remove"
         movement_amount = -amount
-        verb = "Quitó"
-        history_text = f"Un administrador quitó {money(amount, guild.id)}."
+        verb = "Restó"
+        history_text = f"Un administrador restó {money(amount, guild.id)}."
     else:
         await bot.db.set_balance_many(guild.id, user_ids, amount)
         affected_ids = user_ids
@@ -589,7 +589,7 @@ async def apply_balance_change(
                 f"**{money(current_balance, guild.id)}**. Se aplicó a **1 miembro**."
             )
         else:
-            action_result = "Añadiste" if action == "add" else "Quitaste"
+            action_result = "Añadiste" if action == "add" else "Restaste"
             result = (
                 f"{action_result} **{money(amount, guild.id)}** a {members[0].mention}. "
                 f"Nuevo balance: **{money(current_balance, guild.id)}**."
@@ -717,7 +717,7 @@ async def handle_balance_command(
     if isinstance(target, discord.Role):
         action_text = {
             "add": "añadir",
-            "remove": "quitar",
+            "remove": "restar",
             "set": "establecer",
         }[action]
         view = MassBalanceConfirmView(
@@ -770,6 +770,33 @@ async def member_is_whitelisted(member: discord.Member) -> bool:
         member.id,
         [role.id for role in member.roles],
     )
+
+
+async def whitelist_access_source(member: discord.Member) -> tuple[str, str]:
+    entries = await bot.db.list_whitelist_entries(member.guild.id)
+    whitelisted_role_ids = {
+        row["target_id"]
+        for row in entries
+        if row["target_type"] == "role"
+    }
+    matching_role = next(
+        (role for role in member.roles if role.id in whitelisted_role_ids),
+        None,
+    )
+    if matching_role is not None:
+        return (
+            f"Con tu rol {matching_role.mention}",
+            f"por el rol {matching_role.name}",
+        )
+    if any(
+        row["target_type"] == "member" and row["target_id"] == member.id
+        for row in entries
+    ):
+        return (
+            "Por estar añadido directamente a la whitelist",
+            "por acceso directo a la whitelist",
+        )
+    return ("Gracias a la whitelist", "por la whitelist")
 
 
 async def badge_autocomplete(
@@ -838,7 +865,10 @@ async def owned_object_autocomplete(
     )
     choices.extend(
         app_commands.Choice(
-            name=f"Ticket · {row['name']} (x{row['quantity']})"[:100],
+            name=(
+                f"Ticket · {row['name']} (x{row['quantity']})"
+                f"{' · Inactivo' if not row['active'] else ''}"
+            )[:100],
             value=row["name"][:100],
         )
         for row in tickets
@@ -1002,8 +1032,10 @@ def make_shop_embed(
                 f"{money(row['price'], guild.id)}"
             )
         else:
+            ticket_status = "activo" if row["active"] else "inactivo"
             item_lines.append(
-                f"{prefix} (ticket consumible) — {money(row['price'], guild.id)}\n"
+                f"{prefix} (ticket consumible · {ticket_status}) — "
+                f"{money(row['price'], guild.id)}\n"
                 f"  {row['description']}"
             )
     items = "\n".join(item_lines)
@@ -1218,14 +1250,22 @@ async def process_purchase(
             f"{member.mention} compró **{result['name']}** por "
             f"**{money(result['price'], guild.id)}**.\n"
             f"**Cantidad:** {result['quantity']}\n"
+            f"**Estado:** {'Activo' if result['active'] else 'Inactivo'}\n"
             f"**Nuevo balance:** {money(result['new_balance'], guild.id)}",
             color=0x06B6D4,
+        )
+        warning = (
+            "⚠️ Este ticket está **inactivo actualmente**: puedes conservarlo, "
+            "pero no podrás usarlo hasta que un administrador lo reactive."
+            if not result["active"]
+            else "⚠️ Los tickets pueden quedar inactivos temporalmente; si eso "
+            "ocurre, conservarás el ticket hasta que vuelva a activarse."
         )
         await answer(
             interaction,
             f"{member.mention} compró **{result['name']}**. Ahora tiene "
             f"**{result['quantity']}**. Su balance es "
-            f"**{money(result['new_balance'], guild.id)}**.",
+            f"**{money(result['new_balance'], guild.id)}**.\n{warning}",
         )
         return
 
@@ -1511,6 +1551,126 @@ async def cancelarevento(interaction: discord.Interaction) -> None:
         )
 
 
+async def activate_owned_modifier(
+    interaction: discord.Interaction,
+    modifier_name_key: str,
+) -> str:
+    member = guild_member(interaction)
+    guild = interaction.guild
+    if member is None or guild is None or interaction.channel_id is None:
+        return "No pude identificar el miembro, servidor o canal actual."
+    result = await bot.db.activate_modifier(
+        guild.id,
+        member.id,
+        modifier_name_key,
+        interaction.channel_id,
+        MODIFIER_DURATION_MINUTES,
+    )
+    if result["status"] == "missing":
+        return "No tienes ese modificador en tu inventario."
+    if result["status"] == "already_active":
+        return (
+            f"Ya tienes activo **{result['name']}**. Termina "
+            f"<t:{int(result['expires_at'].timestamp())}:R>. No se consumió otra unidad."
+        )
+    await bot.db.record_movement(
+        guild.id,
+        member.id,
+        member.id,
+        "modifier_use",
+        None,
+        f"Usó el modificador {result['name']} durante 5 minutos.",
+    )
+    await send_audit_log(
+        guild,
+        "Modificador activado",
+        f"**Miembro:** {member.mention}\n"
+        f"**Modificador:** {result['name']}\n"
+        f"**Restantes:** {result['quantity']}\n"
+        f"**Finaliza:** <t:{int(result['expires_at'].timestamp())}:R>",
+        color=0xA855F7,
+    )
+    bot.modifier_notification_interactions[(guild.id, member.id)] = interaction
+    return (
+        f"Activaste **{result['name']}** durante **{MODIFIER_DURATION_MINUTES} minutos**. "
+        f"Te quedan **{result['quantity']}**."
+    )
+
+
+class ModifierUseConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        author_id: int,
+        modifier_name: str,
+        modifier_name_key: str,
+        source_interaction: discord.Interaction,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.modifier_name = modifier_name
+        self.modifier_name_key = modifier_name_key
+        self.source_interaction = source_interaction
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Solo la persona que abrió esta confirmación puede responder.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        try:
+            await self.source_interaction.edit_original_response(
+                content="La confirmación expiró. No se consumió el modificador.",
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        await answer(
+            interaction,
+            "Ocurrió un error al activar el modificador.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Usar modificador", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=f"Activando **{self.modifier_name}**...",
+            view=self,
+        )
+        result = await activate_owned_modifier(interaction, self.modifier_name_key)
+        await interaction.edit_original_response(content=result, view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.danger, emoji="✖️")
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Uso cancelado. No se consumió el modificador.",
+            view=None,
+        )
+        self.stop()
+
+
 @bot.tree.command(name="usar", description="Usa una insignia, modificador o ticket que posees.")
 @app_commands.describe(objeto="Nombre de la insignia, modificador o ticket que quieres usar")
 @app_commands.autocomplete(objeto=owned_object_autocomplete)
@@ -1527,6 +1687,13 @@ async def usar(interaction: discord.Interaction, objeto: str) -> None:
             ticket = await find_ticket(interaction, objeto)
             if ticket is None:
                 await answer(interaction, "Ese objeto no existe.")
+                return
+            if not ticket["active"]:
+                await answer(
+                    interaction,
+                    f"El ticket **{ticket['name']}** está inactivo actualmente. "
+                    "Sigue en tu inventario y podrás usarlo cuando vuelva a activarse.",
+                )
                 return
             settings = await bot.db.get_log_settings(guild.id)
             if (
@@ -1581,7 +1748,15 @@ async def usar(interaction: discord.Interaction, objeto: str) -> None:
                 ticket["name_key"],
             )
             if result is None:
-                await answer(interaction, "No tienes ese ticket en tu inventario.")
+                latest_ticket = await find_ticket(interaction, objeto)
+                if latest_ticket is not None and not latest_ticket["active"]:
+                    await answer(
+                        interaction,
+                        f"El ticket **{latest_ticket['name']}** acaba de ser desactivado. "
+                        "No se consumió ninguna unidad.",
+                    )
+                else:
+                    await answer(interaction, "No tienes ese ticket en tu inventario.")
                 return
             alert_embed = discord.Embed(
                 title="🎟️ Ticket utilizado",
@@ -1635,48 +1810,17 @@ async def usar(interaction: discord.Interaction, objeto: str) -> None:
                 f"contactado. Te quedan **{result['quantity']}**.",
             )
             return
-        if interaction.channel_id is None:
-            await answer(interaction, "No pude identificar el canal actual.")
-            return
-        result = await bot.db.activate_modifier(
-            guild.id,
+        view = ModifierUseConfirmView(
             member.id,
+            modifier["name"],
             modifier["name_key"],
-            interaction.channel_id,
-            MODIFIER_DURATION_MINUTES,
-        )
-        if result["status"] == "missing":
-            await answer(interaction, "No tienes ese modificador en tu inventario.")
-            return
-        if result["status"] == "already_active":
-            await answer(
-                interaction,
-                f"Ya tienes activo **{result['name']}**. Termina "
-                f"<t:{int(result['expires_at'].timestamp())}:R>.",
-            )
-            return
-        await bot.db.record_movement(
-            guild.id,
-            member.id,
-            member.id,
-            "modifier_use",
-            None,
-            f"Usó el modificador {result['name']} durante 5 minutos.",
-        )
-        await send_audit_log(
-            guild,
-            "Modificador activado",
-            f"**Miembro:** {member.mention}\n"
-            f"**Modificador:** {result['name']}\n"
-            f"**Restantes:** {result['quantity']}\n"
-            f"**Finaliza:** <t:{int(result['expires_at'].timestamp())}:R>",
-            color=0xA855F7,
-        )
-        bot.modifier_notification_interactions[(guild.id, member.id)] = interaction
-        await answer(
             interaction,
-            f"Activaste **{result['name']}** durante **5 minutos**. "
-            f"Te quedan **{result['quantity']}**.",
+        )
+        await interaction.response.send_message(
+            f"¿Seguro que quieres usar **{modifier['name']}**? Consumirá "
+            f"**1 unidad** y permanecerá activo durante **{MODIFIER_DURATION_MINUTES} minutos**.",
+            view=view,
+            ephemeral=True,
         )
         return
     badge_role = guild.get_role(badge["badge_role_id"])
@@ -1694,6 +1838,9 @@ async def usar(interaction: discord.Interaction, objeto: str) -> None:
             "No tienes esa insignia ni acceso para usarla mediante la whitelist.",
         )
         return
+    whitelist_use_prefix = None
+    if not has_badge and whitelist_access:
+        whitelist_use_prefix, _ = await whitelist_access_source(member)
     if not role_can_be_managed(color_role):
         await answer(interaction, "No puedo asignar ese color. Coloca su rol debajo del rol del bot.")
         return
@@ -1712,10 +1859,21 @@ async def usar(interaction: discord.Interaction, objeto: str) -> None:
     await send_audit_log(
         guild,
         "Color de insignia activado",
-        f"{member.mention} activó **{badge['name']}** ({color_role.mention}).",
+        f"{member.mention} activó **{badge['name']}** ({color_role.mention})."
+        + (
+            f"\n**Acceso:** {whitelist_use_prefix}."
+            if whitelist_use_prefix is not None
+            else ""
+        ),
         color=0x8B5CF6,
     )
-    await answer(interaction, f"Activaste el color de **{badge['name']}**.")
+    if whitelist_use_prefix is not None:
+        await answer(
+            interaction,
+            f"{whitelist_use_prefix}, activaste el color de **{badge['name']}**.",
+        )
+    else:
+        await answer(interaction, f"Activaste el color de **{badge['name']}**.")
 
 
 @bot.tree.command(name="quitar", description="Quita tu rol de color activo.")
@@ -1802,16 +1960,24 @@ async def inventario(
     if tickets:
         ticket_lines = "\n".join(
             f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
-            f"× **{row['quantity']}**\n  {row['description']}"
+            f"× **{row['quantity']}**"
+            f"{' · **Inactivo**' if not row['active'] else ''}\n  {row['description']}"
             for row in tickets
         )
         sections.append(f"__**Tickets consumibles**__\n{ticket_lines}")
     if sections:
         embed.description = "\n\n".join(sections)[:4000]
+        footer_parts = []
         if member.id == requester.id:
-            embed.set_footer(
-                text="Usa /usar para activar una insignia o consumir un objeto."
+            footer_parts.append("Usa /usar para activar una insignia o consumir un objeto.")
+        if whitelist_badges:
+            _, whitelist_footer_reason = await whitelist_access_source(member)
+            footer_parts.append(
+                f"{whitelist_marker(guild.id)} Los objetos con esta marca están disponibles "
+                f"{whitelist_footer_reason}."
             )
+        if footer_parts:
+            embed.set_footer(text=" ".join(footer_parts)[:2048])
     else:
         embed.description = (
             "No tienes insignias, modificadores ni tickets. Puedes conseguir objetos en **/tienda** "
@@ -1880,7 +2046,8 @@ async def objetos(interaction: discord.Interaction) -> None:
             )
             ticket_details.append(
                 f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
-                f"  Ticket consumible · Comprable: {sale}\n"
+                f"  Ticket consumible · Comprable: {sale} · "
+                f"Estado: **{'Activo' if row['active'] else 'Inactivo'}**\n"
                 f"  Descripción: {row['description']}"
             )
         sections.append("__**Tickets**__\n" + "\n".join(ticket_details))
@@ -2465,52 +2632,35 @@ async def exportardatos(interaction: discord.Interaction) -> None:
         )
 
 
-@bot.tree.command(name="añadirbalance", description="Añade monedas a un miembro o rol completo.")
+@bot.tree.command(
+    name="modificarbalance",
+    description="Añade, resta o establece el balance de un miembro o rol.",
+)
 @app_commands.describe(
-    objetivo="Miembro o rol que recibirá las monedas",
-    cantidad="Cantidad a añadir",
+    objetivo="Miembro o rol cuyo balance se modificará",
+    operacion="Cambio que quieres realizar",
+    cantidad="Cantidad que se añadirá, quitará o establecerá",
+)
+@app_commands.choices(
+    operacion=[
+        app_commands.Choice(name="Añadir", value="add"),
+        app_commands.Choice(name="Restar", value="remove"),
+        app_commands.Choice(name="Establecer", value="set"),
+    ]
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def añadirbalance(
+async def modificarbalance(
     interaction: discord.Interaction,
     objetivo: discord.Member | discord.Role,
-    cantidad: app_commands.Range[int, 1, MAX_MONEY],
-) -> None:
-    await handle_balance_command(interaction, objetivo, cantidad, "add")
-
-
-@bot.tree.command(name="quitarbalance", description="Quita monedas a un miembro o rol completo.")
-@app_commands.describe(
-    objetivo="Miembro o rol al que se quitarán monedas",
-    cantidad="Cantidad a quitar",
-)
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def quitarbalance(
-    interaction: discord.Interaction,
-    objetivo: discord.Member | discord.Role,
-    cantidad: app_commands.Range[int, 1, MAX_MONEY],
-) -> None:
-    await handle_balance_command(interaction, objetivo, cantidad, "remove")
-
-
-@bot.tree.command(name="setbalance", description="Establece el balance de un miembro o rol completo.")
-@app_commands.describe(
-    objetivo="Miembro o rol cuyo balance cambiará",
-    cantidad="Nuevo balance",
-)
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def setbalance(
-    interaction: discord.Interaction,
-    objetivo: discord.Member | discord.Role,
+    operacion: str,
     cantidad: app_commands.Range[int, 0, MAX_MONEY],
 ) -> None:
-    await handle_balance_command(interaction, objetivo, cantidad, "set")
+    if operacion in {"add", "remove"} and cantidad == 0:
+        await answer(interaction, "La cantidad debe ser mayor que 0 para añadir o restar.")
+        return
+    await handle_balance_command(interaction, objetivo, cantidad, operacion)
 
 
 @bot.tree.command(name="darobjeto", description="Entrega un objeto a un miembro.")
@@ -2643,45 +2793,128 @@ async def darobjeto(
     await answer(interaction, f"Entregaste **{badge['name']}** a {miembro.mention}.")
 
 
-@bot.tree.command(name="quitarinsignia", description="Retira una insignia a un miembro.")
-@app_commands.describe(miembro="Miembro que perderá la insignia", insignia="Nombre de la insignia")
-@app_commands.autocomplete(insignia=badge_autocomplete)
+@bot.tree.command(name="quitarobjeto", description="Retira un objeto a un miembro.")
+@app_commands.describe(
+    miembro="Miembro que perderá el objeto",
+    objeto="Insignia, modificador o ticket que se retirará",
+    cantidad="Cantidad; para insignias debe ser 1",
+)
+@app_commands.autocomplete(objeto=editable_object_autocomplete)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def quitarinsignia(interaction: discord.Interaction, miembro: discord.Member, insignia: str) -> None:
+async def quitarobjeto(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+    objeto: str,
+    cantidad: app_commands.Range[int, 1, 1000] = 1,
+) -> None:
     guild = interaction.guild
-    badge = await find_badge(interaction, insignia)
-    if guild is None or badge is None:
-        await answer(interaction, "Esa insignia no existe.")
+    if guild is None:
         return
-    badge_role = guild.get_role(badge["badge_role_id"])
-    color_role = guild.get_role(badge["color_role_id"])
-    if badge_role is None or badge_role not in miembro.roles:
-        await answer(interaction, f"{miembro.mention} no tiene esa insignia.")
+    badge = await find_badge(interaction, objeto)
+    modifier = None if badge is not None else await find_modifier(interaction, objeto)
+    ticket = (
+        None
+        if badge is not None or modifier is not None
+        else await find_ticket(interaction, objeto)
+    )
+    if badge is None and modifier is None and ticket is None:
+        await answer(interaction, "Ese objeto no existe.")
         return
-    roles = [badge_role]
-    if color_role is not None and color_role in miembro.roles:
-        roles.append(color_role)
+
+    if badge is not None:
+        if cantidad != 1:
+            await answer(interaction, "Las insignias son únicas; usa **cantidad: 1**.")
+            return
+        badge_role = guild.get_role(badge["badge_role_id"])
+        color_role = guild.get_role(badge["color_role_id"])
+        if badge_role is None or badge_role not in miembro.roles:
+            await answer(interaction, f"{miembro.mention} no tiene esa insignia.")
+            return
+        roles = [badge_role]
+        if color_role is not None and color_role in miembro.roles:
+            roles.append(color_role)
+        await interaction.response.defer()
+        await miembro.remove_roles(
+            *roles,
+            reason=f"Insignia retirada por {interaction.user}",
+        )
+        await bot.db.record_movement(
+            guild.id,
+            miembro.id,
+            interaction.user.id,
+            "badge_remove",
+            None,
+            f"Se retiró la insignia {badge['name']}.",
+        )
+        await send_audit_log(
+            guild,
+            "Insignia retirada",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Miembro:** {miembro.mention}\n"
+            f"**Insignia:** {badge['name']} ({badge_role.mention})",
+            color=0xEF4444,
+        )
+        await answer(interaction, f"Quitaste **{badge['name']}** a {miembro.mention}.")
+        return
+
+    item = modifier or ticket
+    is_modifier = modifier is not None
+    inventory = (
+        await bot.db.list_modifier_inventory(guild.id, miembro.id)
+        if is_modifier
+        else await bot.db.list_ticket_inventory(guild.id, miembro.id)
+    )
+    current_quantity = next(
+        (row["quantity"] for row in inventory if row["id"] == item["id"]),
+        0,
+    )
+    if current_quantity <= 0:
+        await answer(interaction, f"{miembro.mention} no tiene **{item['name']}**.")
+        return
+    removed = min(current_quantity, cantidad)
     await interaction.response.defer()
-    await miembro.remove_roles(*roles, reason=f"Insignia retirada por {interaction.user}")
+    quantity = (
+        await bot.db.remove_modifier_inventory(
+            guild.id,
+            miembro.id,
+            item["id"],
+            cantidad,
+        )
+        if is_modifier
+        else await bot.db.remove_ticket_inventory(
+            guild.id,
+            miembro.id,
+            item["id"],
+            cantidad,
+        )
+    )
+    item_type = "modificador" if is_modifier else "ticket"
+    action = "modifier_remove" if is_modifier else "ticket_remove"
     await bot.db.record_movement(
         guild.id,
         miembro.id,
         interaction.user.id,
-        "badge_remove",
-        None,
-        f"Se retiró la insignia {badge['name']}.",
+        action,
+        -removed,
+        f"Un administrador retiró {removed} de {item['name']}.",
     )
     await send_audit_log(
         guild,
-        "Insignia retirada",
+        f"{item_type.capitalize()} retirado",
         f"**Administrador:** {interaction.user.mention}\n"
         f"**Miembro:** {miembro.mention}\n"
-        f"**Insignia:** {badge['name']} ({badge_role.mention})",
+        f"**{item_type.capitalize()}:** {item['name']}\n"
+        f"**Cantidad retirada:** {removed}\n"
+        f"**Restantes:** {quantity}",
         color=0xEF4444,
     )
-    await answer(interaction, f"Quitaste **{badge['name']}** a {miembro.mention}.")
+    await answer(
+        interaction,
+        f"Retiraste **{removed}** de **{item['name']}** a {miembro.mention}. "
+        f"Ahora tiene **{quantity}**.",
+    )
 
 
 @bot.tree.command(name="configurarinsignia", description="Configura una insignia y su rol de color.")
@@ -2901,6 +3134,7 @@ async def configurarmodificador(
     nombre="Nombre del ticket",
     comprable="Indica si aparecerá en la tienda",
     descripcion="Explica para qué sirve el ticket",
+    activo="Indica si el ticket se puede usar actualmente",
     precio="Precio; usa 0 si no será comprable",
     apartado="Apartado de la tienda; por defecto será General",
     emoji="Emoji opcional: Unicode, :nombre: o ID del servidor/bot",
@@ -2914,6 +3148,7 @@ async def configurarticket(
     nombre: str,
     comprable: bool,
     descripcion: str,
+    activo: bool,
     precio: app_commands.Range[int, 0, MAX_MONEY] = 0,
     apartado: str | None = None,
     emoji: str | None = None,
@@ -2971,6 +3206,7 @@ async def configurarticket(
             final_section,
             final_emoji,
             final_description,
+            activo,
         )
     except asyncpg.UniqueViolationError:
         await answer(interaction, "Ya existe un ticket con ese nombre.")
@@ -2992,10 +3228,15 @@ async def configurarticket(
         f"**Precio:** {money(precio, interaction.guild_id)}\n"
         f"**Apartado:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}\n"
+        f"**Estado:** {'Activo' if activo else 'Inactivo'}\n"
         f"**Descripción:** {final_description}",
         color=0x06B6D4,
     )
-    await answer(interaction, f"Configuré el ticket **{display_name}** correctamente.")
+    await answer(
+        interaction,
+        f"Configuré el ticket **{display_name}** como "
+        f"**{'activo' if activo else 'inactivo'}**.",
+    )
 
 
 @bot.tree.command(name="editar", description="Edita una insignia, modificador o ticket.")
@@ -3011,6 +3252,7 @@ async def configurarticket(
     emoji="Emoji, :nombre: o ID; escribe quitar para eliminarlo",
     mensajes="Para modificadores: nueva lista separada por |",
     descripcion="Para tickets: nueva descripción",
+    activo="Para tickets: permitir o impedir su uso",
 )
 @app_commands.autocomplete(
     objeto=editable_object_autocomplete,
@@ -3032,6 +3274,7 @@ async def editar(
     emoji: str | None = None,
     mensajes: str | None = None,
     descripcion: str | None = None,
+    activo: bool | None = None,
 ) -> None:
     assert interaction.guild_id is not None
     guild = interaction.guild
@@ -3105,6 +3348,9 @@ async def editar(
             return
         if descripcion is not None:
             await answer(interaction, "La opción descripción solo se usa con tickets.")
+            return
+        if activo is not None:
+            await answer(interaction, "La opción activo solo se usa con tickets.")
             return
         if permitir_whitelist is not None:
             await answer(
@@ -3190,6 +3436,7 @@ async def editar(
         final_description = (
             descripcion.strip() if descripcion is not None else current_ticket["description"]
         )
+        final_active = activo if activo is not None else current_ticket["active"]
         if not final_description or len(final_description) > 1000:
             await answer(
                 interaction,
@@ -3208,6 +3455,7 @@ async def editar(
                 final_section,
                 final_emoji,
                 final_description,
+                final_active,
             )
         except asyncpg.UniqueViolationError:
             await answer(interaction, "Ya existe un ticket con ese nombre.")
@@ -3233,16 +3481,17 @@ async def editar(
             f"**Precio:** {money(final_price, interaction.guild_id)}\n"
             f"**Apartado:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}\n"
+            f"**Estado:** {'Activo' if final_active else 'Inactivo'}\n"
             f"**Descripción:** {final_description}",
             color=0x06B6D4,
         )
         await answer(interaction, f"Actualicé el ticket **{final_name}**.")
         return
 
-    if mensajes is not None or descripcion is not None:
+    if mensajes is not None or descripcion is not None or activo is not None:
         await answer(
             interaction,
-            "Las opciones mensajes y descripción no se usan con insignias.",
+            "Las opciones mensajes, descripción y activo no se usan con insignias.",
         )
         return
     if await bot.db.get_modifier(interaction.guild_id, final_name_key):
@@ -3315,154 +3564,70 @@ async def editar(
     await answer(interaction, f"Actualicé la insignia **{final_name}**.")
 
 
-@bot.tree.command(name="borrarinsignia", description="Borra la configuración de una insignia.")
-@app_commands.describe(insignia="Nombre de la insignia que se borrará")
-@app_commands.autocomplete(insignia=badge_autocomplete)
+@bot.tree.command(name="borrarobjeto", description="Borra un objeto configurado.")
+@app_commands.describe(objeto="Insignia, modificador o ticket que se borrará")
+@app_commands.autocomplete(objeto=editable_object_autocomplete)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def borrarinsignia(interaction: discord.Interaction, insignia: str) -> None:
+async def borrarobjeto(interaction: discord.Interaction, objeto: str) -> None:
     assert interaction.guild_id is not None
+    badge = await find_badge(interaction, objeto)
+    modifier = None if badge is not None else await find_modifier(interaction, objeto)
+    ticket = (
+        None
+        if badge is not None or modifier is not None
+        else await find_ticket(interaction, objeto)
+    )
+    if badge is None and modifier is None and ticket is None:
+        await answer(interaction, "Ese objeto no existe.")
+        return
     await interaction.response.defer()
-    deleted = await bot.db.delete_badge(interaction.guild_id, normalize_name(insignia))
-    if deleted is None:
-        await answer(interaction, "Esa insignia no existe.")
-        return
-    if interaction.guild is not None:
-        await bot.db.record_movement(
+    if badge is not None:
+        deleted = await bot.db.delete_badge(interaction.guild_id, badge["name_key"])
+        item_type = "insignia"
+        action = "badge_config_delete"
+        extra = "Los roles de Discord no fueron eliminados."
+    elif modifier is not None:
+        deleted = await bot.db.delete_modifier(
             interaction.guild_id,
-            None,
-            interaction.user.id,
-            "badge_config_delete",
-            None,
-            f"Borró la configuración de {deleted['name']}.",
+            modifier["name_key"],
         )
-        await send_audit_log(
-            interaction.guild,
-            "Configuración de insignia borrada",
-            f"**Administrador:** {interaction.user.mention}\n"
-            f"**Insignia:** {deleted['name']}\n"
-            "Los roles de Discord no fueron eliminados.",
-            color=0xEF4444,
+        item_type = "modificador"
+        action = "modifier_config_delete"
+        extra = "Sus unidades y activaciones también fueron eliminadas."
+    else:
+        deleted = await bot.db.delete_ticket(
+            interaction.guild_id,
+            ticket["name_key"],
         )
-    await answer(interaction, f"Borré **{deleted['name']}**. No eliminé ningún rol del servidor.")
-
-
-@bot.tree.command(name="quitarmodificador", description="Retira unidades de un modificador.")
-@app_commands.describe(
-    miembro="Miembro que perderá el modificador",
-    modificador="Nombre del modificador",
-    cantidad="Cantidad que se retirará",
-)
-@app_commands.autocomplete(modificador=modifier_autocomplete)
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def quitarmodificador(
-    interaction: discord.Interaction,
-    miembro: discord.Member,
-    modificador: str,
-    cantidad: app_commands.Range[int, 1, 1000] = 1,
-) -> None:
-    assert interaction.guild_id is not None
-    item = await find_modifier(interaction, modificador)
-    if item is None:
-        await answer(interaction, "Ese modificador no existe.")
+        item_type = "ticket"
+        action = "ticket_config_delete"
+        extra = "Sus unidades de inventario también fueron eliminadas."
+    if deleted is None:
+        await answer(interaction, "Ese objeto ya no existe.")
         return
-    inventory = await bot.db.list_modifier_inventory(interaction.guild_id, miembro.id)
-    current_quantity = next(
-        (row["quantity"] for row in inventory if row["id"] == item["id"]),
-        0,
-    )
-    removed = min(current_quantity, cantidad)
-    quantity = await bot.db.remove_modifier_inventory(
-        interaction.guild_id,
-        miembro.id,
-        item["id"],
-        cantidad,
-    )
     await bot.db.record_movement(
         interaction.guild_id,
-        miembro.id,
+        None,
         interaction.user.id,
-        "modifier_remove",
-        -removed,
-        f"Un administrador retiró {removed} de {item['name']}.",
+        action,
+        None,
+        f"Borró el {item_type} {deleted['name']}.",
     )
     if interaction.guild is not None:
         await send_audit_log(
             interaction.guild,
-            "Modificador retirado",
+            "Objeto borrado",
             f"**Administrador:** {interaction.user.mention}\n"
-            f"**Miembro:** {miembro.mention}\n"
-            f"**Modificador:** {item['name']}\n"
-            f"**Cantidad retirada:** {removed}\n"
-            f"**Restantes:** {quantity}",
+            f"**Tipo:** {item_type.capitalize()}\n"
+            f"**Objeto:** {deleted['name']}\n"
+            f"{extra}",
             color=0xEF4444,
         )
     await answer(
         interaction,
-        f"Retiraste hasta **{cantidad}** de **{item['name']}** a {miembro.mention}. "
-        f"Ahora tiene **{quantity}**.",
-    )
-
-
-@bot.tree.command(name="quitarticket", description="Retira unidades de un ticket.")
-@app_commands.describe(
-    miembro="Miembro que perderá el ticket",
-    ticket="Nombre del ticket",
-    cantidad="Cantidad que se retirará",
-)
-@app_commands.autocomplete(ticket=ticket_autocomplete)
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def quitarticket(
-    interaction: discord.Interaction,
-    miembro: discord.Member,
-    ticket: str,
-    cantidad: app_commands.Range[int, 1, 1000] = 1,
-) -> None:
-    assert interaction.guild_id is not None
-    item = await find_ticket(interaction, ticket)
-    if item is None:
-        await answer(interaction, "Ese ticket no existe.")
-        return
-    inventory = await bot.db.list_ticket_inventory(interaction.guild_id, miembro.id)
-    current_quantity = next(
-        (row["quantity"] for row in inventory if row["id"] == item["id"]),
-        0,
-    )
-    removed = min(current_quantity, cantidad)
-    quantity = await bot.db.remove_ticket_inventory(
-        interaction.guild_id,
-        miembro.id,
-        item["id"],
-        cantidad,
-    )
-    await bot.db.record_movement(
-        interaction.guild_id,
-        miembro.id,
-        interaction.user.id,
-        "ticket_remove",
-        -removed,
-        f"Un administrador retiró {removed} de {item['name']}.",
-    )
-    if interaction.guild is not None:
-        await send_audit_log(
-            interaction.guild,
-            "Ticket retirado",
-            f"**Administrador:** {interaction.user.mention}\n"
-            f"**Miembro:** {miembro.mention}\n"
-            f"**Ticket:** {item['name']}\n"
-            f"**Cantidad retirada:** {removed}\n"
-            f"**Restantes:** {quantity}",
-            color=0xEF4444,
-        )
-    await answer(
-        interaction,
-        f"Retiraste hasta **{cantidad}** de **{item['name']}** a {miembro.mention}. "
-        f"Ahora tiene **{quantity}**.",
+        f"Borré el {item_type} **{deleted['name']}**. {extra}",
     )
 
 
@@ -3563,88 +3728,6 @@ async def estadomodificador(
     )
 
 
-@bot.tree.command(name="borrarmodificador", description="Borra un modificador configurado.")
-@app_commands.describe(modificador="Nombre del modificador que se borrará")
-@app_commands.autocomplete(modificador=modifier_autocomplete)
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def borrarmodificador(
-    interaction: discord.Interaction,
-    modificador: str,
-) -> None:
-    assert interaction.guild_id is not None
-    deleted = await bot.db.delete_modifier(
-        interaction.guild_id,
-        normalize_name(modificador),
-    )
-    if deleted is None:
-        await answer(interaction, "Ese modificador no existe.")
-        return
-    await bot.db.record_movement(
-        interaction.guild_id,
-        None,
-        interaction.user.id,
-        "modifier_config_delete",
-        None,
-        f"Borró el modificador {deleted['name']}.",
-    )
-    if interaction.guild is not None:
-        await send_audit_log(
-            interaction.guild,
-            "Modificador borrado",
-            f"**Administrador:** {interaction.user.mention}\n"
-            f"**Modificador:** {deleted['name']}\n"
-            "Sus unidades y activaciones también fueron eliminadas.",
-            color=0xEF4444,
-        )
-    await answer(
-        interaction,
-        f"Borré el modificador **{deleted['name']}** y sus unidades de inventario.",
-    )
-
-
-@bot.tree.command(name="borrarticket", description="Borra un ticket configurado.")
-@app_commands.describe(ticket="Nombre del ticket que se borrará")
-@app_commands.autocomplete(ticket=ticket_autocomplete)
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def borrarticket(
-    interaction: discord.Interaction,
-    ticket: str,
-) -> None:
-    assert interaction.guild_id is not None
-    deleted = await bot.db.delete_ticket(
-        interaction.guild_id,
-        normalize_name(ticket),
-    )
-    if deleted is None:
-        await answer(interaction, "Ese ticket no existe.")
-        return
-    await bot.db.record_movement(
-        interaction.guild_id,
-        None,
-        interaction.user.id,
-        "ticket_config_delete",
-        None,
-        f"Borró el ticket {deleted['name']}.",
-    )
-    if interaction.guild is not None:
-        await send_audit_log(
-            interaction.guild,
-            "Ticket borrado",
-            f"**Administrador:** {interaction.user.mention}\n"
-            f"**Ticket:** {deleted['name']}\n"
-            "Sus unidades de inventario también fueron eliminadas.",
-            color=0xEF4444,
-        )
-    await answer(
-        interaction,
-        f"Borré el ticket **{deleted['name']}** y sus unidades de inventario.",
-    )
-
-
 @bot.tree.command(name="ayuda", description="Muestra la guía de comandos de Sularea.")
 @app_commands.guild_only()
 async def ayuda(interaction: discord.Interaction) -> None:
@@ -3685,13 +3768,12 @@ async def ayuda(interaction: discord.Interaction) -> None:
             name="Administración",
             value=(
                 "`/inventario [miembro]` · `/objetos`\n"
-                "`/darobjeto` · `/quitarinsignia` · `/quitarmodificador` · `/quitarticket`\n"
+                "`/darobjeto` · `/quitarobjeto` · `/borrarobjeto`\n"
                 "`/configurarinsignia` · `/configurarmodificador` · `/configurarticket`\n"
-                "`/editar` · `/borrarinsignia` · `/borrarmodificador` · `/borrarticket`\n"
-                "`/estadomodificador`\n"
+                "`/editar` · `/estadomodificador`\n"
                 "`/añadiradmin` · `/quitaradmin` · `/admins`\n"
                 "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`\n"
-                "`/revisarbalance` · `/añadirbalance` · `/quitarbalance` · `/setbalance`\n"
+                "`/revisarbalance` · `/modificarbalance`\n"
                 "`/eventopregunta` · `/cancelarevento`\n"
                 "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`"
                 "\n`/configurarmoneda` · `/configuraremojiwhitelist`"

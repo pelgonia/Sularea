@@ -69,8 +69,12 @@ CREATE TABLE IF NOT EXISTS tickets (
     shop_section TEXT,
     emoji TEXT,
     description TEXT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
     UNIQUE (guild_id, name_key)
 );
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
 
 CREATE INDEX IF NOT EXISTS tickets_shop_index
 ON tickets (guild_id, purchasable, price);
@@ -481,7 +485,8 @@ class Database:
             SELECT
                 'badge' AS item_type, name, name_key, price, shop_section,
                 emoji, badge_role_id, color_role_id, NULL::BIGINT AS modifier_id,
-                NULL::BIGINT AS ticket_id, NULL::TEXT AS description
+                NULL::BIGINT AS ticket_id, NULL::TEXT AS description,
+                NULL::BOOLEAN AS active
             FROM badges
             WHERE guild_id = $1 AND purchasable = TRUE
             UNION ALL
@@ -489,7 +494,8 @@ class Database:
                 'modifier' AS item_type, name, name_key, price, shop_section,
                 emoji, NULL::BIGINT AS badge_role_id,
                 NULL::BIGINT AS color_role_id, id AS modifier_id,
-                NULL::BIGINT AS ticket_id, NULL::TEXT AS description
+                NULL::BIGINT AS ticket_id, NULL::TEXT AS description,
+                NULL::BOOLEAN AS active
             FROM modifiers
             WHERE guild_id = $1 AND purchasable = TRUE
             UNION ALL
@@ -497,7 +503,7 @@ class Database:
                 'ticket' AS item_type, name, name_key, price, shop_section,
                 emoji, NULL::BIGINT AS badge_role_id,
                 NULL::BIGINT AS color_role_id, NULL::BIGINT AS modifier_id,
-                id AS ticket_id, description
+                id AS ticket_id, description, active
             FROM tickets
             WHERE guild_id = $1 AND purchasable = TRUE
             ORDER BY shop_section NULLS FIRST, price, name
@@ -613,14 +619,15 @@ class Database:
         shop_section: str | None,
         emoji: str | None,
         description: str,
+        active: bool,
     ) -> None:
         await self._pool().execute(
             """
             INSERT INTO tickets (
                 guild_id, name, name_key, purchasable, price,
-                shop_section, emoji, description
+                shop_section, emoji, description, active
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             """,
             guild_id,
             name,
@@ -630,6 +637,7 @@ class Database:
             shop_section,
             emoji,
             description,
+            active,
         )
 
     async def update_ticket(
@@ -643,6 +651,7 @@ class Database:
         shop_section: str | None,
         emoji: str | None,
         description: str,
+        active: bool,
     ) -> bool:
         result = await self._pool().execute(
             """
@@ -653,7 +662,8 @@ class Database:
                 price = $6,
                 shop_section = $7,
                 emoji = $8,
-                description = $9
+                description = $9,
+                active = $10
             WHERE guild_id = $1 AND name_key = $2
             """,
             guild_id,
@@ -665,6 +675,7 @@ class Database:
             shop_section,
             emoji,
             description,
+            active,
         )
         return result == "UPDATE 1"
 
@@ -807,6 +818,7 @@ class Database:
               AND ticket.id = inventory.ticket_id
               AND ticket.guild_id = $1
               AND ticket.name_key = $3
+              AND ticket.active = TRUE
             RETURNING ticket.id, ticket.name, ticket.description,
                       inventory.quantity
             """,
@@ -877,6 +889,7 @@ class Database:
                     "price": ticket["price"],
                     "new_balance": new_balance,
                     "quantity": quantity,
+                    "active": ticket["active"],
                 }
 
     async def purchase_modifier(
@@ -1423,7 +1436,7 @@ class Database:
         tickets = await self._pool().fetch(
             """
             SELECT id, name, name_key, purchasable, price,
-                   shop_section, emoji, description
+                   shop_section, emoji, description, active
             FROM tickets WHERE guild_id = $1 ORDER BY name
             """,
             guild_id,
