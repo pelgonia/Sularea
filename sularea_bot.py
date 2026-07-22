@@ -987,6 +987,53 @@ async def modifier_autocomplete(
     ][:25]
 
 
+async def modifier_message_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None or not hasattr(bot, "db"):
+        return []
+    modifier_name = getattr(interaction.namespace, "modificador", None)
+    action = getattr(interaction.namespace, "accion", None)
+    if not isinstance(modifier_name, str) or action == "add":
+        return []
+    modifier = await bot.db.get_modifier(
+        interaction.guild_id,
+        normalize_name(modifier_name),
+    )
+    if modifier is None:
+        return []
+    search = normalize_name(current)
+    choices = []
+    for index, message in enumerate(modifier["messages"]):
+        preview = " ".join(message.split())
+        label = f"{index + 1}. {preview}"
+        if search and search not in normalize_name(label):
+            continue
+        choices.append(
+            app_commands.Choice(
+                name=label[:100],
+                value=f"#{index + 1}",
+            )
+        )
+    return choices[:25]
+
+
+def modifier_message_index(messages: list[str], selected: str) -> int | None:
+    cleaned = selected.strip()
+    if cleaned.startswith("#") and cleaned[1:].isdigit():
+        index = int(cleaned[1:]) - 1
+        return index if 0 <= index < len(messages) else None
+    normalized = normalize_name(cleaned)
+    return next(
+        (
+            index
+            for index, message in enumerate(messages)
+            if normalize_name(message) == normalized
+        ),
+        None,
+    )
+
+
 async def ticket_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
@@ -3443,6 +3490,172 @@ async def configurarmodificador(
     )
 
 
+@bot.tree.command(
+    name="editarmensajes",
+    description="Añade, edita o quita mensajes individuales de un modificador.",
+)
+@app_commands.describe(
+    modificador="Modificador cuyos mensajes quieres cambiar",
+    accion="Añadir, editar o quitar un mensaje",
+    mensaje="Mensaje nuevo al añadir; mensaje actual al editar o quitar",
+    nuevo_mensaje="Texto de reemplazo; solo se usa con la acción Editar",
+)
+@app_commands.choices(
+    accion=[
+        app_commands.Choice(name="Añadir", value="add"),
+        app_commands.Choice(name="Editar", value="edit"),
+        app_commands.Choice(name="Quitar", value="remove"),
+    ]
+)
+@app_commands.autocomplete(
+    modificador=modifier_autocomplete,
+    mensaje=modifier_message_autocomplete,
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def editarmensajes(
+    interaction: discord.Interaction,
+    modificador: str,
+    accion: str,
+    mensaje: str,
+    nuevo_mensaje: str | None = None,
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    current = await find_modifier(interaction, modificador)
+    if current is None:
+        await answer(interaction, "Ese modificador no existe.")
+        return
+    messages = list(current["messages"])
+    old_message: str | None = None
+    added_or_updated_message: str | None = None
+
+    if accion == "add":
+        if nuevo_mensaje is not None:
+            await answer(
+                interaction,
+                "Para añadir, escribe el texto solamente en la opción mensaje.",
+            )
+            return
+        added_or_updated_message = mensaje.strip()
+        if not added_or_updated_message or len(added_or_updated_message) > 1900:
+            await answer(interaction, "El mensaje debe tener entre 1 y 1.900 caracteres.")
+            return
+        if len(messages) >= 20:
+            await answer(interaction, "Ese modificador ya tiene el máximo de 20 mensajes.")
+            return
+        if any(
+            normalize_name(item) == normalize_name(added_or_updated_message)
+            for item in messages
+        ):
+            await answer(interaction, "Ese mensaje ya existe en el modificador.")
+            return
+        messages.append(added_or_updated_message)
+        action_label = "Añadido"
+        response_verb = "Añadí"
+        movement_action = "modifier_message_add"
+    elif accion in {"edit", "remove"}:
+        selected_index = modifier_message_index(messages, mensaje)
+        if selected_index is None:
+            await answer(
+                interaction,
+                "Selecciona uno de los mensajes actuales que muestra el comando.",
+            )
+            return
+        old_message = messages[selected_index]
+        if accion == "remove":
+            if nuevo_mensaje is not None:
+                await answer(
+                    interaction,
+                    "La opción nuevo_mensaje solo se usa con la acción Editar.",
+                )
+                return
+            if len(messages) == 1:
+                await answer(
+                    interaction,
+                    "No puedes quitar el último mensaje del modificador. Edítalo en su lugar.",
+                )
+                return
+            messages.pop(selected_index)
+            action_label = "Quitado"
+            response_verb = "Quité"
+            movement_action = "modifier_message_remove"
+        else:
+            added_or_updated_message = (nuevo_mensaje or "").strip()
+            if not added_or_updated_message or len(added_or_updated_message) > 1900:
+                await answer(
+                    interaction,
+                    "Para editar debes escribir nuevo_mensaje con entre 1 y 1.900 caracteres.",
+                )
+                return
+            if any(
+                index != selected_index
+                and normalize_name(item) == normalize_name(added_or_updated_message)
+                for index, item in enumerate(messages)
+            ):
+                await answer(interaction, "Ese mensaje ya existe en el modificador.")
+                return
+            messages[selected_index] = added_or_updated_message
+            action_label = "Editado"
+            response_verb = "Edité"
+            movement_action = "modifier_message_edit"
+    else:
+        await answer(interaction, "La acción seleccionada no es válida.")
+        return
+
+    await interaction.response.defer()
+    updated = await bot.db.update_modifier(
+        interaction.guild_id,
+        current["name_key"],
+        current["name"],
+        current["name_key"],
+        current["purchasable"],
+        current["price"],
+        current["shop_section"],
+        current["emoji"],
+        messages,
+        current["trigger_numerator"],
+        current["trigger_denominator"],
+        current["cooldown_seconds"],
+        current["duration_minutes"],
+    )
+    if not updated:
+        await answer(interaction, "Ese modificador ya no existe.")
+        return
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        movement_action,
+        None,
+        f"{action_label} un mensaje de {current['name']}.",
+    )
+    details = (
+        f"**Anterior:** {old_message[:700]}\n"
+        f"**Nuevo:** {added_or_updated_message[:700]}"
+        if old_message is not None and added_or_updated_message is not None
+        else f"**Mensaje:** {(added_or_updated_message or old_message or '')[:1400]}"
+    )
+    await send_audit_log(
+        guild,
+        f"Mensaje de modificador: {action_label.lower()}",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Modificador:** {current['name']}\n"
+        f"**Acción:** {action_label}\n"
+        f"**Mensajes totales:** {len(messages)}\n"
+        f"{details}",
+        color=0xA855F7,
+    )
+    await answer(
+        interaction,
+        f"{response_verb} correctamente el mensaje de **{current['name']}**. "
+        f"Ahora tiene **{len(messages)} mensajes**.",
+    )
+
+
 @bot.tree.command(name="configurarticket", description="Configura un ticket consumible.")
 @app_commands.describe(
     nombre="Nombre del ticket",
@@ -3564,7 +3777,6 @@ async def configurarticket(
     precio="Nuevo precio",
     apartado="Nuevo apartado de la tienda",
     emoji="Emoji, :nombre: o ID; escribe quitar para eliminarlo",
-    mensajes="Para modificadores: nueva lista separada por |",
     descripcion="Para tickets: nueva descripción",
     activo="Para tickets: permitir o impedir su uso",
     probabilidad="Para modificadores: porcentaje (25) o fracción (1/4)",
@@ -3589,7 +3801,6 @@ async def editar(
     precio: int | None = None,
     apartado: str | None = None,
     emoji: str | None = None,
-    mensajes: str | None = None,
     descripcion: str | None = None,
     activo: bool | None = None,
     probabilidad: str | None = None,
@@ -3685,12 +3896,6 @@ async def editar(
             await answer(interaction, "Ya existe un ticket con ese nombre.")
             return
         final_messages = list(current_modifier["messages"])
-        if mensajes is not None:
-            parsed_messages, messages_error = parse_modifier_messages(mensajes)
-            if messages_error is not None or parsed_messages is None:
-                await answer(interaction, messages_error or "Los mensajes no son válidos.")
-                return
-            final_messages = parsed_messages
         if probabilidad is not None:
             parsed_probability, probability_error = parse_modifier_probability(probabilidad)
             if probability_error is not None or parsed_probability is None:
@@ -3776,9 +3981,6 @@ async def editar(
         if rol_insignia is not None or rol_color is not None:
             await answer(interaction, "Los tickets no utilizan roles de Discord.")
             return
-        if mensajes is not None:
-            await answer(interaction, "La opción mensajes solo se usa con modificadores.")
-            return
         if probabilidad is not None or cooldown is not None or duracion is not None:
             await answer(
                 interaction,
@@ -3853,8 +4055,7 @@ async def editar(
         return
 
     if (
-        mensajes is not None
-        or descripcion is not None
+        descripcion is not None
         or activo is not None
         or probabilidad is not None
         or cooldown is not None
@@ -4146,7 +4347,7 @@ async def ayuda(interaction: discord.Interaction) -> None:
                 "`/inventario [miembro]` · `/objetos`\n"
                 "`/darobjeto` · `/quitarobjeto` · `/borrarobjeto`\n"
                 "`/configurarinsignia` · `/configurarmodificador` · `/configurarticket`\n"
-                "`/editar` · `/estadomodificador`\n"
+                "`/editar` · `/editarmensajes` · `/estadomodificador`\n"
                 "`/añadiradmin` · `/quitaradmin` · `/admins`\n"
                 "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`\n"
                 "`/revisarbalance` · `/modificarbalance`\n"
@@ -4161,7 +4362,8 @@ async def ayuda(interaction: discord.Interaction) -> None:
             value=(
                 "En `/configurarmodificador` y `/editar`, escribe `25` para 25% "
                 "o `1/4` para la misma probabilidad. El cooldown se indica en "
-                "segundos y la duración en minutos."
+                "segundos y la duración en minutos. Usa `/editarmensajes` para "
+                "añadir, reemplazar o quitar mensajes individuales."
             ),
             inline=False,
         )
