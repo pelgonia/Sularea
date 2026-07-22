@@ -67,10 +67,14 @@ CREATE TABLE IF NOT EXISTS active_modifiers (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     modifier_id BIGINT NOT NULL REFERENCES modifiers(id) ON DELETE CASCADE,
+    channel_id BIGINT,
     expires_at TIMESTAMPTZ NOT NULL,
     last_trigger_at TIMESTAMPTZ,
     PRIMARY KEY (guild_id, user_id)
 );
+
+ALTER TABLE active_modifiers
+ADD COLUMN IF NOT EXISTS channel_id BIGINT;
 
 CREATE INDEX IF NOT EXISTS active_modifiers_expiration_index
 ON active_modifiers (expires_at);
@@ -631,6 +635,7 @@ class Database:
         guild_id: int,
         user_id: int,
         name_key: str,
+        channel_id: int,
         duration_minutes: int = 5,
     ) -> dict:
         async with self._pool().acquire() as connection:
@@ -687,14 +692,18 @@ class Database:
                 expires_at = await connection.fetchval(
                     """
                     INSERT INTO active_modifiers (
-                        guild_id, user_id, modifier_id, expires_at
+                        guild_id, user_id, modifier_id, channel_id, expires_at
                     )
-                    VALUES ($1, $2, $3, NOW() + ($4::INTEGER * INTERVAL '1 minute'))
+                    VALUES (
+                        $1, $2, $3, $4,
+                        NOW() + ($5::INTEGER * INTERVAL '1 minute')
+                    )
                     RETURNING expires_at
                     """,
                     guild_id,
                     user_id,
                     inventory["modifier_id"],
+                    channel_id,
                     duration_minutes,
                 )
                 return {
@@ -737,9 +746,9 @@ class Database:
             WITH expired AS (
                 DELETE FROM active_modifiers
                 WHERE expires_at <= NOW()
-                RETURNING guild_id, user_id, modifier_id
+                RETURNING guild_id, user_id, modifier_id, channel_id
             )
-            SELECT expired.guild_id, expired.user_id, modifier.name
+            SELECT expired.guild_id, expired.user_id, expired.channel_id, modifier.name
             FROM expired
             JOIN modifiers AS modifier ON modifier.id = expired.modifier_id
             """
@@ -899,7 +908,7 @@ class Database:
         )
         active_modifiers = await self._pool().fetch(
             """
-            SELECT user_id, modifier_id, expires_at, last_trigger_at
+            SELECT user_id, modifier_id, channel_id, expires_at, last_trigger_at
             FROM active_modifiers WHERE guild_id = $1
             ORDER BY user_id
             """,
