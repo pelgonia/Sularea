@@ -1771,26 +1771,27 @@ async def inventario(
         and row["whitelist_enabled"]
         and guild.get_role(row["badge_role_id"]) not in member.roles
     ]
+    owned_keys = {row["name_key"] for row in owned}
+    whitelist_keys = {row["name_key"] for row in whitelist_badges}
+    available_badges = [
+        row
+        for row in rows
+        if row["name_key"] in owned_keys or row["name_key"] in whitelist_keys
+    ]
     modifiers = await bot.db.list_modifier_inventory(guild.id, member.id)
     tickets = await bot.db.list_ticket_inventory(guild.id, member.id)
     embed = discord.Embed(title=f"Inventario de {member.display_name}", color=0x8B5CF6)
     embed.set_thumbnail(url=member.display_avatar.url)
     sections = []
-    if owned:
+    if available_badges:
         badge_lines = "\n".join(
-            f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
-            f"(<@&{row['color_role_id']}>)"
-            for row in owned
-        )
-        sections.append(f"__**Insignias**__\n{badge_lines}")
-    if whitelist_badges:
-        whitelist_lines = "\n".join(
-            f"• {whitelist_marker(guild.id)} "
+            f"• "
+            f"{f'{whitelist_marker(guild.id)} ' if row['name_key'] in whitelist_keys else ''}"
             f"{badge_emoji(row['emoji'], guild)}**{row['name']}** "
             f"(<@&{row['color_role_id']}>)"
-            for row in whitelist_badges
+            for row in available_badges
         )
-        sections.append(f"__**Acceso por whitelist**__\n{whitelist_lines}")
+        sections.append(f"__**Insignias**__\n{badge_lines}")
     if modifiers:
         modifier_lines = "\n".join(
             f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
