@@ -7,6 +7,7 @@ import random
 import traceback
 import unicodedata
 from datetime import datetime, timezone
+from fractions import Fraction
 
 import asyncpg
 import discord
@@ -24,10 +25,10 @@ MAX_SHOP_SECTIONS = 25
 MAX_TICKET_ADMINS = 50
 MODIFIER_DURATION_MINUTES = 5
 MODIFIER_COOLDOWN_SECONDS = 10
-MODIFIER_TRIGGER_DENOMINATOR = 10
+MODIFIER_PROBABILITY = "10"
 MAX_MODIFIER_DURATION_MINUTES = 1440
 MAX_MODIFIER_COOLDOWN_SECONDS = 3600
-MAX_MODIFIER_TRIGGER_DENOMINATOR = 1000
+MAX_MODIFIER_PROBABILITY_PART = 1_000_000
 DEFAULT_COIN_EMOJI = "🪙"
 DEFAULT_WHITELIST_EMOJI = "⭐"
 
@@ -146,6 +147,38 @@ def parse_modifier_messages(value: str) -> tuple[list[str] | None, str | None]:
     if any(len(message) > 1900 for message in messages):
         return None, "Cada mensaje del modificador puede tener hasta 1.900 caracteres."
     return messages, None
+
+
+def parse_modifier_probability(
+    value: str,
+) -> tuple[tuple[int, int] | None, str | None]:
+    cleaned = value.strip().replace(" ", "").replace(",", ".")
+    if not cleaned:
+        return None, "Debes indicar una probabilidad, por ejemplo `25` o `1/4`."
+    is_percentage = "/" not in cleaned
+    if cleaned.endswith("%"):
+        cleaned = cleaned[:-1]
+        is_percentage = True
+    try:
+        probability = Fraction(cleaned)
+    except (ValueError, ZeroDivisionError):
+        return None, "La probabilidad debe escribirse como porcentaje (`25`) o fracción (`1/4`)."
+    if is_percentage:
+        probability /= 100
+    if probability < 0 or probability > 1:
+        return None, "La probabilidad debe estar entre 0% y 100%."
+    if (
+        probability.numerator > MAX_MODIFIER_PROBABILITY_PART
+        or probability.denominator > MAX_MODIFIER_PROBABILITY_PART
+    ):
+        return None, "La fracción es demasiado grande; usa números de hasta 1.000.000."
+    return (probability.numerator, probability.denominator), None
+
+
+def modifier_probability_label(numerator: int, denominator: int) -> str:
+    percentage = numerator / denominator * 100
+    shown_percentage = f"{percentage:.4f}".rstrip("0").rstrip(".")
+    return f"{numerator}/{denominator} ({shown_percentage}%)"
 
 
 def answer_hash(value: str) -> str:
@@ -1548,7 +1581,7 @@ async def on_message(message: discord.Message) -> None:
     await bot.process_commands(message)
 
 
-@bot.tree.command(name="say", description="Hace que el bot envíe un mensaje.")
+@bot.tree.command(name="say", description="Envía como bot un mensaje escrito por un administrador.")
 @app_commands.describe(mensaje="El mensaje que quieres que diga el bot")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -1900,7 +1933,7 @@ class ModifierUseConfirmView(discord.ui.View):
         self.stop()
 
 
-@bot.tree.command(name="usar", description="Usa una insignia, modificador o ticket que posees.")
+@bot.tree.command(name="usar", description="Activa una insignia o consume un modificador o ticket.")
 @app_commands.describe(
     objeto="Nombre de la insignia, modificador o ticket que quieres usar",
     miembro="Opcional: miembro al que aplicarás el modificador",
@@ -2131,7 +2164,7 @@ async def usar(
         await answer(interaction, f"Activaste el color de **{badge['name']}**.")
 
 
-@bot.tree.command(name="quitar", description="Quita tu rol de color activo.")
+@bot.tree.command(name="quitar", description="Quita tu color activo sin borrar tus insignias.")
 @app_commands.guild_only()
 async def quitar(interaction: discord.Interaction) -> None:
     member = guild_member(interaction)
@@ -2156,7 +2189,7 @@ async def quitar(interaction: discord.Interaction) -> None:
     await answer(interaction, "Quité tu rol de color. Tus insignias siguen intactas.")
 
 
-@bot.tree.command(name="inventario", description="Muestra tus insignias y consumibles.")
+@bot.tree.command(name="inventario", description="Muestra tus insignias, modificadores y tickets.")
 @app_commands.describe(miembro="Inventario de otro miembro; solo para administradores")
 @app_commands.guild_only()
 async def inventario(
@@ -2243,7 +2276,7 @@ async def inventario(
     await answer(interaction, embed=embed)
 
 
-@bot.tree.command(name="objetos", description="Muestra todos los objetos configurados.")
+@bot.tree.command(name="objetos", description="Muestra a administradores toda la configuración de objetos.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -2288,7 +2321,7 @@ async def objetos(interaction: discord.Interaction) -> None:
                 f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
                 f"  Modificador consumible · Comprable: {sale} · "
                 f"Mensajes: **{len(row['messages'])}**\n"
-                f"  Probabilidad: **1/{row['trigger_denominator']}** · "
+                f"  Probabilidad: **{modifier_probability_label(row['trigger_numerator'], row['trigger_denominator'])}** · "
                 f"Cooldown: **{row['cooldown_seconds']} s** · "
                 f"Duración: **{row['duration_minutes']} min**"
             )
@@ -2318,7 +2351,7 @@ async def objetos(interaction: discord.Interaction) -> None:
     await answer(interaction, embed=embed)
 
 
-@bot.tree.command(name="tienda", description="Muestra los objetos disponibles para comprar.")
+@bot.tree.command(name="tienda", description="Abre el Mercado de Sularea por apartados.")
 @app_commands.guild_only()
 async def tienda(interaction: discord.Interaction) -> None:
     assert interaction.guild_id is not None and interaction.guild is not None
@@ -2340,7 +2373,7 @@ async def tienda(interaction: discord.Interaction) -> None:
     view.message = await interaction.original_response()
 
 
-@bot.tree.command(name="comprar", description="Compra un objeto de la tienda.")
+@bot.tree.command(name="comprar", description="Compra una insignia, modificador o ticket disponible.")
 @app_commands.describe(objeto="Nombre del objeto que quieres comprar")
 @app_commands.autocomplete(objeto=shop_autocomplete)
 @app_commands.guild_only()
@@ -3281,13 +3314,16 @@ async def configurarinsignia(
     await answer(interaction, f"Configuré la insignia **{display_name}** correctamente.")
 
 
-@bot.tree.command(name="configurarmodificador", description="Configura un modificador consumible.")
+@bot.tree.command(
+    name="configurarmodificador",
+    description="Configura un consumible con mensajes, probabilidad, cooldown y duración.",
+)
 @app_commands.describe(
     nombre="Nombre del modificador",
     comprable="Indica si aparecerá en la tienda",
     mensajes="Mensajes posibles separados por el símbolo |",
-    probabilidad="Probabilidad 1 entre N; por ejemplo 10 significa 1/10",
-    cooldown="Segundos mínimos entre intentos de activación",
+    probabilidad="Porcentaje (25) o fracción (1/4)",
+    cooldown="Segundos mínimos entre mensajes generados",
     duracion="Minutos que permanecerá activo",
     precio="Precio; usa 0 si no será comprable",
     apartado="Apartado de la tienda; por defecto será General",
@@ -3302,7 +3338,7 @@ async def configurarmodificador(
     nombre: str,
     comprable: bool,
     mensajes: str,
-    probabilidad: app_commands.Range[int, 1, MAX_MODIFIER_TRIGGER_DENOMINATOR] = MODIFIER_TRIGGER_DENOMINATOR,
+    probabilidad: str = MODIFIER_PROBABILITY,
     cooldown: app_commands.Range[int, 0, MAX_MODIFIER_COOLDOWN_SECONDS] = MODIFIER_COOLDOWN_SECONDS,
     duracion: app_commands.Range[int, 1, MAX_MODIFIER_DURATION_MINUTES] = MODIFIER_DURATION_MINUTES,
     precio: app_commands.Range[int, 0, MAX_MONEY] = 0,
@@ -3328,6 +3364,11 @@ async def configurarmodificador(
     if messages_error is not None or parsed_messages is None:
         await answer(interaction, messages_error or "Los mensajes no son válidos.")
         return
+    parsed_probability, probability_error = parse_modifier_probability(probabilidad)
+    if probability_error is not None or parsed_probability is None:
+        await answer(interaction, probability_error or "La probabilidad no es válida.")
+        return
+    probability_numerator, probability_denominator = parsed_probability
     if not comprable:
         precio = 0
     final_section = shop_section_name(apartado) if comprable else None
@@ -3362,7 +3403,8 @@ async def configurarmodificador(
             final_section,
             final_emoji,
             parsed_messages,
-            probabilidad,
+            probability_numerator,
+            probability_denominator,
             cooldown,
             duracion,
         )
@@ -3387,7 +3429,7 @@ async def configurarmodificador(
         f"**Apartado:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}\n"
         f"**Mensajes:** {len(parsed_messages)}\n"
-        f"**Probabilidad:** 1/{probabilidad}\n"
+        f"**Probabilidad:** {modifier_probability_label(probability_numerator, probability_denominator)}\n"
         f"**Cooldown:** {cooldown} segundos\n"
         f"**Duración:** {duracion} minutos",
         color=0xA855F7,
@@ -3395,7 +3437,8 @@ async def configurarmodificador(
     await answer(
         interaction,
         f"Configuré el modificador **{display_name}** con "
-        f"**{len(parsed_messages)} mensajes**, probabilidad **1/{probabilidad}**, "
+        f"**{len(parsed_messages)} mensajes**, probabilidad "
+        f"**{modifier_probability_label(probability_numerator, probability_denominator)}**, "
         f"cooldown de **{cooldown} segundos** y duración de **{duracion} minutos**.",
     )
 
@@ -3510,7 +3553,7 @@ async def configurarticket(
     )
 
 
-@bot.tree.command(name="editar", description="Edita una insignia, modificador o ticket.")
+@bot.tree.command(name="editar", description="Edita la configuración de cualquier objeto.")
 @app_commands.describe(
     objeto="Nombre actual del objeto",
     nuevo_nombre="Nuevo nombre (opcional)",
@@ -3524,7 +3567,7 @@ async def configurarticket(
     mensajes="Para modificadores: nueva lista separada por |",
     descripcion="Para tickets: nueva descripción",
     activo="Para tickets: permitir o impedir su uso",
-    probabilidad="Para modificadores: probabilidad 1 entre N",
+    probabilidad="Para modificadores: porcentaje (25) o fracción (1/4)",
     cooldown="Para modificadores: segundos entre intentos",
     duracion="Para modificadores: minutos que permanece activo",
 )
@@ -3549,7 +3592,7 @@ async def editar(
     mensajes: str | None = None,
     descripcion: str | None = None,
     activo: bool | None = None,
-    probabilidad: int | None = None,
+    probabilidad: str | None = None,
     cooldown: int | None = None,
     duracion: int | None = None,
 ) -> None:
@@ -3648,24 +3691,24 @@ async def editar(
                 await answer(interaction, messages_error or "Los mensajes no son válidos.")
                 return
             final_messages = parsed_messages
-        final_probability = (
-            probabilidad
-            if probabilidad is not None
-            else current_modifier["trigger_denominator"]
-        )
+        if probabilidad is not None:
+            parsed_probability, probability_error = parse_modifier_probability(probabilidad)
+            if probability_error is not None or parsed_probability is None:
+                await answer(
+                    interaction,
+                    probability_error or "La probabilidad no es válida.",
+                )
+                return
+            final_probability_numerator, final_probability_denominator = parsed_probability
+        else:
+            final_probability_numerator = current_modifier["trigger_numerator"]
+            final_probability_denominator = current_modifier["trigger_denominator"]
         final_cooldown = (
             cooldown if cooldown is not None else current_modifier["cooldown_seconds"]
         )
         final_duration = (
             duracion if duracion is not None else current_modifier["duration_minutes"]
         )
-        if not 1 <= final_probability <= MAX_MODIFIER_TRIGGER_DENOMINATOR:
-            await answer(
-                interaction,
-                f"La probabilidad debe ser 1 entre un número de 1 a "
-                f"{MAX_MODIFIER_TRIGGER_DENOMINATOR}.",
-            )
-            return
         if not 0 <= final_cooldown <= MAX_MODIFIER_COOLDOWN_SECONDS:
             await answer(
                 interaction,
@@ -3690,7 +3733,8 @@ async def editar(
                 final_section,
                 final_emoji,
                 final_messages,
-                final_probability,
+                final_probability_numerator,
+                final_probability_denominator,
                 final_cooldown,
                 final_duration,
             )
@@ -3719,7 +3763,8 @@ async def editar(
             f"**Apartado:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}\n"
             f"**Mensajes:** {len(final_messages)}\n"
-            f"**Probabilidad:** 1/{final_probability}\n"
+            f"**Probabilidad:** "
+            f"{modifier_probability_label(final_probability_numerator, final_probability_denominator)}\n"
             f"**Cooldown:** {final_cooldown} segundos\n"
             f"**Duración:** {final_duration} minutos",
             color=0xA855F7,
@@ -4074,9 +4119,11 @@ async def ayuda(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Inventario y objetos",
         value=(
-            "`/inventario` — Ver insignias y consumibles.\n"
-            "`/usar` — Usar una insignia, modificador o ticket.\n"
-            "`/quitar` — Quitar tu rol de color."
+            "`/inventario [miembro]` — Ver insignias y consumibles; consultar a otro "
+            "miembro requiere Administrador.\n"
+            "`/usar objeto [miembro]` — Activar una insignia, consumir un ticket o "
+            "aplicar un modificador a ti u otra persona.\n"
+            "`/quitar` — Quitar tu color sin perder insignias."
         ),
         inline=False,
     )
@@ -4086,8 +4133,9 @@ async def ayuda(interaction: discord.Interaction) -> None:
             "`/balance` — Consultar tus monedas.\n"
             "`/historial` — Ver tus últimos 10 movimientos.\n"
             "`/ranking` — Ver los balances más altos.\n"
-            "`/tienda` — Ver los objetos del mercado.\n"
-            "`/comprar` — Comprar escribiendo el nombre."
+            "`/tienda` — Abrir el mercado por apartados.\n"
+            "`/comprar objeto` — Comprar por nombre; un ticket inactivo pide "
+            "confirmación privada."
         ),
         inline=False,
     )
@@ -4105,6 +4153,15 @@ async def ayuda(interaction: discord.Interaction) -> None:
                 "`/eventopregunta` · `/cancelarevento`\n"
                 "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`"
                 "\n`/configurarmoneda` · `/configuraremojiwhitelist`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Probabilidad de modificadores",
+            value=(
+                "En `/configurarmodificador` y `/editar`, escribe `25` para 25% "
+                "o `1/4` para la misma probabilidad. El cooldown se indica en "
+                "segundos y la duración en minutos."
             ),
             inline=False,
         )

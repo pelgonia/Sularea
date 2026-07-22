@@ -53,11 +53,15 @@ CREATE TABLE IF NOT EXISTS modifiers (
     shop_section TEXT,
     emoji TEXT,
     messages TEXT[] NOT NULL CHECK (CARDINALITY(messages) > 0),
+    trigger_numerator INTEGER NOT NULL DEFAULT 1 CHECK (trigger_numerator >= 0),
     trigger_denominator INTEGER NOT NULL DEFAULT 10 CHECK (trigger_denominator >= 1),
     cooldown_seconds INTEGER NOT NULL DEFAULT 10 CHECK (cooldown_seconds >= 0),
     duration_minutes INTEGER NOT NULL DEFAULT 5 CHECK (duration_minutes >= 1),
     UNIQUE (guild_id, name_key)
 );
+
+ALTER TABLE modifiers
+ADD COLUMN IF NOT EXISTS trigger_numerator INTEGER NOT NULL DEFAULT 1;
 
 ALTER TABLE modifiers
 ADD COLUMN IF NOT EXISTS trigger_denominator INTEGER NOT NULL DEFAULT 10;
@@ -503,6 +507,7 @@ class Database:
                 emoji, badge_role_id, color_role_id, NULL::BIGINT AS modifier_id,
                 NULL::BIGINT AS ticket_id, NULL::TEXT AS description,
                 NULL::BOOLEAN AS active,
+                NULL::INTEGER AS trigger_numerator,
                 NULL::INTEGER AS trigger_denominator,
                 NULL::INTEGER AS cooldown_seconds,
                 NULL::INTEGER AS duration_minutes
@@ -514,7 +519,7 @@ class Database:
                 emoji, NULL::BIGINT AS badge_role_id,
                 NULL::BIGINT AS color_role_id, id AS modifier_id,
                 NULL::BIGINT AS ticket_id, NULL::TEXT AS description,
-                NULL::BOOLEAN AS active, trigger_denominator,
+                NULL::BOOLEAN AS active, trigger_numerator, trigger_denominator,
                 cooldown_seconds, duration_minutes
             FROM modifiers
             WHERE guild_id = $1 AND purchasable = TRUE
@@ -524,6 +529,7 @@ class Database:
                 emoji, NULL::BIGINT AS badge_role_id,
                 NULL::BIGINT AS color_role_id, NULL::BIGINT AS modifier_id,
                 id AS ticket_id, description, active,
+                NULL::INTEGER AS trigger_numerator,
                 NULL::INTEGER AS trigger_denominator,
                 NULL::INTEGER AS cooldown_seconds,
                 NULL::INTEGER AS duration_minutes
@@ -544,6 +550,7 @@ class Database:
         shop_section: str | None,
         emoji: str | None,
         messages: list[str],
+        trigger_numerator: int,
         trigger_denominator: int,
         cooldown_seconds: int,
         duration_minutes: int,
@@ -552,10 +559,10 @@ class Database:
             """
             INSERT INTO modifiers (
                 guild_id, name, name_key, purchasable, price,
-                shop_section, emoji, messages, trigger_denominator,
+                shop_section, emoji, messages, trigger_numerator, trigger_denominator,
                 cooldown_seconds, duration_minutes
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::TEXT[], $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::TEXT[], $9, $10, $11, $12)
             """,
             guild_id,
             name,
@@ -565,6 +572,7 @@ class Database:
             shop_section,
             emoji,
             messages,
+            trigger_numerator,
             trigger_denominator,
             cooldown_seconds,
             duration_minutes,
@@ -581,6 +589,7 @@ class Database:
         shop_section: str | None,
         emoji: str | None,
         messages: list[str],
+        trigger_numerator: int,
         trigger_denominator: int,
         cooldown_seconds: int,
         duration_minutes: int,
@@ -595,9 +604,10 @@ class Database:
                 shop_section = $7,
                 emoji = $8,
                 messages = $9::TEXT[],
-                trigger_denominator = $10,
-                cooldown_seconds = $11,
-                duration_minutes = $12
+                trigger_numerator = $10,
+                trigger_denominator = $11,
+                cooldown_seconds = $12,
+                duration_minutes = $13
             WHERE guild_id = $1 AND name_key = $2
             """,
             guild_id,
@@ -609,6 +619,7 @@ class Database:
             shop_section,
             emoji,
             messages,
+            trigger_numerator,
             trigger_denominator,
             cooldown_seconds,
             duration_minutes,
@@ -1149,7 +1160,10 @@ class Database:
                       modifier.cooldown_seconds * INTERVAL '1 second'
                   )
               )
-              AND RANDOM() < (1.0 / modifier.trigger_denominator)
+              AND RANDOM() < (
+                  modifier.trigger_numerator::DOUBLE PRECISION
+                  / modifier.trigger_denominator
+              )
             RETURNING modifier.name, modifier.messages
             """,
             guild_id,
@@ -1471,7 +1485,8 @@ class Database:
         modifiers = await self._pool().fetch(
             """
             SELECT id, name, name_key, purchasable, price,
-                   shop_section, emoji, messages, trigger_denominator,
+                   shop_section, emoji, messages, trigger_numerator,
+                   trigger_denominator,
                    cooldown_seconds, duration_minutes
             FROM modifiers WHERE guild_id = $1 ORDER BY name
             """,
