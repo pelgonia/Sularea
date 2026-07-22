@@ -18,10 +18,16 @@ from database import Database
 
 load_dotenv()
 MAX_MONEY = 1_000_000_000_000
+DEFAULT_SHOP_SECTION = "General"
 
 
 def normalize_name(value: str) -> str:
     return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
+def shop_section_name(value: str | None) -> str:
+    cleaned = (value or "").strip()
+    return cleaned or DEFAULT_SHOP_SECTION
 
 
 def answer_hash(value: str) -> str:
@@ -502,6 +508,24 @@ async def shop_autocomplete(
     ][:25]
 
 
+async def shop_section_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None or not hasattr(bot, "db"):
+        return []
+    rows = await bot.db.list_badges(interaction.guild_id, purchasable_only=True)
+    search = normalize_name(current)
+    sections: dict[str, str] = {}
+    for row in rows:
+        section = shop_section_name(row["shop_section"])
+        sections.setdefault(normalize_name(section), section)
+    return [
+        app_commands.Choice(name=section[:100], value=section[:100])
+        for key, section in sorted(sections.items(), key=lambda item: item[0])
+        if search in key
+    ][:25]
+
+
 async def process_purchase(
     interaction: discord.Interaction,
     badge_name: str,
@@ -915,7 +939,8 @@ async def insignias(
         details = []
         for row in rows:
             sale = (
-                f"Sí — {money(row['price'])} monedas"
+                f"Sí — {money(row['price'])} monedas · "
+                f"Apartado: **{shop_section_name(row['shop_section'])}**"
                 if row["purchasable"]
                 else "No"
             )
@@ -940,11 +965,33 @@ async def tienda(interaction: discord.Interaction) -> None:
     if interaction.guild.icon is not None:
         embed.set_thumbnail(url=interaction.guild.icon.url)
     if rows:
-        embed.description = "\n".join(
-            f"• **{row['name']}** (<@&{row['color_role_id']}>) — "
-            f"{money(row['price'])} monedas"
-            for row in rows
-        )[:4000]
+        sections: dict[str, dict[str, object]] = {}
+        for row in rows:
+            section_name = shop_section_name(row["shop_section"])
+            section_key = normalize_name(section_name)
+            section = sections.setdefault(
+                section_key,
+                {"name": section_name, "badges": []},
+            )
+            section["badges"].append(row)
+
+        ordered_sections = sorted(
+            sections.values(),
+            key=lambda section: (
+                normalize_name(str(section["name"]))
+                != normalize_name(DEFAULT_SHOP_SECTION),
+                normalize_name(str(section["name"])),
+            ),
+        )
+        blocks = []
+        for section in ordered_sections:
+            badge_lines = "\n".join(
+                f"• **{row['name']}** (<@&{row['color_role_id']}>) — "
+                f"{money(row['price'])} monedas"
+                for row in section["badges"]
+            )
+            blocks.append(f"__**{section['name']}**__\n{badge_lines}")
+        embed.description = "\n\n".join(blocks)[:4000]
         embed.set_footer(text="Usa /comprar para obtener una insignia.")
     else:
         embed.description = "No hay insignias a la venta en este momento."
@@ -1289,7 +1336,9 @@ async def quitarinsignia(interaction: discord.Interaction, miembro: discord.Memb
     comprable="Indica si aparecerá en la tienda",
     precio="Precio; usa 0 si será gratuita",
     nombre="Nombre para los comandos; por defecto usa el nombre del rol",
+    apartado="Apartado de la tienda; por defecto será General",
 )
+@app_commands.autocomplete(apartado=shop_section_autocomplete)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -1300,6 +1349,7 @@ async def configurarinsignia(
     comprable: bool,
     precio: app_commands.Range[int, 0, MAX_MONEY] = 0,
     nombre: str | None = None,
+    apartado: str | None = None,
 ) -> None:
     assert interaction.guild_id is not None
     display_name = (nombre or rol_insignia.name).strip()
@@ -1314,11 +1364,15 @@ async def configurarinsignia(
         return
     if not comprable:
         precio = 0
+    final_section = shop_section_name(apartado) if comprable else None
+    if final_section is not None and len(final_section) > 100:
+        await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
+        return
     await interaction.response.defer()
     try:
         await bot.db.create_badge(
             interaction.guild_id, display_name, normalize_name(display_name),
-            rol_insignia.id, rol_color.id, comprable, precio,
+            rol_insignia.id, rol_color.id, comprable, precio, final_section,
         )
     except asyncpg.UniqueViolationError:
         await answer(interaction, "Ya existe una insignia con ese nombre o ese rol.")
@@ -1340,7 +1394,8 @@ async def configurarinsignia(
             f"**Rol de insignia:** {rol_insignia.mention}\n"
             f"**Rol de color:** {rol_color.mention}\n"
             f"**Comprable:** {'Sí' if comprable else 'No'}\n"
-            f"**Precio:** {money(precio)} monedas",
+            f"**Precio:** {money(precio)} monedas\n"
+            f"**Apartado:** {final_section or 'No aplica'}",
         )
     await answer(interaction, f"Configuré la insignia **{display_name}** correctamente.")
 
@@ -1350,8 +1405,12 @@ async def configurarinsignia(
     insignia="Nombre actual", nuevo_nombre="Nuevo nombre (opcional)",
     rol_insignia="Nuevo rol de insignia", rol_color="Nuevo rol de color",
     comprable="Cambiar si aparece en la tienda", precio="Nuevo precio",
+    apartado="Nuevo apartado de la tienda",
 )
-@app_commands.autocomplete(insignia=badge_autocomplete)
+@app_commands.autocomplete(
+    insignia=badge_autocomplete,
+    apartado=shop_section_autocomplete,
+)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -1363,6 +1422,7 @@ async def editarinsignia(
     rol_color: discord.Role | None = None,
     comprable: bool | None = None,
     precio: int | None = None,
+    apartado: str | None = None,
 ) -> None:
     assert interaction.guild_id is not None
     current = await find_badge(interaction, insignia)
@@ -1374,6 +1434,11 @@ async def editarinsignia(
     final_color_role = rol_color.id if rol_color else current["color_role_id"]
     final_purchasable = comprable if comprable is not None else current["purchasable"]
     final_price = precio if precio is not None else current["price"]
+    final_section = (
+        shop_section_name(apartado if apartado is not None else current["shop_section"])
+        if final_purchasable
+        else None
+    )
     if not final_name or len(final_name) > 100:
         await answer(interaction, "El nombre debe tener entre 1 y 100 caracteres.")
         return
@@ -1382,6 +1447,9 @@ async def editarinsignia(
         return
     if not final_purchasable:
         final_price = 0
+    if final_section is not None and len(final_section) > 100:
+        await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
+        return
     if final_badge_role == final_color_role:
         await answer(interaction, "El rol de insignia y el rol de color deben ser diferentes.")
         return
@@ -1393,7 +1461,7 @@ async def editarinsignia(
         updated = await bot.db.update_badge(
             interaction.guild_id, current["name_key"], final_name,
             normalize_name(final_name), final_badge_role, final_color_role,
-            final_purchasable, final_price,
+            final_purchasable, final_price, final_section,
         )
     except asyncpg.UniqueViolationError:
         await answer(interaction, "Ese nombre o rol ya pertenece a otra insignia.")
@@ -1419,7 +1487,8 @@ async def editarinsignia(
             f"**Rol de insignia:** <@&{final_badge_role}>\n"
             f"**Rol de color:** <@&{final_color_role}>\n"
             f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
-            f"**Precio:** {money(final_price)} monedas",
+            f"**Precio:** {money(final_price)} monedas\n"
+            f"**Apartado:** {final_section or 'No aplica'}",
         )
     await answer(interaction, f"Actualicé la insignia **{final_name}**.")
 

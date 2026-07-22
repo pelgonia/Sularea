@@ -19,9 +19,18 @@ CREATE TABLE IF NOT EXISTS badges (
     color_role_id BIGINT NOT NULL,
     purchasable BOOLEAN NOT NULL DEFAULT FALSE,
     price BIGINT NOT NULL DEFAULT 0 CHECK (price >= 0),
+    shop_section TEXT,
     PRIMARY KEY (guild_id, name_key),
     UNIQUE (guild_id, badge_role_id)
 );
+
+ALTER TABLE badges
+ADD COLUMN IF NOT EXISTS shop_section TEXT;
+
+UPDATE badges
+SET shop_section = 'General'
+WHERE purchasable = TRUE
+  AND (shop_section IS NULL OR BTRIM(shop_section) = '');
 
 CREATE INDEX IF NOT EXISTS badges_shop_index
 ON badges (guild_id, purchasable, price);
@@ -251,7 +260,7 @@ class Database:
                 """
                 SELECT * FROM badges
                 WHERE guild_id = $1 AND purchasable = TRUE
-                ORDER BY price, name
+                ORDER BY COALESCE(shop_section, 'General'), price, name
                 """,
                 guild_id,
             )
@@ -269,14 +278,15 @@ class Database:
         color_role_id: int,
         purchasable: bool,
         price: int,
+        shop_section: str | None,
     ) -> None:
         await self._pool().execute(
             """
             INSERT INTO badges (
                 guild_id, name, name_key, badge_role_id,
-                color_role_id, purchasable, price
+                color_role_id, purchasable, price, shop_section
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             """,
             guild_id,
             name,
@@ -285,6 +295,7 @@ class Database:
             color_role_id,
             purchasable,
             price,
+            shop_section,
         )
 
     async def update_badge(
@@ -297,6 +308,7 @@ class Database:
         color_role_id: int,
         purchasable: bool,
         price: int,
+        shop_section: str | None,
     ):
         result = await self._pool().execute(
             """
@@ -306,7 +318,8 @@ class Database:
                 badge_role_id = $5,
                 color_role_id = $6,
                 purchasable = $7,
-                price = $8
+                price = $8,
+                shop_section = $9
             WHERE guild_id = $1 AND name_key = $2
             """,
             guild_id,
@@ -317,6 +330,7 @@ class Database:
             color_role_id,
             purchasable,
             price,
+            shop_section,
         )
         return result == "UPDATE 1"
 
@@ -459,7 +473,8 @@ class Database:
         )
         badges = await self._pool().fetch(
             """
-            SELECT name, name_key, badge_role_id, color_role_id, purchasable, price
+            SELECT name, name_key, badge_role_id, color_role_id,
+                   purchasable, price, shop_section
             FROM badges WHERE guild_id = $1 ORDER BY name
             """,
             guild_id,
