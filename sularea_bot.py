@@ -835,9 +835,11 @@ async def owned_object_autocomplete(
     member = guild_member(interaction)
     if interaction.guild_id is None or member is None or not hasattr(bot, "db"):
         return []
-    badges = await bot.db.list_badges(interaction.guild_id)
-    modifiers = await bot.db.list_modifier_inventory(interaction.guild_id, member.id)
-    tickets = await bot.db.list_ticket_inventory(interaction.guild_id, member.id)
+    badges, modifiers, tickets = await asyncio.gather(
+        bot.db.list_badges(interaction.guild_id),
+        bot.db.list_modifier_inventory(interaction.guild_id, member.id),
+        bot.db.list_ticket_inventory(interaction.guild_id, member.id),
+    )
     owned_role_ids = {role.id for role in member.roles}
     whitelisted = await member_is_whitelisted(member)
     search = normalize_name(current)
@@ -869,6 +871,49 @@ async def owned_object_autocomplete(
                 f"Ticket · {row['name']} (x{row['quantity']})"
                 f"{' · Inactivo' if not row['active'] else ''}"
             )[:100],
+            value=row["name"][:100],
+        )
+        for row in tickets
+        if search in row["name_key"]
+    )
+    return choices[:25]
+
+
+async def removable_object_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None or not hasattr(bot, "db"):
+        return []
+    member = getattr(interaction.namespace, "miembro", None)
+    if not isinstance(member, discord.Member):
+        return []
+
+    badges, modifiers, tickets = await asyncio.gather(
+        bot.db.list_badges(interaction.guild_id),
+        bot.db.list_modifier_inventory(interaction.guild_id, member.id),
+        bot.db.list_ticket_inventory(interaction.guild_id, member.id),
+    )
+    owned_role_ids = {role.id for role in member.roles}
+    search = normalize_name(current)
+    choices = [
+        app_commands.Choice(
+            name=f"Insignia · {row['name']}"[:100],
+            value=row["name"][:100],
+        )
+        for row in badges
+        if row["badge_role_id"] in owned_role_ids and search in row["name_key"]
+    ]
+    choices.extend(
+        app_commands.Choice(
+            name=f"Modificador · {row['name']} (x{row['quantity']})"[:100],
+            value=row["name"][:100],
+        )
+        for row in modifiers
+        if search in row["name_key"]
+    )
+    choices.extend(
+        app_commands.Choice(
+            name=f"Ticket · {row['name']} (x{row['quantity']})"[:100],
             value=row["name"][:100],
         )
         for row in tickets
@@ -2796,10 +2841,10 @@ async def darobjeto(
 @bot.tree.command(name="quitarobjeto", description="Retira un objeto a un miembro.")
 @app_commands.describe(
     miembro="Miembro que perderá el objeto",
-    objeto="Insignia, modificador o ticket que se retirará",
+    objeto="Elige primero al miembro; solo aparecen los objetos que posee",
     cantidad="Cantidad; para insignias debe ser 1",
 )
-@app_commands.autocomplete(objeto=editable_object_autocomplete)
+@app_commands.autocomplete(objeto=removable_object_autocomplete)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
