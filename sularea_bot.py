@@ -31,8 +31,55 @@ def shop_section_name(value: str | None) -> str:
     return cleaned or DEFAULT_SHOP_SECTION
 
 
-def badge_emoji(value: str | None) -> str:
-    return f"{value.strip()} " if value and value.strip() else ""
+def resolve_guild_emoji(
+    guild: discord.Guild,
+    value: str | None,
+) -> tuple[str | None, str | None]:
+    if not value or not value.strip():
+        return None, None
+    cleaned = value.strip()
+    partial = discord.PartialEmoji.from_str(cleaned)
+    if partial.id is not None:
+        emoji = guild.get_emoji(partial.id)
+        if emoji is None:
+            return None, "Ese emoji personalizado no pertenece a este servidor."
+        return str(emoji), None
+
+    emoji_name: str | None = None
+    if cleaned.startswith(":") and cleaned.endswith(":") and len(cleaned) > 2:
+        emoji_name = cleaned[1:-1]
+    else:
+        direct_match = next(
+            (
+                emoji
+                for emoji in guild.emojis
+                if normalize_name(emoji.name) == normalize_name(cleaned)
+            ),
+            None,
+        )
+        if direct_match is not None:
+            return str(direct_match), None
+
+    if emoji_name is not None:
+        named_match = next(
+            (
+                emoji
+                for emoji in guild.emojis
+                if normalize_name(emoji.name) == normalize_name(emoji_name)
+            ),
+            None,
+        )
+        if named_match is None:
+            return None, f"No encontré el emoji `:{emoji_name}:` en este servidor."
+        return str(named_match), None
+
+    return cleaned, None
+
+
+def badge_emoji(value: str | None, guild: discord.Guild) -> str:
+    resolved, _ = resolve_guild_emoji(guild, value)
+    shown = resolved or (value.strip() if value and value.strip() else "")
+    return f"{shown} " if shown else ""
 
 
 def edited_badge_emoji(value: str | None, current: str | None = None) -> str | None:
@@ -580,7 +627,7 @@ def make_shop_embed(
 ) -> discord.Embed:
     section_name, rows = sections[selected_index]
     items = "\n".join(
-        f"• {badge_emoji(row['emoji'])}**{row['name']}** "
+        f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
         f"(<@&{row['color_role_id']}>) — {money(row['price'])} monedas"
         for row in rows
     )
@@ -621,6 +668,7 @@ class ShopSectionSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=options,
+            row=0,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -657,11 +705,30 @@ class ShopView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
-                "Solo la persona que usó /tienda puede cambiar este apartado.",
+                "Solo la persona que usó /tienda puede controlar este menú.",
                 ephemeral=True,
             )
             return False
         return True
+
+    @discord.ui.button(
+        label="Cerrar tienda",
+        style=discord.ButtonStyle.danger,
+        emoji="🗑️",
+        row=1,
+    )
+    async def close_shop(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer()
+        try:
+            if interaction.message is not None:
+                await interaction.message.delete()
+        except discord.HTTPException:
+            pass
+        self.stop()
 
     async def on_timeout(self) -> None:
         for child in self.children:
@@ -1041,7 +1108,7 @@ async def inventario(interaction: discord.Interaction) -> None:
     embed.set_thumbnail(url=member.display_avatar.url)
     if owned:
         embed.description = "\n".join(
-            f"• {badge_emoji(row['emoji'])}**{row['name']}** "
+            f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
             f"(<@&{row['color_role_id']}>)"
             for row in owned
         )[:4000]
@@ -1082,7 +1149,7 @@ async def insignias(
         )
         if owned:
             embed.description = "\n".join(
-                f"• {badge_emoji(row['emoji'])}**{row['name']}** — "
+                f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** — "
                 f"<@&{row['badge_role_id']}> "
                 f"(color: <@&{row['color_role_id']}>)"
                 for row in owned
@@ -1103,7 +1170,7 @@ async def insignias(
                 else "No"
             )
             details.append(
-                f"• {badge_emoji(row['emoji'])}**{row['name']}**\n"
+                f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
                 f"  Insignia: <@&{row['badge_role_id']}> · "
                 f"Color: <@&{row['color_role_id']}> · Comprable: {sale}"
             )
@@ -1475,7 +1542,7 @@ async def quitarinsignia(interaction: discord.Interaction, miembro: discord.Memb
     precio="Precio; usa 0 si será gratuita",
     nombre="Nombre para los comandos; por defecto usa el nombre del rol",
     apartado="Apartado de la tienda; por defecto será General",
-    emoji="Emoji opcional para mostrar junto a la insignia",
+    emoji="Emoji opcional; puedes escribir :nombre: si es del servidor",
 )
 @app_commands.autocomplete(apartado=shop_section_autocomplete)
 @app_commands.guild_only()
@@ -1492,6 +1559,8 @@ async def configurarinsignia(
     emoji: str | None = None,
 ) -> None:
     assert interaction.guild_id is not None
+    if interaction.guild is None:
+        return
     display_name = (nombre or rol_insignia.name).strip()
     if not display_name or len(display_name) > 100:
         await answer(interaction, "El nombre debe tener entre 1 y 100 caracteres.")
@@ -1508,7 +1577,11 @@ async def configurarinsignia(
     if final_section is not None and len(final_section) > 100:
         await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
         return
-    final_emoji = edited_badge_emoji(emoji)
+    emoji_value = edited_badge_emoji(emoji)
+    final_emoji, emoji_error = resolve_guild_emoji(interaction.guild, emoji_value)
+    if emoji_error is not None:
+        await answer(interaction, emoji_error)
+        return
     if final_emoji is not None and (len(final_emoji) > 100 or "\n" in final_emoji):
         await answer(interaction, "El emoji no es válido o es demasiado largo.")
         return
@@ -1561,7 +1634,7 @@ async def configurarinsignia(
     rol_insignia="Nuevo rol de insignia", rol_color="Nuevo rol de color",
     comprable="Cambiar si aparece en la tienda", precio="Nuevo precio",
     apartado="Nuevo apartado de la tienda",
-    emoji="Emoji nuevo; escribe quitar para eliminarlo",
+    emoji="Emoji o :nombre: del servidor; escribe quitar para eliminarlo",
 )
 @app_commands.autocomplete(
     insignia=badge_autocomplete,
@@ -1582,6 +1655,8 @@ async def editarinsignia(
     emoji: str | None = None,
 ) -> None:
     assert interaction.guild_id is not None
+    if interaction.guild is None:
+        return
     current = await find_badge(interaction, insignia)
     if current is None:
         await answer(interaction, "Esa insignia no existe.")
@@ -1596,7 +1671,8 @@ async def editarinsignia(
         if final_purchasable
         else None
     )
-    final_emoji = edited_badge_emoji(emoji, current["emoji"])
+    emoji_value = edited_badge_emoji(emoji, current["emoji"])
+    final_emoji, emoji_error = resolve_guild_emoji(interaction.guild, emoji_value)
     if not final_name or len(final_name) > 100:
         await answer(interaction, "El nombre debe tener entre 1 y 100 caracteres.")
         return
@@ -1607,6 +1683,9 @@ async def editarinsignia(
         final_price = 0
     if final_section is not None and len(final_section) > 100:
         await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
+        return
+    if emoji_error is not None:
+        await answer(interaction, emoji_error)
         return
     if final_emoji is not None and (len(final_emoji) > 100 or "\n" in final_emoji):
         await answer(interaction, "El emoji no es válido o es demasiado largo.")
