@@ -82,8 +82,12 @@ ON active_modifiers (expires_at);
 CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id BIGINT PRIMARY KEY,
     log_channel_id BIGINT,
-    logs_enabled BOOLEAN NOT NULL DEFAULT FALSE
+    logs_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    coin_emoji TEXT
 );
+
+ALTER TABLE guild_settings
+ADD COLUMN IF NOT EXISTS coin_emoji TEXT;
 
 CREATE TABLE IF NOT EXISTS movements (
     id BIGSERIAL PRIMARY KEY,
@@ -101,6 +105,10 @@ ON movements (guild_id, user_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS movements_action_index
 ON movements (guild_id, action);
+
+UPDATE movements
+SET description = REPLACE(description, ' monedas', '')
+WHERE description LIKE '%🪙% monedas%';
 
 CREATE TABLE IF NOT EXISTS active_question_events (
     guild_id BIGINT NOT NULL,
@@ -757,7 +765,7 @@ class Database:
     async def get_log_settings(self, guild_id: int):
         return await self._pool().fetchrow(
             """
-            SELECT log_channel_id, logs_enabled
+            SELECT log_channel_id, logs_enabled, coin_emoji
             FROM guild_settings
             WHERE guild_id = $1
             """,
@@ -782,6 +790,46 @@ class Database:
             guild_id,
             channel_id,
             enabled,
+        )
+
+    async def set_coin_emoji(self, guild_id: int, emoji: str | None) -> None:
+        await self._pool().execute(
+            """
+            INSERT INTO guild_settings (guild_id, coin_emoji)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET coin_emoji = EXCLUDED.coin_emoji
+            """,
+            guild_id,
+            emoji,
+        )
+
+    async def list_coin_emojis(self):
+        return await self._pool().fetch(
+            """
+            SELECT guild_id, coin_emoji
+            FROM guild_settings
+            WHERE coin_emoji IS NOT NULL
+            """
+        )
+
+    async def replace_coin_emoji_in_movements(
+        self,
+        guild_id: int,
+        old_emoji: str,
+        new_emoji: str,
+    ) -> None:
+        if old_emoji == new_emoji:
+            return
+        await self._pool().execute(
+            """
+            UPDATE movements
+            SET description = REPLACE(description, $2, $3)
+            WHERE guild_id = $1 AND POSITION($2 IN description) > 0
+            """,
+            guild_id,
+            old_emoji,
+            new_emoji,
         )
 
     async def record_movement(
@@ -1044,9 +1092,13 @@ class Database:
                     event["reward"],
                 )
                 formatted_reward = f"{event['reward']:,}".replace(",", ".")
+                coin_emoji = await connection.fetchval(
+                    "SELECT coin_emoji FROM guild_settings WHERE guild_id = $1",
+                    guild_id,
+                ) or "🪙"
                 description = (
                     f"Ganó un evento de pregunta y recibió "
-                    f"🪙 {formatted_reward} monedas: {event['question']}"
+                    f"{coin_emoji} {formatted_reward}: {event['question']}"
                 )
                 await connection.execute(
                     """

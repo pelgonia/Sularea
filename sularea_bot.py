@@ -23,6 +23,7 @@ DEFAULT_SHOP_SECTION = "General"
 MAX_SHOP_SECTIONS = 25
 MODIFIER_DURATION_MINUTES = 5
 MODIFIER_COOLDOWN_SECONDS = 10
+DEFAULT_COIN_EMOJI = "🪙"
 
 
 def normalize_name(value: str) -> str:
@@ -151,9 +152,16 @@ def answer_hash(value: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def money(value: int) -> str:
+def money(value: int, guild_id: int | None = None) -> str:
     formatted = f"{value:,}".replace(",", ".")
-    return f"🪙 {formatted}"
+    emoji = DEFAULT_COIN_EMOJI
+    if guild_id is not None:
+        emoji = getattr(
+            globals().get("bot"),
+            "coin_emojis",
+            {},
+        ).get(guild_id, DEFAULT_COIN_EMOJI)
+    return f"{emoji} {formatted}"
 
 
 async def answer(
@@ -180,6 +188,7 @@ class SulareaBot(commands.Bot):
         self.purchase_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self.modifier_webhooks: dict[int, discord.Webhook] = {}
         self.application_emojis: dict[int, discord.Emoji] = {}
+        self.coin_emojis: dict[int, str] = {}
         self.modifier_notification_interactions: dict[
             tuple[int, int], discord.Interaction
         ] = {}
@@ -193,6 +202,10 @@ class SulareaBot(commands.Bot):
             )
         self.db = Database(database_url)
         await self.db.connect()
+        coin_rows = await self.db.list_coin_emojis()
+        self.coin_emojis = {
+            row["guild_id"]: row["coin_emoji"] for row in coin_rows
+        }
         try:
             application_emojis = await self.fetch_application_emojis()
             self.application_emojis = {
@@ -274,7 +287,7 @@ def make_question_embed(
         description=question,
         color=0x6B7280 if final_status else 0xEC4899,
     )
-    embed.add_field(name="Recompensa", value=f"{money(reward)} monedas")
+    embed.add_field(name="Recompensa", value=money(reward, guild.id))
     if final_status is not None:
         embed.add_field(name="Finalizado", value=final_status)
         embed.set_footer(text="Este evento ya terminó.")
@@ -361,7 +374,7 @@ async def event_expiration_loop() -> None:
             guild,
             "Evento de pregunta caducado",
             f"**Pregunta:** {event['question']}\n"
-            f"**Recompensa:** {money(event['reward'])} monedas\n"
+            f"**Recompensa:** {money(event['reward'], guild.id)}\n"
             "Terminó sin ganador.",
             color=0x6B7280,
         )
@@ -520,20 +533,20 @@ async def apply_balance_change(
         movement_action = "balance_add"
         movement_amount = amount
         verb = "Añadió"
-        history_text = f"Un administrador añadió {money(amount)} monedas."
+        history_text = f"Un administrador añadió {money(amount, guild.id)}."
     elif action == "remove":
         affected_ids = await bot.db.remove_balance_many(guild.id, user_ids, amount)
         movement_action = "balance_remove"
         movement_amount = -amount
         verb = "Quitó"
-        history_text = f"Un administrador quitó {money(amount)} monedas."
+        history_text = f"Un administrador quitó {money(amount, guild.id)}."
     else:
         await bot.db.set_balance_many(guild.id, user_ids, amount)
         affected_ids = user_ids
         movement_action = "balance_set"
         movement_amount = amount
         verb = "Estableció"
-        history_text = f"Un administrador estableció el balance en {money(amount)} monedas."
+        history_text = f"Un administrador estableció el balance en {money(amount, guild.id)}."
 
     await bot.db.record_movements(
         guild.id,
@@ -551,27 +564,27 @@ async def apply_balance_change(
         if action == "remove" and affected == 0:
             result = (
                 f"{members[0].mention} no tiene saldo suficiente. "
-                f"Su balance es **{money(current_balance)} monedas**."
+                f"Su balance es **{money(current_balance, guild.id)}**."
             )
         elif action == "set":
             result = (
                 f"El balance de {members[0].mention} ahora es "
-                f"**{money(current_balance)} monedas**. Se aplicó a **1 miembro**."
+                f"**{money(current_balance, guild.id)}**. Se aplicó a **1 miembro**."
             )
         else:
             action_result = "Añadiste" if action == "add" else "Quitaste"
             result = (
-                f"{action_result} **{money(amount)} monedas** a {members[0].mention}. "
-                f"Nuevo balance: **{money(current_balance)} monedas**."
+                f"{action_result} **{money(amount, guild.id)}** a {members[0].mention}. "
+                f"Nuevo balance: **{money(current_balance, guild.id)}**."
             )
     elif action == "set":
         result = (
-            f"Establecí el balance de {target_mention} en **{money(amount)} monedas**. "
+            f"Establecí el balance de {target_mention} en **{money(amount, guild.id)}**. "
             f"Se aplicó a **{affected} {'miembro' if affected == 1 else 'miembros'}**."
         )
     else:
         result = (
-            f"{verb} **{money(amount)} monedas** a **{affected} de "
+            f"{verb} **{money(amount, guild.id)}** a **{affected} de "
             f"{len(members)} {'miembro' if len(members) == 1 else 'miembros'}** "
             f"de {target_mention}."
         )
@@ -583,7 +596,7 @@ async def apply_balance_change(
         "Movimiento de balance",
         f"**Administrador:** {actor.mention}\n"
         f"**Objetivo:** {target_mention}\n"
-        f"**Acción:** {verb} {money(amount)} monedas\n"
+        f"**Acción:** {verb} {money(amount, guild.id)}\n"
         f"**Aplicado a:** {affected} miembros"
         + (f"\n**Omitidos:** {skipped}" if skipped else ""),
         color=0x22C55E if action == "add" else 0xEF4444 if action == "remove" else 0x3B82F6,
@@ -698,7 +711,7 @@ async def handle_balance_command(
             amount,
         )
         await interaction.response.send_message(
-            f"⚠️ Vas a **{action_text} {money(amount)} monedas** para "
+            f"⚠️ Vas a **{action_text} {money(amount, guild.id)}** para "
             f"**{len(members)} miembros** con el rol {target.mention}. ¿Confirmar?",
             view=view,
         )
@@ -909,10 +922,10 @@ def make_shop_embed(
     items = "\n".join(
         (
             f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
-            f"(<@&{row['color_role_id']}>) — {money(row['price'])} monedas"
+            f"(<@&{row['color_role_id']}>) — {money(row['price'], guild.id)}"
             if row["item_type"] == "badge"
             else f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
-            f"(modificador consumible · 5 min) — {money(row['price'])} monedas"
+            f"(modificador consumible · 5 min) — {money(row['price'], guild.id)}"
         )
         for row in rows
     )
@@ -1059,7 +1072,7 @@ async def process_purchase(
             current = await bot.db.get_balance(guild.id, member.id)
             await answer(
                 interaction,
-                f"No tienes suficiente dinero. Tienes **{money(current)} monedas**.",
+                f"No tienes suficiente dinero. Tienes **{money(current, guild.id)}**.",
             )
             return
         await bot.db.record_movement(
@@ -1069,22 +1082,22 @@ async def process_purchase(
             "modifier_purchase",
             -result["price"],
             f"Compró el modificador {result['name']} por "
-            f"{money(result['price'])} monedas.",
+            f"{money(result['price'], guild.id)}.",
         )
         await send_audit_log(
             guild,
             "Compra de modificador",
             f"{member.mention} compró **{result['name']}** por "
-            f"**{money(result['price'])} monedas**.\n"
+            f"**{money(result['price'], guild.id)}**.\n"
             f"**Cantidad:** {result['quantity']}\n"
-            f"**Nuevo balance:** {money(result['new_balance'])} monedas",
+            f"**Nuevo balance:** {money(result['new_balance'], guild.id)}",
             color=0xA855F7,
         )
         await answer(
             interaction,
             f"{member.mention} compró **{result['name']}**. Ahora tiene "
             f"**{result['quantity']}**. Su balance es "
-            f"**{money(result['new_balance'])} monedas**.",
+            f"**{money(result['new_balance'], guild.id)}**.",
         )
         return
 
@@ -1116,7 +1129,7 @@ async def process_purchase(
             current = await bot.db.get_balance(guild.id, member.id)
             await answer(
                 interaction,
-                f"No tienes suficiente dinero. Tienes **{money(current)} monedas**.",
+                f"No tienes suficiente dinero. Tienes **{money(current, guild.id)}**.",
             )
             return
         try:
@@ -1131,21 +1144,21 @@ async def process_purchase(
         member.id,
         "purchase",
         -badge["price"],
-        f"Compró la insignia {badge['name']} por {money(badge['price'])} monedas.",
+        f"Compró la insignia {badge['name']} por {money(badge['price'], guild.id)}.",
     )
     await send_audit_log(
         guild,
         "Compra en el Mercado de Sularea",
         f"{member.mention} compró **{badge['name']}** (<@&{badge['color_role_id']}>) "
-        f"por **{money(badge['price'])} monedas**.\n"
-        f"**Nuevo balance:** {money(new_balance)} monedas",
+        f"por **{money(badge['price'], guild.id)}**.\n"
+        f"**Nuevo balance:** {money(new_balance, guild.id)}",
         color=0xF59E0B,
     )
     await answer(
         interaction,
         f"{member.mention} compró **{badge['name']}** por "
-        f"**{money(badge['price'])} monedas**. Su nuevo balance es "
-        f"**{money(new_balance)} monedas**.",
+        f"**{money(badge['price'], guild.id)}**. Su nuevo balance es "
+        f"**{money(new_balance, guild.id)}**.",
     )
 
 
@@ -1178,15 +1191,15 @@ async def on_message(message: discord.Message) -> None:
             )
             await message.channel.send(
                 f"🎉 {message.author.mention} respondió correctamente y ganó "
-                f"**{money(event['reward'])} monedas**. Su nuevo balance es "
-                f"**{money(event['new_balance'])} monedas**!"
+                f"**{money(event['reward'], message.guild.id)}**. Su nuevo balance es "
+                f"**{money(event['new_balance'], message.guild.id)}**!"
             )
             await send_audit_log(
                 message.guild,
                 "Evento de pregunta ganado",
                 f"**Ganador:** {message.author.mention}\n"
                 f"**Pregunta:** {event['question']}\n"
-                f"**Recompensa:** {money(event['reward'])} monedas\n"
+                f"**Recompensa:** {money(event['reward'], message.guild.id)}\n"
                 f"**Canal:** {message.channel.mention}",
                 color=0x22C55E,
             )
@@ -1321,7 +1334,7 @@ async def eventopregunta(
             "Evento de pregunta creado",
             f"**Administrador:** {interaction.user.mention}\n"
             f"**Pregunta:** {pregunta.strip()}\n"
-            f"**Recompensa:** {money(recompensa)} monedas\n"
+            f"**Recompensa:** {money(recompensa, interaction.guild_id)}\n"
             f"**Duración:** {minutos} minutos\n"
             f"**Canal:** <#{interaction.channel_id}>",
             color=0xEC4899,
@@ -1540,39 +1553,61 @@ async def inventario(
     await answer(interaction, embed=embed)
 
 
-@bot.tree.command(name="insignias", description="Muestra la configuración de insignias.")
+@bot.tree.command(name="objetos", description="Muestra todos los objetos configurados.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def insignias(interaction: discord.Interaction) -> None:
+async def objetos(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     if guild is None:
         return
-    rows = await bot.db.list_badges(guild.id)
+    badges = await bot.db.list_badges(guild.id)
+    modifiers = await bot.db.list_modifiers(guild.id)
 
-    embed = discord.Embed(title="Configuración de insignias", color=0x3B82F6)
-    if rows:
-        details = []
-        for row in rows:
+    embed = discord.Embed(title="Configuración de objetos", color=0x3B82F6)
+    if guild.icon is not None:
+        embed.set_thumbnail(url=guild.icon.url)
+    sections = []
+    if badges:
+        badge_details = []
+        for row in badges:
             sale = (
-                f"Sí — {money(row['price'])} monedas · "
+                f"Sí — {money(row['price'], guild.id)} · "
                 f"Apartado: **{shop_section_name(row['shop_section'])}**"
                 if row["purchasable"]
                 else "No"
             )
-            details.append(
+            badge_details.append(
                 f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
                 f"  Insignia: <@&{row['badge_role_id']}> · "
                 f"Color: <@&{row['color_role_id']}> · Comprable: {sale}"
             )
-        embed.description = "\n".join(details)[:4000]
-    else:
-        embed.description = "No hay insignias configuradas en este servidor."
+        sections.append("__**Insignias**__\n" + "\n".join(badge_details))
+    if modifiers:
+        modifier_details = []
+        for row in modifiers:
+            sale = (
+                f"Sí — {money(row['price'], guild.id)} · "
+                f"Apartado: **{shop_section_name(row['shop_section'])}**"
+                if row["purchasable"]
+                else "No"
+            )
+            modifier_details.append(
+                f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
+                f"  Modificador consumible · Comprable: {sale} · "
+                f"Mensajes: **{len(row['messages'])}**"
+            )
+        sections.append("__**Modificadores**__\n" + "\n".join(modifier_details))
+    embed.description = (
+        "\n\n".join(sections)[:4000]
+        if sections
+        else "No hay objetos configurados en este servidor."
+    )
     embed.set_footer(text="Usa /inventario miembro para consultar a un jugador.")
     await answer(interaction, embed=embed)
 
 
-@bot.tree.command(name="tienda", description="Muestra las insignias disponibles para comprar.")
+@bot.tree.command(name="tienda", description="Muestra los objetos disponibles para comprar.")
 @app_commands.guild_only()
 async def tienda(interaction: discord.Interaction) -> None:
     assert interaction.guild_id is not None and interaction.guild is not None
@@ -1609,7 +1644,7 @@ async def balance(interaction: discord.Interaction) -> None:
     value = await bot.db.get_balance(interaction.guild_id, interaction.user.id)
     await answer(
         interaction,
-        f"Tu balance es **{money(value)} monedas**. Puedes conseguir dinero "
+        f"Tu balance es **{money(value, interaction.guild_id)}**. Puedes conseguir dinero "
         "participando en los eventos de Sularea.",
     )
 
@@ -1665,7 +1700,7 @@ async def ranking(interaction: discord.Interaction) -> None:
         medals = ["🥇", "🥈", "🥉"]
         embed.description = "\n".join(
             f"{medals[index] if index < 3 else f'**{index + 1}.**'} "
-            f"<@{row['user_id']}> — **{money(row['balance'])} monedas**"
+            f"<@{row['user_id']}> — **{money(row['balance'], interaction.guild_id)}**"
             for index, row in enumerate(rows)
         )
     await answer(interaction, embed=embed)
@@ -1684,7 +1719,62 @@ async def revisarbalance(
     value = await bot.db.get_balance(interaction.guild_id, miembro.id)
     await answer(
         interaction,
-        f"El balance de {miembro.mention} es **{money(value)} monedas**.",
+        f"El balance de {miembro.mention} es **{money(value, interaction.guild_id)}**.",
+    )
+
+
+@bot.tree.command(name="configurarmoneda", description="Configura el emoji de la moneda.")
+@app_commands.describe(
+    emoji="Emoji, :nombre: o ID del servidor/bot; escribe quitar para restaurar",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configurarmoneda(
+    interaction: discord.Interaction,
+    emoji: str,
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    emoji_value = edited_badge_emoji(emoji)
+    final_emoji, emoji_error = await resolve_configured_emoji(guild, emoji_value)
+    if emoji_error is not None:
+        await answer(interaction, emoji_error)
+        return
+    old_emoji = bot.coin_emojis.get(interaction.guild_id, DEFAULT_COIN_EMOJI)
+    await bot.db.set_coin_emoji(interaction.guild_id, final_emoji)
+    if final_emoji is None:
+        bot.coin_emojis.pop(interaction.guild_id, None)
+        selected_emoji = DEFAULT_COIN_EMOJI
+    else:
+        bot.coin_emojis[interaction.guild_id] = final_emoji
+        selected_emoji = final_emoji
+    await bot.db.replace_coin_emoji_in_movements(
+        interaction.guild_id,
+        old_emoji,
+        selected_emoji,
+    )
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "coin_emoji_config",
+        None,
+        f"Configuró el emoji de moneda como {selected_emoji}.",
+    )
+    await send_audit_log(
+        guild,
+        "Emoji de moneda configurado",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Emoji:** {selected_emoji}",
+        color=0xF59E0B,
+    )
+    await answer(
+        interaction,
+        f"El emoji de la moneda ahora es {selected_emoji}. Ejemplo: "
+        f"**{money(100, interaction.guild_id)}**.",
     )
 
 
@@ -1750,7 +1840,10 @@ async def estadisticas(interaction: discord.Interaction) -> None:
     if interaction.guild is not None and interaction.guild.icon is not None:
         embed.set_thumbnail(url=interaction.guild.icon.url)
     embed.add_field(name="Miembros registrados", value=str(stats["users"]))
-    embed.add_field(name="Dinero total", value=f"{money(stats['total_money'])} monedas")
+    embed.add_field(
+        name="Dinero total",
+        value=money(stats["total_money"], interaction.guild_id),
+    )
     embed.add_field(name="Insignias configuradas", value=str(stats["badges"]))
     embed.add_field(name="Modificadores configurados", value=str(stats["modifiers"]))
     embed.add_field(name="Compras realizadas", value=str(stats["purchases"]))
@@ -2025,7 +2118,7 @@ async def configurarinsignia(
             f"**Rol de insignia:** {rol_insignia.mention}\n"
             f"**Rol de color:** {rol_color.mention}\n"
             f"**Comprable:** {'Sí' if comprable else 'No'}\n"
-            f"**Precio:** {money(precio)} monedas\n"
+            f"**Precio:** {money(precio, interaction.guild_id)}\n"
             f"**Apartado:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}",
         )
@@ -2122,7 +2215,7 @@ async def configurarmodificador(
         f"**Administrador:** {interaction.user.mention}\n"
         f"**Nombre:** {display_name}\n"
         f"**Comprable:** {'Sí' if comprable else 'No'}\n"
-        f"**Precio:** {money(precio)} monedas\n"
+        f"**Precio:** {money(precio, interaction.guild_id)}\n"
         f"**Apartado:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}\n"
         f"**Mensajes:** {len(parsed_messages)}",
@@ -2187,7 +2280,10 @@ async def editar(
     final_purchasable = comprable if comprable is not None else current["purchasable"]
     final_price = precio if precio is not None else current["price"]
     if final_price < 0 or final_price > MAX_MONEY:
-        await answer(interaction, f"El precio debe estar entre 0 y {money(MAX_MONEY)}.")
+        await answer(
+            interaction,
+            f"El precio debe estar entre 0 y {money(MAX_MONEY, interaction.guild_id)}.",
+        )
         return
     if not final_purchasable:
         final_price = 0
@@ -2268,7 +2364,7 @@ async def editar(
             f"**Nombre anterior:** {current_modifier['name']}\n"
             f"**Nombre actual:** {final_name}\n"
             f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
-            f"**Precio:** {money(final_price)} monedas\n"
+            f"**Precio:** {money(final_price, interaction.guild_id)}\n"
             f"**Apartado:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}\n"
             f"**Mensajes:** {len(final_messages)}",
@@ -2333,7 +2429,7 @@ async def editar(
         f"**Rol de insignia:** <@&{final_badge_role}>\n"
         f"**Rol de color:** <@&{final_color_role}>\n"
         f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
-        f"**Precio:** {money(final_price)} monedas\n"
+        f"**Precio:** {money(final_price, interaction.guild_id)}\n"
         f"**Apartado:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}",
     )
@@ -2565,7 +2661,7 @@ async def ayuda(interaction: discord.Interaction) -> None:
         embed.add_field(
             name="Administración",
             value=(
-                "`/inventario [miembro]` · `/insignias`\n"
+                "`/inventario [miembro]` · `/objetos`\n"
                 "`/darinsignia` · `/quitarinsignia`\n"
                 "`/configurarinsignia` · `/configurarmodificador` · `/editar`\n"
                 "`/borrarinsignia` · `/borrarmodificador`\n"
@@ -2573,6 +2669,7 @@ async def ayuda(interaction: discord.Interaction) -> None:
                 "`/revisarbalance` · `/añadirbalance` · `/quitarbalance` · `/setbalance`\n"
                 "`/eventopregunta` · `/cancelarevento`\n"
                 "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`"
+                "\n`/configurarmoneda`"
             ),
             inline=False,
         )
