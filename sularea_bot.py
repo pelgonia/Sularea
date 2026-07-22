@@ -1091,8 +1091,8 @@ def make_shop_embed(
             )
         elif row["item_type"] == "modifier":
             item_lines.append(
-                f"{prefix} (modificador consumible · {row['duration_minutes']} min · "
-                f"1/{row['trigger_denominator']} · cooldown {row['cooldown_seconds']} s) — "
+                f"{prefix} (modificador consumible · "
+                f"{row['duration_minutes']} min) — "
                 f"{money(row['price'], guild.id)}"
             )
         else:
@@ -2208,8 +2208,7 @@ async def inventario(
     if modifiers:
         modifier_lines = "\n".join(
             f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
-            f"× **{row['quantity']}** · {row['duration_minutes']} min · "
-            f"1/{row['trigger_denominator']} · cooldown {row['cooldown_seconds']} s"
+            f"× **{row['quantity']}** · {row['duration_minutes']} min"
             for row in modifiers
         )
         sections.append(f"__**Modificadores consumibles**__\n{modifier_lines}")
