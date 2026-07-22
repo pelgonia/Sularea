@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import traceback
 import unicodedata
 from datetime import datetime, timezone
@@ -20,6 +21,8 @@ load_dotenv()
 MAX_MONEY = 1_000_000_000_000
 DEFAULT_SHOP_SECTION = "General"
 MAX_SHOP_SECTIONS = 25
+MODIFIER_DURATION_MINUTES = 5
+MODIFIER_COOLDOWN_SECONDS = 10
 
 
 def normalize_name(value: str) -> str:
@@ -91,6 +94,18 @@ def edited_badge_emoji(value: str | None, current: str | None = None) -> str | N
     return cleaned or None
 
 
+def parse_modifier_messages(value: str) -> tuple[list[str] | None, str | None]:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").replace("|", "\n")
+    messages = [part.strip() for part in normalized.split("\n") if part.strip()]
+    if not messages:
+        return None, "Debes configurar al menos un mensaje para el modificador."
+    if len(messages) > 20:
+        return None, "Puedes configurar un máximo de 20 mensajes por modificador."
+    if any(len(message) > 1900 for message in messages):
+        return None, "Cada mensaje del modificador puede tener hasta 1.900 caracteres."
+    return messages, None
+
+
 def answer_hash(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value)
     without_accents = "".join(
@@ -128,6 +143,7 @@ class SulareaBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.purchase_locks: dict[tuple[int, int], asyncio.Lock] = {}
+        self.modifier_webhooks: dict[int, discord.Webhook] = {}
 
     async def setup_hook(self) -> None:
         database_url = os.getenv("DATABASE_URL")
@@ -141,10 +157,14 @@ class SulareaBot(commands.Bot):
         await self.tree.sync()
         if not event_expiration_loop.is_running():
             event_expiration_loop.start()
+        if not modifier_expiration_loop.is_running():
+            modifier_expiration_loop.start()
 
     async def close(self) -> None:
         if event_expiration_loop.is_running():
             event_expiration_loop.cancel()
+        if modifier_expiration_loop.is_running():
+            modifier_expiration_loop.cancel()
         if hasattr(self, "db"):
             await self.db.close()
         await super().close()
@@ -304,6 +324,123 @@ async def event_expiration_loop() -> None:
 @event_expiration_loop.before_loop
 async def before_event_expiration_loop() -> None:
     await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=5)
+async def modifier_expiration_loop() -> None:
+    if not hasattr(bot, "db"):
+        return
+    try:
+        expired_modifiers = await bot.db.pop_expired_modifiers()
+    except (OSError, asyncpg.PostgresError):
+        traceback.print_exc()
+        return
+    for expired in expired_modifiers:
+        guild = bot.get_guild(expired["guild_id"])
+        user = guild.get_member(expired["user_id"]) if guild is not None else None
+        if user is None:
+            user = bot.get_user(expired["user_id"])
+        if user is None:
+            try:
+                user = await bot.fetch_user(expired["user_id"])
+            except discord.HTTPException:
+                user = None
+        if user is not None:
+            try:
+                await user.send(
+                    f"Tu modificador **{expired['name']}** terminó después de 5 minutos."
+                )
+            except discord.HTTPException:
+                pass
+        await bot.db.record_movement(
+            expired["guild_id"],
+            expired["user_id"],
+            expired["user_id"],
+            "modifier_expire",
+            None,
+            f"Terminó el modificador {expired['name']}.",
+        )
+        if guild is not None:
+            await send_audit_log(
+                guild,
+                "Modificador finalizado",
+                f"**Miembro:** <@{expired['user_id']}>\n"
+                f"**Modificador:** {expired['name']}",
+                color=0x6B7280,
+            )
+
+
+@modifier_expiration_loop.before_loop
+async def before_modifier_expiration_loop() -> None:
+    await bot.wait_until_ready()
+
+
+async def get_modifier_webhook(
+    channel: discord.abc.GuildChannel | discord.Thread,
+) -> tuple[discord.Webhook | None, discord.Thread | None]:
+    thread = channel if isinstance(channel, discord.Thread) else None
+    base_channel = channel.parent if thread is not None else channel
+    if not isinstance(base_channel, (discord.TextChannel, discord.ForumChannel)):
+        return None, thread
+    cached = bot.modifier_webhooks.get(base_channel.id)
+    if cached is not None:
+        return cached, thread
+    try:
+        webhooks = await base_channel.webhooks()
+        owned_webhooks = [
+            item
+            for item in webhooks
+            if item.name == "Sularea Modificadores"
+            and item.user is not None
+            and bot.user is not None
+            and item.user.id == bot.user.id
+        ]
+        webhook = next(
+            (item for item in owned_webhooks if item.token is not None),
+            None,
+        )
+        if webhook is None:
+            for stale_webhook in owned_webhooks:
+                try:
+                    await stale_webhook.delete(
+                        reason="Renovación del webhook de modificadores",
+                    )
+                except discord.HTTPException:
+                    pass
+            webhook = await base_channel.create_webhook(
+                name="Sularea Modificadores",
+                reason="Mensajes de modificadores de Sularea",
+            )
+        bot.modifier_webhooks[base_channel.id] = webhook
+        return webhook, thread
+    except discord.HTTPException:
+        traceback.print_exc()
+        return None, thread
+
+
+async def send_modifier_webhook_message(
+    message: discord.Message,
+    content: str,
+) -> None:
+    webhook, thread = await get_modifier_webhook(message.channel)
+    if webhook is None:
+        return
+    kwargs = {
+        "content": content,
+        "username": message.author.display_name[:80],
+        "avatar_url": message.author.display_avatar.url,
+        "allowed_mentions": discord.AllowedMentions.none(),
+        "wait": True,
+    }
+    if thread is not None:
+        kwargs["thread"] = thread
+    try:
+        await webhook.send(**kwargs)
+    except discord.NotFound:
+        base_channel = message.channel.parent if thread is not None else message.channel
+        bot.modifier_webhooks.pop(base_channel.id, None)
+    except discord.HTTPException:
+        traceback.print_exc()
 
 
 async def apply_balance_change(
@@ -523,6 +660,12 @@ async def find_badge(interaction: discord.Interaction, name: str):
     return await bot.db.get_badge(interaction.guild_id, normalize_name(name))
 
 
+async def find_modifier(interaction: discord.Interaction, name: str):
+    if interaction.guild_id is None:
+        return None
+    return await bot.db.get_modifier(interaction.guild_id, normalize_name(name))
+
+
 async def badge_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
@@ -553,19 +696,93 @@ async def owned_badge_autocomplete(
     ][:25]
 
 
+async def owned_object_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    member = guild_member(interaction)
+    if interaction.guild_id is None or member is None or not hasattr(bot, "db"):
+        return []
+    badges = await bot.db.list_badges(interaction.guild_id)
+    modifiers = await bot.db.list_modifier_inventory(interaction.guild_id, member.id)
+    owned_role_ids = {role.id for role in member.roles}
+    search = normalize_name(current)
+    choices = [
+        app_commands.Choice(
+            name=f"Insignia · {row['name']}"[:100],
+            value=row["name"][:100],
+        )
+        for row in badges
+        if row["badge_role_id"] in owned_role_ids and search in row["name_key"]
+    ]
+    choices.extend(
+        app_commands.Choice(
+            name=f"Modificador · {row['name']} (x{row['quantity']})"[:100],
+            value=row["name"][:100],
+        )
+        for row in modifiers
+        if search in row["name_key"]
+    )
+    return choices[:25]
+
+
+async def modifier_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None or not hasattr(bot, "db"):
+        return []
+    rows = await bot.db.list_modifiers(interaction.guild_id)
+    search = normalize_name(current)
+    return [
+        app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
+        for row in rows
+        if search in row["name_key"]
+    ][:25]
+
+
+async def editable_object_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None or not hasattr(bot, "db"):
+        return []
+    badges = await bot.db.list_badges(interaction.guild_id)
+    modifiers = await bot.db.list_modifiers(interaction.guild_id)
+    search = normalize_name(current)
+    choices = [
+        app_commands.Choice(
+            name=f"Insignia · {row['name']}"[:100],
+            value=row["name"][:100],
+        )
+        for row in badges
+        if search in row["name_key"]
+    ]
+    choices.extend(
+        app_commands.Choice(
+            name=f"Modificador · {row['name']}"[:100],
+            value=row["name"][:100],
+        )
+        for row in modifiers
+        if search in row["name_key"]
+    )
+    return choices[:25]
+
+
 async def shop_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
-    rows = await bot.db.list_badges(interaction.guild_id, purchasable_only=True)
+    rows = await bot.db.list_shop_items(interaction.guild_id)
     member = guild_member(interaction)
     owned_role_ids = {role.id for role in member.roles} if member is not None else set()
     search = normalize_name(current)
     return [
         app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
         for row in rows
-        if row["badge_role_id"] not in owned_role_ids and search in row["name_key"]
+        if (
+            row["item_type"] == "modifier"
+            or row["badge_role_id"] not in owned_role_ids
+        )
+        and search in row["name_key"]
     ][:25]
 
 
@@ -574,7 +791,7 @@ async def shop_section_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
-    rows = await bot.db.list_badges(interaction.guild_id, purchasable_only=True)
+    rows = await bot.db.list_shop_items(interaction.guild_id)
     search = normalize_name(current)
     sections: dict[str, str] = {}
     for row in rows:
@@ -591,13 +808,14 @@ async def shop_section_is_available(
     guild_id: int,
     section_name: str,
     *,
-    excluding_badge: str | None = None,
+    excluding_item: tuple[str, str] | None = None,
 ) -> bool:
-    rows = await bot.db.list_badges(guild_id, purchasable_only=True)
+    rows = await bot.db.list_shop_items(guild_id)
     sections = {
         normalize_name(shop_section_name(row["shop_section"]))
         for row in rows
-        if row["name_key"] != excluding_badge
+        if excluding_item is None
+        or (row["item_type"], row["name_key"]) != excluding_item
     }
     sections.add(normalize_name(section_name))
     return len(sections) <= MAX_SHOP_SECTIONS
@@ -627,8 +845,13 @@ def make_shop_embed(
 ) -> discord.Embed:
     section_name, rows = sections[selected_index]
     items = "\n".join(
-        f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
-        f"(<@&{row['color_role_id']}>) — {money(row['price'])} monedas"
+        (
+            f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
+            f"(<@&{row['color_role_id']}>) — {money(row['price'])} monedas"
+            if row["item_type"] == "badge"
+            else f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
+            f"(modificador consumible · 5 min) — {money(row['price'])} monedas"
+        )
         for row in rows
     )
     embed = discord.Embed(
@@ -656,8 +879,7 @@ class ShopSectionSelect(discord.ui.Select):
                 value=str(index),
                 description=(
                     f"{len(rows)} "
-                    f"{'insignia' if len(rows) == 1 else 'insignias'} disponible"
-                    f"{'s' if len(rows) != 1 else ''}"
+                    f"{'objeto disponible' if len(rows) == 1 else 'objetos disponibles'}"
                 )[:100],
                 default=index == 0,
             )
@@ -751,13 +973,61 @@ class ShopView(discord.ui.View):
 
 async def process_purchase(
     interaction: discord.Interaction,
-    badge_name: str,
+    item_name: str,
 ) -> None:
     member = guild_member(interaction)
     guild = interaction.guild
-    badge = await find_badge(interaction, badge_name)
-    if member is None or guild is None or badge is None or not badge["purchasable"]:
-        await answer(interaction, "Esa insignia no está disponible en la tienda.")
+    if member is None or guild is None:
+        return
+    badge = await find_badge(interaction, item_name)
+    modifier = None if badge is not None else await find_modifier(interaction, item_name)
+    if modifier is not None and modifier["purchasable"]:
+        await interaction.response.defer()
+        lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
+        async with lock:
+            result = await bot.db.purchase_modifier(
+                guild.id,
+                member.id,
+                modifier["name_key"],
+            )
+        if result is None:
+            await answer(interaction, "Ese modificador ya no está disponible.")
+            return
+        if result["status"] == "insufficient":
+            current = await bot.db.get_balance(guild.id, member.id)
+            await answer(
+                interaction,
+                f"No tienes suficiente dinero. Tienes **{money(current)} monedas**.",
+            )
+            return
+        await bot.db.record_movement(
+            guild.id,
+            member.id,
+            member.id,
+            "modifier_purchase",
+            -result["price"],
+            f"Compró el modificador {result['name']} por "
+            f"{money(result['price'])} monedas.",
+        )
+        await send_audit_log(
+            guild,
+            "Compra de modificador",
+            f"{member.mention} compró **{result['name']}** por "
+            f"**{money(result['price'])} monedas**.\n"
+            f"**Cantidad:** {result['quantity']}\n"
+            f"**Nuevo balance:** {money(result['new_balance'])} monedas",
+            color=0xA855F7,
+        )
+        await answer(
+            interaction,
+            f"{member.mention} compró **{result['name']}**. Ahora tiene "
+            f"**{result['quantity']}**. Su balance es "
+            f"**{money(result['new_balance'])} monedas**.",
+        )
+        return
+
+    if badge is None or not badge["purchasable"]:
+        await answer(interaction, "Ese objeto no está disponible en la tienda.")
         return
     role = guild.get_role(badge["badge_role_id"])
     if role is None:
@@ -827,39 +1097,50 @@ async def on_ready() -> None:
 async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.guild is None or not hasattr(bot, "db"):
         return
-    if message.reference is None or message.reference.message_id is None:
-        await bot.process_commands(message)
-        return
-    event = await bot.db.claim_question_event(
-        message.guild.id,
-        message.channel.id,
-        answer_hash(message.content),
-        message.reference.message_id,
-        message.author.id,
-    )
-    if event is not None:
-        await finalize_question_embed(
-            message.guild,
+    if message.reference is not None and message.reference.message_id is not None:
+        event = await bot.db.claim_question_event(
+            message.guild.id,
             message.channel.id,
-            event["message_id"],
-            event["question"],
-            event["reward"],
-            f"✅ Ganado por {message.author.mention}.",
+            answer_hash(message.content),
+            message.reference.message_id,
+            message.author.id,
         )
-        await message.channel.send(
-            f"🎉 {message.author.mention} respondió correctamente y ganó "
-            f"**{money(event['reward'])} monedas**. Su nuevo balance es "
-            f"**{money(event['new_balance'])} monedas**!"
+        if event is not None:
+            await finalize_question_embed(
+                message.guild,
+                message.channel.id,
+                event["message_id"],
+                event["question"],
+                event["reward"],
+                f"✅ Ganado por {message.author.mention}.",
+            )
+            await message.channel.send(
+                f"🎉 {message.author.mention} respondió correctamente y ganó "
+                f"**{money(event['reward'])} monedas**. Su nuevo balance es "
+                f"**{money(event['new_balance'])} monedas**!"
+            )
+            await send_audit_log(
+                message.guild,
+                "Evento de pregunta ganado",
+                f"**Ganador:** {message.author.mention}\n"
+                f"**Pregunta:** {event['question']}\n"
+                f"**Recompensa:** {money(event['reward'])} monedas\n"
+                f"**Canal:** {message.channel.mention}",
+                color=0x22C55E,
+            )
+    try:
+        modifier = await bot.db.try_trigger_modifier(
+            message.guild.id,
+            message.author.id,
+            MODIFIER_COOLDOWN_SECONDS,
         )
-        await send_audit_log(
-            message.guild,
-            "Evento de pregunta ganado",
-            f"**Ganador:** {message.author.mention}\n"
-            f"**Pregunta:** {event['question']}\n"
-            f"**Recompensa:** {money(event['reward'])} monedas\n"
-            f"**Canal:** {message.channel.mention}",
-            color=0x22C55E,
-        )
+        if modifier is not None and modifier["messages"]:
+            await send_modifier_webhook_message(
+                message,
+                random.choice(list(modifier["messages"])),
+            )
+    except (OSError, asyncpg.PostgresError):
+        traceback.print_exc()
     await bot.process_commands(message)
 
 
@@ -1027,16 +1308,59 @@ async def cancelarevento(interaction: discord.Interaction) -> None:
         )
 
 
-@bot.tree.command(name="usar", description="Activa el color de una insignia que posees.")
-@app_commands.describe(insignia="Nombre de la insignia que quieres usar")
-@app_commands.autocomplete(insignia=owned_badge_autocomplete)
+@bot.tree.command(name="usar", description="Usa una insignia o un modificador que posees.")
+@app_commands.describe(objeto="Nombre de la insignia o modificador que quieres usar")
+@app_commands.autocomplete(objeto=owned_object_autocomplete)
 @app_commands.guild_only()
-async def usar(interaction: discord.Interaction, insignia: str) -> None:
+async def usar(interaction: discord.Interaction, objeto: str) -> None:
     member = guild_member(interaction)
     guild = interaction.guild
-    badge = await find_badge(interaction, insignia)
-    if member is None or guild is None or badge is None:
-        await answer(interaction, "Esa insignia no existe.")
+    if member is None or guild is None:
+        return
+    badge = await find_badge(interaction, objeto)
+    if badge is None:
+        modifier = await find_modifier(interaction, objeto)
+        if modifier is None:
+            await answer(interaction, "Ese objeto no existe.")
+            return
+        result = await bot.db.activate_modifier(
+            guild.id,
+            member.id,
+            modifier["name_key"],
+            MODIFIER_DURATION_MINUTES,
+        )
+        if result["status"] == "missing":
+            await answer(interaction, "No tienes ese modificador en tu inventario.")
+            return
+        if result["status"] == "already_active":
+            await answer(
+                interaction,
+                f"Ya tienes activo **{result['name']}**. Termina "
+                f"<t:{int(result['expires_at'].timestamp())}:R>.",
+            )
+            return
+        await bot.db.record_movement(
+            guild.id,
+            member.id,
+            member.id,
+            "modifier_use",
+            None,
+            f"Usó el modificador {result['name']} durante 5 minutos.",
+        )
+        await send_audit_log(
+            guild,
+            "Modificador activado",
+            f"**Miembro:** {member.mention}\n"
+            f"**Modificador:** {result['name']}\n"
+            f"**Restantes:** {result['quantity']}\n"
+            f"**Finaliza:** <t:{int(result['expires_at'].timestamp())}:R>",
+            color=0xA855F7,
+        )
+        await answer(
+            interaction,
+            f"Activaste **{result['name']}** durante **5 minutos**. "
+            f"Te quedan **{result['quantity']}**.",
+        )
         return
     badge_role = guild.get_role(badge["badge_role_id"])
     color_role = guild.get_role(badge["color_role_id"])
@@ -1095,7 +1419,7 @@ async def quitar(interaction: discord.Interaction) -> None:
     await answer(interaction, "Quité tu rol de color. Tus insignias siguen intactas.")
 
 
-@bot.tree.command(name="inventario", description="Muestra tus insignias disponibles.")
+@bot.tree.command(name="inventario", description="Muestra tus insignias y modificadores.")
 @app_commands.guild_only()
 async def inventario(interaction: discord.Interaction) -> None:
     member = guild_member(interaction)
@@ -1104,20 +1428,32 @@ async def inventario(interaction: discord.Interaction) -> None:
         return
     rows = await bot.db.list_badges(guild.id)
     owned = [row for row in rows if guild.get_role(row["badge_role_id"]) in member.roles]
-    embed = discord.Embed(title=f"Insignias de {member.display_name}", color=0x8B5CF6)
+    modifiers = await bot.db.list_modifier_inventory(guild.id, member.id)
+    embed = discord.Embed(title=f"Inventario de {member.display_name}", color=0x8B5CF6)
     embed.set_thumbnail(url=member.display_avatar.url)
+    sections = []
     if owned:
-        embed.description = "\n".join(
+        badge_lines = "\n".join(
             f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
             f"(<@&{row['color_role_id']}>)"
             for row in owned
-        )[:4000]
+        )
+        sections.append(f"__**Insignias**__\n{badge_lines}")
+    if modifiers:
+        modifier_lines = "\n".join(
+            f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
+            f"× **{row['quantity']}**"
+            for row in modifiers
+        )
+        sections.append(f"__**Modificadores consumibles**__\n{modifier_lines}")
+    if sections:
+        embed.description = "\n\n".join(sections)[:4000]
         embed.set_footer(
-            text="Usa /usar para activar una insignia y /quitar para quitar el rol de color."
+            text="Usa /usar para activar una insignia o consumir un modificador."
         )
     else:
         embed.description = (
-            "No tienes insignias activas. Puedes comprar una en **/tienda** "
+            "No tienes insignias ni modificadores. Puedes conseguir objetos en **/tienda** "
             "y consultar tus monedas con **/balance**."
         )
     await answer(interaction, embed=embed)
@@ -1185,12 +1521,12 @@ async def insignias(
 @app_commands.guild_only()
 async def tienda(interaction: discord.Interaction) -> None:
     assert interaction.guild_id is not None and interaction.guild is not None
-    rows = await bot.db.list_badges(interaction.guild_id, purchasable_only=True)
+    rows = await bot.db.list_shop_items(interaction.guild_id)
     if not rows:
         embed = discord.Embed(title="Mercado de Sularea", color=0xF59E0B)
         if interaction.guild.icon is not None:
             embed.set_thumbnail(url=interaction.guild.icon.url)
-        embed.description = "No hay insignias a la venta en este momento."
+        embed.description = "No hay objetos a la venta en este momento."
         await answer(interaction, embed=embed)
         return
 
@@ -1203,12 +1539,12 @@ async def tienda(interaction: discord.Interaction) -> None:
     view.message = await interaction.original_response()
 
 
-@bot.tree.command(name="comprar", description="Compra una insignia de la tienda.")
-@app_commands.describe(insignia="Nombre de la insignia que quieres comprar")
-@app_commands.autocomplete(insignia=shop_autocomplete)
+@bot.tree.command(name="comprar", description="Compra un objeto de la tienda.")
+@app_commands.describe(objeto="Nombre del objeto que quieres comprar")
+@app_commands.autocomplete(objeto=shop_autocomplete)
 @app_commands.guild_only()
-async def comprar(interaction: discord.Interaction, insignia: str) -> None:
-    await process_purchase(interaction, insignia)
+async def comprar(interaction: discord.Interaction, objeto: str) -> None:
+    await process_purchase(interaction, objeto)
 
 
 @bot.tree.command(name="balance", description="Muestra tu balance de monedas.")
@@ -1246,6 +1582,11 @@ async def historial(interaction: discord.Interaction) -> None:
         "event_reward": "🎉",
         "badge_grant": "🏅",
         "badge_remove": "🗑️",
+        "modifier_purchase": "🧪",
+        "modifier_use": "✨",
+        "modifier_grant": "🎁",
+        "modifier_remove": "➖",
+        "modifier_expire": "⌛",
     }
     embed.description = "\n".join(
         f"{icons.get(row['action'], '•')} {row['description']} "
@@ -1356,9 +1697,11 @@ async def estadisticas(interaction: discord.Interaction) -> None:
     embed.add_field(name="Miembros registrados", value=str(stats["users"]))
     embed.add_field(name="Dinero total", value=f"{money(stats['total_money'])} monedas")
     embed.add_field(name="Insignias configuradas", value=str(stats["badges"]))
+    embed.add_field(name="Modificadores configurados", value=str(stats["modifiers"]))
     embed.add_field(name="Compras realizadas", value=str(stats["purchases"]))
     embed.add_field(name="Eventos ganados", value=str(stats["event_wins"]))
     embed.add_field(name="Eventos activos", value=str(stats["active_events"]))
+    embed.add_field(name="Modificadores activos", value=str(stats["active_modifiers"]))
     embed.add_field(name="Movimientos guardados", value=str(stats["movements"]))
     await answer(interaction, embed=embed)
 
@@ -1565,6 +1908,9 @@ async def configurarinsignia(
     if not display_name or len(display_name) > 100:
         await answer(interaction, "El nombre debe tener entre 1 y 100 caracteres.")
         return
+    if await bot.db.get_modifier(interaction.guild_id, normalize_name(display_name)):
+        await answer(interaction, "Ya existe un modificador con ese nombre.")
+        return
     if rol_insignia == rol_color:
         await answer(interaction, "El rol de insignia y el rol de color deben ser diferentes.")
         return
@@ -1628,62 +1974,52 @@ async def configurarinsignia(
     await answer(interaction, f"Configuré la insignia **{display_name}** correctamente.")
 
 
-@bot.tree.command(name="editarinsignia", description="Edita una insignia configurada.")
+@bot.tree.command(name="configurarmodificador", description="Configura un modificador consumible.")
 @app_commands.describe(
-    insignia="Nombre actual", nuevo_nombre="Nuevo nombre (opcional)",
-    rol_insignia="Nuevo rol de insignia", rol_color="Nuevo rol de color",
-    comprable="Cambiar si aparece en la tienda", precio="Nuevo precio",
-    apartado="Nuevo apartado de la tienda",
-    emoji="Emoji o :nombre: del servidor; escribe quitar para eliminarlo",
+    nombre="Nombre del modificador",
+    comprable="Indica si aparecerá en la tienda",
+    mensajes="Mensajes posibles separados por el símbolo |",
+    precio="Precio; usa 0 si no será comprable",
+    apartado="Apartado de la tienda; por defecto será General",
+    emoji="Emoji opcional; puedes escribir :nombre: si es del servidor",
 )
-@app_commands.autocomplete(
-    insignia=badge_autocomplete,
-    apartado=shop_section_autocomplete,
-)
+@app_commands.autocomplete(apartado=shop_section_autocomplete)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def editarinsignia(
+async def configurarmodificador(
     interaction: discord.Interaction,
-    insignia: str,
-    nuevo_nombre: str | None = None,
-    rol_insignia: discord.Role | None = None,
-    rol_color: discord.Role | None = None,
-    comprable: bool | None = None,
-    precio: int | None = None,
+    nombre: str,
+    comprable: bool,
+    mensajes: str,
+    precio: app_commands.Range[int, 0, MAX_MONEY] = 0,
     apartado: str | None = None,
     emoji: str | None = None,
 ) -> None:
     assert interaction.guild_id is not None
-    if interaction.guild is None:
+    guild = interaction.guild
+    if guild is None:
         return
-    current = await find_badge(interaction, insignia)
-    if current is None:
-        await answer(interaction, "Esa insignia no existe.")
-        return
-    final_name = nuevo_nombre.strip() if nuevo_nombre is not None else current["name"]
-    final_badge_role = rol_insignia.id if rol_insignia else current["badge_role_id"]
-    final_color_role = rol_color.id if rol_color else current["color_role_id"]
-    final_purchasable = comprable if comprable is not None else current["purchasable"]
-    final_price = precio if precio is not None else current["price"]
-    final_section = (
-        shop_section_name(apartado if apartado is not None else current["shop_section"])
-        if final_purchasable
-        else None
-    )
-    emoji_value = edited_badge_emoji(emoji, current["emoji"])
-    final_emoji, emoji_error = resolve_guild_emoji(interaction.guild, emoji_value)
-    if not final_name or len(final_name) > 100:
+    display_name = nombre.strip()
+    if not display_name or len(display_name) > 100:
         await answer(interaction, "El nombre debe tener entre 1 y 100 caracteres.")
         return
-    if final_price < 0 or final_price > MAX_MONEY:
-        await answer(interaction, f"El precio debe estar entre 0 y {money(MAX_MONEY)}.")
+    name_key = normalize_name(display_name)
+    if await bot.db.get_badge(interaction.guild_id, name_key):
+        await answer(interaction, "Ya existe una insignia con ese nombre.")
         return
-    if not final_purchasable:
-        final_price = 0
+    parsed_messages, messages_error = parse_modifier_messages(mensajes)
+    if messages_error is not None or parsed_messages is None:
+        await answer(interaction, messages_error or "Los mensajes no son válidos.")
+        return
+    if not comprable:
+        precio = 0
+    final_section = shop_section_name(apartado) if comprable else None
     if final_section is not None and len(final_section) > 100:
         await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
         return
+    emoji_value = edited_badge_emoji(emoji)
+    final_emoji, emoji_error = resolve_guild_emoji(guild, emoji_value)
     if emoji_error is not None:
         await answer(interaction, emoji_error)
         return
@@ -1693,25 +2029,228 @@ async def editarinsignia(
     if final_section is not None and not await shop_section_is_available(
         interaction.guild_id,
         final_section,
-        excluding_badge=current["name_key"],
     ):
         await answer(
             interaction,
             f"La tienda admite un máximo de {MAX_SHOP_SECTIONS} apartados.",
         )
         return
+    await interaction.response.defer()
+    try:
+        await bot.db.create_modifier(
+            interaction.guild_id,
+            display_name,
+            name_key,
+            comprable,
+            precio,
+            final_section,
+            final_emoji,
+            parsed_messages,
+        )
+    except asyncpg.UniqueViolationError:
+        await answer(interaction, "Ya existe un modificador con ese nombre.")
+        return
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "modifier_config_create",
+        None,
+        f"Configuró el modificador {display_name}.",
+    )
+    await send_audit_log(
+        guild,
+        "Modificador configurado",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Nombre:** {display_name}\n"
+        f"**Comprable:** {'Sí' if comprable else 'No'}\n"
+        f"**Precio:** {money(precio)} monedas\n"
+        f"**Apartado:** {final_section or 'No aplica'}\n"
+        f"**Emoji:** {final_emoji or 'Ninguno'}\n"
+        f"**Mensajes:** {len(parsed_messages)}",
+        color=0xA855F7,
+    )
+    await answer(
+        interaction,
+        f"Configuré el modificador **{display_name}** con "
+        f"**{len(parsed_messages)} mensajes**.",
+    )
+
+
+@bot.tree.command(name="editar", description="Edita una insignia o un modificador.")
+@app_commands.describe(
+    objeto="Nombre actual del objeto",
+    nuevo_nombre="Nuevo nombre (opcional)",
+    rol_insignia="Nuevo rol de insignia; no aplica a modificadores",
+    rol_color="Nuevo rol de color; no aplica a modificadores",
+    comprable="Cambiar si aparece en la tienda",
+    precio="Nuevo precio",
+    apartado="Nuevo apartado de la tienda",
+    emoji="Emoji o :nombre: del servidor; escribe quitar para eliminarlo",
+    mensajes="Para modificadores: nueva lista separada por |",
+)
+@app_commands.autocomplete(
+    objeto=editable_object_autocomplete,
+    apartado=shop_section_autocomplete,
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def editar(
+    interaction: discord.Interaction,
+    objeto: str,
+    nuevo_nombre: str | None = None,
+    rol_insignia: discord.Role | None = None,
+    rol_color: discord.Role | None = None,
+    comprable: bool | None = None,
+    precio: int | None = None,
+    apartado: str | None = None,
+    emoji: str | None = None,
+    mensajes: str | None = None,
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    current_badge = await find_badge(interaction, objeto)
+    current_modifier = (
+        None if current_badge is not None else await find_modifier(interaction, objeto)
+    )
+    if current_badge is None and current_modifier is None:
+        await answer(interaction, "Ese objeto no existe.")
+        return
+
+    current = current_badge or current_modifier
+    final_name = nuevo_nombre.strip() if nuevo_nombre is not None else current["name"]
+    if not final_name or len(final_name) > 100:
+        await answer(interaction, "El nombre debe tener entre 1 y 100 caracteres.")
+        return
+    final_name_key = normalize_name(final_name)
+    final_purchasable = comprable if comprable is not None else current["purchasable"]
+    final_price = precio if precio is not None else current["price"]
+    if final_price < 0 or final_price > MAX_MONEY:
+        await answer(interaction, f"El precio debe estar entre 0 y {money(MAX_MONEY)}.")
+        return
+    if not final_purchasable:
+        final_price = 0
+    final_section = (
+        shop_section_name(apartado if apartado is not None else current["shop_section"])
+        if final_purchasable
+        else None
+    )
+    if final_section is not None and len(final_section) > 100:
+        await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
+        return
+    emoji_value = edited_badge_emoji(emoji, current["emoji"])
+    final_emoji, emoji_error = resolve_guild_emoji(guild, emoji_value)
+    if emoji_error is not None:
+        await answer(interaction, emoji_error)
+        return
+    if final_emoji is not None and (len(final_emoji) > 100 or "\n" in final_emoji):
+        await answer(interaction, "El emoji no es válido o es demasiado largo.")
+        return
+
+    item_type = "badge" if current_badge is not None else "modifier"
+    if final_section is not None and not await shop_section_is_available(
+        interaction.guild_id,
+        final_section,
+        excluding_item=(item_type, current["name_key"]),
+    ):
+        await answer(
+            interaction,
+            f"La tienda admite un máximo de {MAX_SHOP_SECTIONS} apartados.",
+        )
+        return
+
+    if current_modifier is not None:
+        if rol_insignia is not None or rol_color is not None:
+            await answer(interaction, "Los modificadores no utilizan roles de Discord.")
+            return
+        if await bot.db.get_badge(interaction.guild_id, final_name_key):
+            await answer(interaction, "Ya existe una insignia con ese nombre.")
+            return
+        final_messages = list(current_modifier["messages"])
+        if mensajes is not None:
+            parsed_messages, messages_error = parse_modifier_messages(mensajes)
+            if messages_error is not None or parsed_messages is None:
+                await answer(interaction, messages_error or "Los mensajes no son válidos.")
+                return
+            final_messages = parsed_messages
+        await interaction.response.defer()
+        try:
+            updated = await bot.db.update_modifier(
+                interaction.guild_id,
+                current_modifier["name_key"],
+                final_name,
+                final_name_key,
+                final_purchasable,
+                final_price,
+                final_section,
+                final_emoji,
+                final_messages,
+            )
+        except asyncpg.UniqueViolationError:
+            await answer(interaction, "Ya existe un modificador con ese nombre.")
+            return
+        if not updated:
+            await answer(interaction, "No pude encontrar ese modificador.")
+            return
+        await bot.db.record_movement(
+            interaction.guild_id,
+            None,
+            interaction.user.id,
+            "modifier_config_edit",
+            None,
+            f"Editó el modificador {current_modifier['name']} como {final_name}.",
+        )
+        await send_audit_log(
+            guild,
+            "Modificador editado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Nombre anterior:** {current_modifier['name']}\n"
+            f"**Nombre actual:** {final_name}\n"
+            f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
+            f"**Precio:** {money(final_price)} monedas\n"
+            f"**Apartado:** {final_section or 'No aplica'}\n"
+            f"**Emoji:** {final_emoji or 'Ninguno'}\n"
+            f"**Mensajes:** {len(final_messages)}",
+            color=0xA855F7,
+        )
+        await answer(interaction, f"Actualicé el modificador **{final_name}**.")
+        return
+
+    if mensajes is not None:
+        await answer(interaction, "La opción mensajes solo se usa con modificadores.")
+        return
+    if await bot.db.get_modifier(interaction.guild_id, final_name_key):
+        await answer(interaction, "Ya existe un modificador con ese nombre.")
+        return
+    final_badge_role = (
+        rol_insignia.id if rol_insignia else current_badge["badge_role_id"]
+    )
+    final_color_role = rol_color.id if rol_color else current_badge["color_role_id"]
     if final_badge_role == final_color_role:
         await answer(interaction, "El rol de insignia y el rol de color deben ser diferentes.")
         return
-    if any(role is not None and not role_can_be_managed(role) for role in (rol_insignia, rol_color)):
+    if any(
+        role is not None and not role_can_be_managed(role)
+        for role in (rol_insignia, rol_color)
+    ):
         await answer(interaction, "Los roles deben estar debajo del rol del bot.")
         return
     await interaction.response.defer()
     try:
         updated = await bot.db.update_badge(
-            interaction.guild_id, current["name_key"], final_name,
-            normalize_name(final_name), final_badge_role, final_color_role,
-            final_purchasable, final_price, final_section, final_emoji,
+            interaction.guild_id,
+            current_badge["name_key"],
+            final_name,
+            final_name_key,
+            final_badge_role,
+            final_color_role,
+            final_purchasable,
+            final_price,
+            final_section,
+            final_emoji,
         )
     except asyncpg.UniqueViolationError:
         await answer(interaction, "Ese nombre o rol ya pertenece a otra insignia.")
@@ -1719,28 +2258,27 @@ async def editarinsignia(
     if not updated:
         await answer(interaction, "No pude encontrar esa insignia.")
         return
-    if interaction.guild is not None:
-        await bot.db.record_movement(
-            interaction.guild_id,
-            None,
-            interaction.user.id,
-            "badge_config_edit",
-            None,
-            f"Editó la insignia {current['name']} como {final_name}.",
-        )
-        await send_audit_log(
-            interaction.guild,
-            "Insignia editada",
-            f"**Administrador:** {interaction.user.mention}\n"
-            f"**Nombre anterior:** {current['name']}\n"
-            f"**Nombre actual:** {final_name}\n"
-            f"**Rol de insignia:** <@&{final_badge_role}>\n"
-            f"**Rol de color:** <@&{final_color_role}>\n"
-            f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
-            f"**Precio:** {money(final_price)} monedas\n"
-            f"**Apartado:** {final_section or 'No aplica'}\n"
-            f"**Emoji:** {final_emoji or 'Ninguno'}",
-        )
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "badge_config_edit",
+        None,
+        f"Editó la insignia {current_badge['name']} como {final_name}.",
+    )
+    await send_audit_log(
+        guild,
+        "Insignia editada",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Nombre anterior:** {current_badge['name']}\n"
+        f"**Nombre actual:** {final_name}\n"
+        f"**Rol de insignia:** <@&{final_badge_role}>\n"
+        f"**Rol de color:** <@&{final_color_role}>\n"
+        f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
+        f"**Precio:** {money(final_price)} monedas\n"
+        f"**Apartado:** {final_section or 'No aplica'}\n"
+        f"**Emoji:** {final_emoji or 'Ninguno'}",
+    )
     await answer(interaction, f"Actualicé la insignia **{final_name}**.")
 
 
@@ -1777,6 +2315,202 @@ async def borrarinsignia(interaction: discord.Interaction, insignia: str) -> Non
     await answer(interaction, f"Borré **{deleted['name']}**. No eliminé ningún rol del servidor.")
 
 
+@bot.tree.command(name="modificadores", description="Consulta modificadores configurados o de un miembro.")
+@app_commands.describe(miembro="Miembro cuyo inventario quieres consultar")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def modificadores(
+    interaction: discord.Interaction,
+    miembro: discord.Member | None = None,
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    embed = discord.Embed(title="Modificadores de Sularea", color=0xA855F7)
+    if miembro is not None:
+        rows = await bot.db.list_modifier_inventory(guild.id, miembro.id)
+        embed.title = f"Modificadores de {miembro.display_name}"
+        embed.set_thumbnail(url=miembro.display_avatar.url)
+        embed.description = (
+            "\n".join(
+                f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
+                f"× **{row['quantity']}**"
+                for row in rows
+            )[:4000]
+            if rows
+            else f"{miembro.mention} no tiene modificadores."
+        )
+    else:
+        rows = await bot.db.list_modifiers(guild.id)
+        embed.description = (
+            "\n".join(
+                f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** · "
+                f"{'Comprable por ' + money(row['price']) if row['purchasable'] else 'No comprable'} "
+                f"· Apartado: **{shop_section_name(row['shop_section']) if row['purchasable'] else 'No aplica'}** "
+                f"· {len(row['messages'])} mensajes"
+                for row in rows
+            )[:4000]
+            if rows
+            else "No hay modificadores configurados."
+        )
+    await answer(interaction, embed=embed)
+
+
+@bot.tree.command(name="darmodificador", description="Entrega unidades de un modificador.")
+@app_commands.describe(
+    miembro="Miembro que recibirá el modificador",
+    modificador="Nombre del modificador",
+    cantidad="Cantidad que recibirá",
+)
+@app_commands.autocomplete(modificador=modifier_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def darmodificador(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+    modificador: str,
+    cantidad: app_commands.Range[int, 1, 1000] = 1,
+) -> None:
+    assert interaction.guild_id is not None
+    item = await find_modifier(interaction, modificador)
+    if item is None:
+        await answer(interaction, "Ese modificador no existe.")
+        return
+    quantity = await bot.db.add_modifier_inventory(
+        interaction.guild_id,
+        miembro.id,
+        item["id"],
+        cantidad,
+    )
+    await bot.db.record_movement(
+        interaction.guild_id,
+        miembro.id,
+        interaction.user.id,
+        "modifier_grant",
+        cantidad,
+        f"Un administrador entregó {cantidad} de {item['name']}.",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Modificador entregado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Miembro:** {miembro.mention}\n"
+            f"**Modificador:** {item['name']}\n"
+            f"**Cantidad entregada:** {cantidad}\n"
+            f"**Total:** {quantity}",
+            color=0xA855F7,
+        )
+    await answer(
+        interaction,
+        f"Entregaste **{cantidad}** de **{item['name']}** a {miembro.mention}. "
+        f"Ahora tiene **{quantity}**.",
+    )
+
+
+@bot.tree.command(name="quitarmodificador", description="Retira unidades de un modificador.")
+@app_commands.describe(
+    miembro="Miembro que perderá el modificador",
+    modificador="Nombre del modificador",
+    cantidad="Cantidad que se retirará",
+)
+@app_commands.autocomplete(modificador=modifier_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def quitarmodificador(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+    modificador: str,
+    cantidad: app_commands.Range[int, 1, 1000] = 1,
+) -> None:
+    assert interaction.guild_id is not None
+    item = await find_modifier(interaction, modificador)
+    if item is None:
+        await answer(interaction, "Ese modificador no existe.")
+        return
+    inventory = await bot.db.list_modifier_inventory(interaction.guild_id, miembro.id)
+    current_quantity = next(
+        (row["quantity"] for row in inventory if row["id"] == item["id"]),
+        0,
+    )
+    removed = min(current_quantity, cantidad)
+    quantity = await bot.db.remove_modifier_inventory(
+        interaction.guild_id,
+        miembro.id,
+        item["id"],
+        cantidad,
+    )
+    await bot.db.record_movement(
+        interaction.guild_id,
+        miembro.id,
+        interaction.user.id,
+        "modifier_remove",
+        -removed,
+        f"Un administrador retiró {removed} de {item['name']}.",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Modificador retirado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Miembro:** {miembro.mention}\n"
+            f"**Modificador:** {item['name']}\n"
+            f"**Cantidad retirada:** {removed}\n"
+            f"**Restantes:** {quantity}",
+            color=0xEF4444,
+        )
+    await answer(
+        interaction,
+        f"Retiraste hasta **{cantidad}** de **{item['name']}** a {miembro.mention}. "
+        f"Ahora tiene **{quantity}**.",
+    )
+
+
+@bot.tree.command(name="borrarmodificador", description="Borra un modificador configurado.")
+@app_commands.describe(modificador="Nombre del modificador que se borrará")
+@app_commands.autocomplete(modificador=modifier_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def borrarmodificador(
+    interaction: discord.Interaction,
+    modificador: str,
+) -> None:
+    assert interaction.guild_id is not None
+    deleted = await bot.db.delete_modifier(
+        interaction.guild_id,
+        normalize_name(modificador),
+    )
+    if deleted is None:
+        await answer(interaction, "Ese modificador no existe.")
+        return
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "modifier_config_delete",
+        None,
+        f"Borró el modificador {deleted['name']}.",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Modificador borrado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Modificador:** {deleted['name']}\n"
+            "Sus unidades y activaciones también fueron eliminadas.",
+            color=0xEF4444,
+        )
+    await answer(
+        interaction,
+        f"Borré el modificador **{deleted['name']}** y sus unidades de inventario.",
+    )
+
+
 @bot.tree.command(name="ayuda", description="Muestra la guía de comandos de Sularea.")
 @app_commands.guild_only()
 async def ayuda(interaction: discord.Interaction) -> None:
@@ -1784,7 +2518,7 @@ async def ayuda(interaction: discord.Interaction) -> None:
     embed = discord.Embed(
         title="Ayuda de Sularea",
         description=(
-            "Participa en eventos para conseguir monedas e insignias. "
+            "Participa en eventos para conseguir monedas, insignias y modificadores. "
             "Responde directamente al mensaje de cada pregunta. Después puedes "
             "comprar y activar roles de color especiales."
         ),
@@ -1793,10 +2527,10 @@ async def ayuda(interaction: discord.Interaction) -> None:
     if interaction.guild is not None and interaction.guild.icon is not None:
         embed.set_thumbnail(url=interaction.guild.icon.url)
     embed.add_field(
-        name="Insignias",
+        name="Inventario y objetos",
         value=(
-            "`/inventario` — Ver tus insignias.\n"
-            "`/usar` — Activar un rol de color.\n"
+            "`/inventario` — Ver insignias y modificadores.\n"
+            "`/usar` — Usar una insignia o modificador.\n"
             "`/quitar` — Quitar tu rol de color."
         ),
         inline=False,
@@ -1807,7 +2541,7 @@ async def ayuda(interaction: discord.Interaction) -> None:
             "`/balance` — Consultar tus monedas.\n"
             "`/historial` — Ver tus últimos 10 movimientos.\n"
             "`/ranking` — Ver los balances más altos.\n"
-            "`/tienda` — Ver las insignias del mercado.\n"
+            "`/tienda` — Ver los objetos del mercado.\n"
             "`/comprar` — Comprar escribiendo el nombre."
         ),
         inline=False,
@@ -1817,7 +2551,9 @@ async def ayuda(interaction: discord.Interaction) -> None:
             name="Administración",
             value=(
                 "`/insignias [miembro]` · `/darinsignia` · `/quitarinsignia`\n"
-                "`/configurarinsignia` · `/editarinsignia` · `/borrarinsignia`\n"
+                "`/configurarinsignia` · `/configurarmodificador` · `/editar`\n"
+                "`/borrarinsignia` · `/borrarmodificador` · `/modificadores`\n"
+                "`/darmodificador` · `/quitarmodificador`\n"
                 "`/revisarbalance` · `/añadirbalance` · `/quitarbalance` · `/setbalance`\n"
                 "`/eventopregunta` · `/cancelarevento`\n"
                 "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`"

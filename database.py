@@ -39,6 +39,42 @@ WHERE purchasable = TRUE
 CREATE INDEX IF NOT EXISTS badges_shop_index
 ON badges (guild_id, purchasable, price);
 
+CREATE TABLE IF NOT EXISTS modifiers (
+    id BIGSERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    purchasable BOOLEAN NOT NULL DEFAULT FALSE,
+    price BIGINT NOT NULL DEFAULT 0 CHECK (price >= 0),
+    shop_section TEXT,
+    emoji TEXT,
+    messages TEXT[] NOT NULL CHECK (CARDINALITY(messages) > 0),
+    UNIQUE (guild_id, name_key)
+);
+
+CREATE INDEX IF NOT EXISTS modifiers_shop_index
+ON modifiers (guild_id, purchasable, price);
+
+CREATE TABLE IF NOT EXISTS modifier_inventory (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    modifier_id BIGINT NOT NULL REFERENCES modifiers(id) ON DELETE CASCADE,
+    quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+    PRIMARY KEY (guild_id, user_id, modifier_id)
+);
+
+CREATE TABLE IF NOT EXISTS active_modifiers (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    modifier_id BIGINT NOT NULL REFERENCES modifiers(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    last_trigger_at TIMESTAMPTZ,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS active_modifiers_expiration_index
+ON active_modifiers (expires_at);
+
 CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id BIGINT PRIMARY KEY,
     log_channel_id BIGINT,
@@ -354,6 +390,361 @@ class Database:
             name_key,
         )
 
+    async def get_modifier(self, guild_id: int, name_key: str):
+        return await self._pool().fetchrow(
+            "SELECT * FROM modifiers WHERE guild_id = $1 AND name_key = $2",
+            guild_id,
+            name_key,
+        )
+
+    async def list_modifiers(self, guild_id: int, purchasable_only: bool = False):
+        if purchasable_only:
+            return await self._pool().fetch(
+                """
+                SELECT * FROM modifiers
+                WHERE guild_id = $1 AND purchasable = TRUE
+                ORDER BY COALESCE(shop_section, 'General'), price, name
+                """,
+                guild_id,
+            )
+        return await self._pool().fetch(
+            "SELECT * FROM modifiers WHERE guild_id = $1 ORDER BY name",
+            guild_id,
+        )
+
+    async def list_shop_items(self, guild_id: int):
+        return await self._pool().fetch(
+            """
+            SELECT
+                'badge' AS item_type, name, name_key, price, shop_section,
+                emoji, badge_role_id, color_role_id, NULL::BIGINT AS modifier_id
+            FROM badges
+            WHERE guild_id = $1 AND purchasable = TRUE
+            UNION ALL
+            SELECT
+                'modifier' AS item_type, name, name_key, price, shop_section,
+                emoji, NULL::BIGINT AS badge_role_id,
+                NULL::BIGINT AS color_role_id, id AS modifier_id
+            FROM modifiers
+            WHERE guild_id = $1 AND purchasable = TRUE
+            ORDER BY shop_section NULLS FIRST, price, name
+            """,
+            guild_id,
+        )
+
+    async def create_modifier(
+        self,
+        guild_id: int,
+        name: str,
+        name_key: str,
+        purchasable: bool,
+        price: int,
+        shop_section: str | None,
+        emoji: str | None,
+        messages: list[str],
+    ) -> None:
+        await self._pool().execute(
+            """
+            INSERT INTO modifiers (
+                guild_id, name, name_key, purchasable, price,
+                shop_section, emoji, messages
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::TEXT[])
+            """,
+            guild_id,
+            name,
+            name_key,
+            purchasable,
+            price,
+            shop_section,
+            emoji,
+            messages,
+        )
+
+    async def update_modifier(
+        self,
+        guild_id: int,
+        old_name_key: str,
+        name: str,
+        name_key: str,
+        purchasable: bool,
+        price: int,
+        shop_section: str | None,
+        emoji: str | None,
+        messages: list[str],
+    ) -> bool:
+        result = await self._pool().execute(
+            """
+            UPDATE modifiers
+            SET name = $3,
+                name_key = $4,
+                purchasable = $5,
+                price = $6,
+                shop_section = $7,
+                emoji = $8,
+                messages = $9::TEXT[]
+            WHERE guild_id = $1 AND name_key = $2
+            """,
+            guild_id,
+            old_name_key,
+            name,
+            name_key,
+            purchasable,
+            price,
+            shop_section,
+            emoji,
+            messages,
+        )
+        return result == "UPDATE 1"
+
+    async def delete_modifier(self, guild_id: int, name_key: str):
+        return await self._pool().fetchrow(
+            """
+            DELETE FROM modifiers
+            WHERE guild_id = $1 AND name_key = $2
+            RETURNING *
+            """,
+            guild_id,
+            name_key,
+        )
+
+    async def list_modifier_inventory(self, guild_id: int, user_id: int):
+        return await self._pool().fetch(
+            """
+            SELECT m.*, i.quantity
+            FROM modifier_inventory i
+            JOIN modifiers m ON m.id = i.modifier_id
+            WHERE i.guild_id = $1 AND i.user_id = $2 AND i.quantity > 0
+            ORDER BY m.name
+            """,
+            guild_id,
+            user_id,
+        )
+
+    async def add_modifier_inventory(
+        self,
+        guild_id: int,
+        user_id: int,
+        modifier_id: int,
+        quantity: int,
+    ) -> int:
+        return await self._pool().fetchval(
+            """
+            INSERT INTO modifier_inventory (guild_id, user_id, modifier_id, quantity)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (guild_id, user_id, modifier_id)
+            DO UPDATE SET quantity = modifier_inventory.quantity + EXCLUDED.quantity
+            RETURNING quantity
+            """,
+            guild_id,
+            user_id,
+            modifier_id,
+            quantity,
+        )
+
+    async def remove_modifier_inventory(
+        self,
+        guild_id: int,
+        user_id: int,
+        modifier_id: int,
+        quantity: int,
+    ) -> int:
+        value = await self._pool().fetchval(
+            """
+            UPDATE modifier_inventory
+            SET quantity = GREATEST(quantity - $4, 0)
+            WHERE guild_id = $1 AND user_id = $2 AND modifier_id = $3
+            RETURNING quantity
+            """,
+            guild_id,
+            user_id,
+            modifier_id,
+            quantity,
+        )
+        return int(value or 0)
+
+    async def purchase_modifier(
+        self,
+        guild_id: int,
+        user_id: int,
+        name_key: str,
+    ) -> dict | None:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                modifier = await connection.fetchrow(
+                    """
+                    SELECT * FROM modifiers
+                    WHERE guild_id = $1 AND name_key = $2 AND purchasable = TRUE
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    name_key,
+                )
+                if modifier is None:
+                    return None
+                await connection.execute(
+                    """
+                    INSERT INTO balances (guild_id, user_id, balance)
+                    VALUES ($1, $2, 0)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    guild_id,
+                    user_id,
+                )
+                new_balance = await connection.fetchval(
+                    """
+                    UPDATE balances
+                    SET balance = balance - $3
+                    WHERE guild_id = $1 AND user_id = $2 AND balance >= $3
+                    RETURNING balance
+                    """,
+                    guild_id,
+                    user_id,
+                    modifier["price"],
+                )
+                if new_balance is None:
+                    return {"status": "insufficient"}
+                quantity = await connection.fetchval(
+                    """
+                    INSERT INTO modifier_inventory (
+                        guild_id, user_id, modifier_id, quantity
+                    )
+                    VALUES ($1, $2, $3, 1)
+                    ON CONFLICT (guild_id, user_id, modifier_id)
+                    DO UPDATE SET quantity = modifier_inventory.quantity + 1
+                    RETURNING quantity
+                    """,
+                    guild_id,
+                    user_id,
+                    modifier["id"],
+                )
+                return {
+                    "status": "purchased",
+                    "name": modifier["name"],
+                    "price": modifier["price"],
+                    "new_balance": new_balance,
+                    "quantity": quantity,
+                }
+
+    async def activate_modifier(
+        self,
+        guild_id: int,
+        user_id: int,
+        name_key: str,
+        duration_minutes: int = 5,
+    ) -> dict:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                active = await connection.fetchrow(
+                    """
+                    SELECT m.name, a.expires_at
+                    FROM active_modifiers a
+                    JOIN modifiers m ON m.id = a.modifier_id
+                    WHERE a.guild_id = $1 AND a.user_id = $2
+                    FOR UPDATE OF a
+                    """,
+                    guild_id,
+                    user_id,
+                )
+                if active is not None and active["expires_at"] > await connection.fetchval("SELECT NOW()"):
+                    return {
+                        "status": "already_active",
+                        "name": active["name"],
+                        "expires_at": active["expires_at"],
+                    }
+                if active is not None:
+                    await connection.execute(
+                        "DELETE FROM active_modifiers WHERE guild_id = $1 AND user_id = $2",
+                        guild_id,
+                        user_id,
+                    )
+                inventory = await connection.fetchrow(
+                    """
+                    SELECT i.modifier_id, i.quantity, m.name
+                    FROM modifier_inventory i
+                    JOIN modifiers m ON m.id = i.modifier_id
+                    WHERE i.guild_id = $1 AND i.user_id = $2
+                      AND m.guild_id = $1 AND m.name_key = $3
+                    FOR UPDATE OF i
+                    """,
+                    guild_id,
+                    user_id,
+                    name_key,
+                )
+                if inventory is None or inventory["quantity"] <= 0:
+                    return {"status": "missing"}
+                quantity = await connection.fetchval(
+                    """
+                    UPDATE modifier_inventory
+                    SET quantity = quantity - 1
+                    WHERE guild_id = $1 AND user_id = $2 AND modifier_id = $3
+                    RETURNING quantity
+                    """,
+                    guild_id,
+                    user_id,
+                    inventory["modifier_id"],
+                )
+                expires_at = await connection.fetchval(
+                    """
+                    INSERT INTO active_modifiers (
+                        guild_id, user_id, modifier_id, expires_at
+                    )
+                    VALUES ($1, $2, $3, NOW() + ($4::INTEGER * INTERVAL '1 minute'))
+                    RETURNING expires_at
+                    """,
+                    guild_id,
+                    user_id,
+                    inventory["modifier_id"],
+                    duration_minutes,
+                )
+                return {
+                    "status": "activated",
+                    "name": inventory["name"],
+                    "quantity": quantity,
+                    "expires_at": expires_at,
+                }
+
+    async def try_trigger_modifier(
+        self,
+        guild_id: int,
+        user_id: int,
+        cooldown_seconds: int = 10,
+    ):
+        return await self._pool().fetchrow(
+            """
+            UPDATE active_modifiers AS active
+            SET last_trigger_at = NOW()
+            FROM modifiers AS modifier
+            WHERE active.guild_id = $1
+              AND active.user_id = $2
+              AND modifier.id = active.modifier_id
+              AND active.expires_at > NOW()
+              AND (
+                  active.last_trigger_at IS NULL
+                  OR active.last_trigger_at <= NOW() - ($3::INTEGER * INTERVAL '1 second')
+              )
+              AND RANDOM() < 0.1
+            RETURNING modifier.name, modifier.messages
+            """,
+            guild_id,
+            user_id,
+            cooldown_seconds,
+        )
+
+    async def pop_expired_modifiers(self):
+        return await self._pool().fetch(
+            """
+            WITH expired AS (
+                DELETE FROM active_modifiers
+                WHERE expires_at <= NOW()
+                RETURNING guild_id, user_id, modifier_id
+            )
+            SELECT expired.guild_id, expired.user_id, modifier.name
+            FROM expired
+            JOIN modifiers AS modifier ON modifier.id = expired.modifier_id
+            """
+        )
+
     async def get_log_settings(self, guild_id: int):
         return await self._pool().fetchrow(
             """
@@ -466,10 +857,12 @@ class Database:
                 (SELECT COUNT(*) FROM balances WHERE guild_id = $1) AS users,
                 (SELECT COALESCE(SUM(balance), 0) FROM balances WHERE guild_id = $1) AS total_money,
                 (SELECT COUNT(*) FROM badges WHERE guild_id = $1) AS badges,
+                (SELECT COUNT(*) FROM modifiers WHERE guild_id = $1) AS modifiers,
                 (SELECT COUNT(*) FROM movements WHERE guild_id = $1) AS movements,
-                (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action = 'purchase') AS purchases,
+                (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action IN ('purchase', 'modifier_purchase')) AS purchases,
                 (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action = 'event_reward') AS event_wins,
-                (SELECT COUNT(*) FROM active_question_events WHERE guild_id = $1) AS active_events
+                (SELECT COUNT(*) FROM active_question_events WHERE guild_id = $1) AS active_events,
+                (SELECT COUNT(*) FROM active_modifiers WHERE guild_id = $1) AS active_modifiers
             """,
             guild_id,
         )
@@ -485,6 +878,30 @@ class Database:
             SELECT name, name_key, badge_role_id, color_role_id,
                    purchasable, price, shop_section, emoji
             FROM badges WHERE guild_id = $1 ORDER BY name
+            """,
+            guild_id,
+        )
+        modifiers = await self._pool().fetch(
+            """
+            SELECT id, name, name_key, purchasable, price,
+                   shop_section, emoji, messages
+            FROM modifiers WHERE guild_id = $1 ORDER BY name
+            """,
+            guild_id,
+        )
+        modifier_inventory = await self._pool().fetch(
+            """
+            SELECT user_id, modifier_id, quantity
+            FROM modifier_inventory WHERE guild_id = $1
+            ORDER BY user_id, modifier_id
+            """,
+            guild_id,
+        )
+        active_modifiers = await self._pool().fetch(
+            """
+            SELECT user_id, modifier_id, expires_at, last_trigger_at
+            FROM active_modifiers WHERE guild_id = $1
+            ORDER BY user_id
             """,
             guild_id,
         )
@@ -509,6 +926,9 @@ class Database:
             "guild_id": guild_id,
             "balances": [dict(row) for row in balances],
             "badges": [dict(row) for row in badges],
+            "modifiers": [dict(row) for row in modifiers],
+            "modifier_inventory": [dict(row) for row in modifier_inventory],
+            "active_modifiers": [dict(row) for row in active_modifiers],
             "settings": dict(settings) if settings else None,
             "movements": [dict(row) for row in movements],
             "active_question_events": [dict(row) for row in active_events],
