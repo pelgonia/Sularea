@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS badges (
     price BIGINT NOT NULL DEFAULT 0 CHECK (price >= 0),
     shop_section TEXT,
     emoji TEXT,
+    whitelist_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (guild_id, name_key),
     UNIQUE (guild_id, badge_role_id)
 );
@@ -30,6 +31,9 @@ ADD COLUMN IF NOT EXISTS shop_section TEXT;
 
 ALTER TABLE badges
 ADD COLUMN IF NOT EXISTS emoji TEXT;
+
+ALTER TABLE badges
+ADD COLUMN IF NOT EXISTS whitelist_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 
 UPDATE badges
 SET shop_section = 'General'
@@ -55,12 +59,36 @@ CREATE TABLE IF NOT EXISTS modifiers (
 CREATE INDEX IF NOT EXISTS modifiers_shop_index
 ON modifiers (guild_id, purchasable, price);
 
+CREATE TABLE IF NOT EXISTS tickets (
+    id BIGSERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    purchasable BOOLEAN NOT NULL DEFAULT FALSE,
+    price BIGINT NOT NULL DEFAULT 0 CHECK (price >= 0),
+    shop_section TEXT,
+    emoji TEXT,
+    description TEXT NOT NULL,
+    UNIQUE (guild_id, name_key)
+);
+
+CREATE INDEX IF NOT EXISTS tickets_shop_index
+ON tickets (guild_id, purchasable, price);
+
 CREATE TABLE IF NOT EXISTS modifier_inventory (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     modifier_id BIGINT NOT NULL REFERENCES modifiers(id) ON DELETE CASCADE,
     quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
     PRIMARY KEY (guild_id, user_id, modifier_id)
+);
+
+CREATE TABLE IF NOT EXISTS ticket_inventory (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    ticket_id BIGINT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+    quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+    PRIMARY KEY (guild_id, user_id, ticket_id)
 );
 
 CREATE TABLE IF NOT EXISTS active_modifiers (
@@ -83,11 +111,28 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id BIGINT PRIMARY KEY,
     log_channel_id BIGINT,
     logs_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-    coin_emoji TEXT
+    coin_emoji TEXT,
+    whitelist_emoji TEXT
 );
 
 ALTER TABLE guild_settings
 ADD COLUMN IF NOT EXISTS coin_emoji TEXT;
+
+ALTER TABLE guild_settings
+ADD COLUMN IF NOT EXISTS whitelist_emoji TEXT;
+
+CREATE TABLE IF NOT EXISTS ticket_admins (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS whitelist_entries (
+    guild_id BIGINT NOT NULL,
+    target_type TEXT NOT NULL CHECK (target_type IN ('member', 'role')),
+    target_id BIGINT NOT NULL,
+    PRIMARY KEY (guild_id, target_type, target_id)
+);
 
 CREATE TABLE IF NOT EXISTS movements (
     id BIGSERIAL PRIMARY KEY,
@@ -332,14 +377,16 @@ class Database:
         price: int,
         shop_section: str | None,
         emoji: str | None,
+        whitelist_enabled: bool,
     ) -> None:
         await self._pool().execute(
             """
             INSERT INTO badges (
                 guild_id, name, name_key, badge_role_id,
-                color_role_id, purchasable, price, shop_section, emoji
+                color_role_id, purchasable, price, shop_section, emoji,
+                whitelist_enabled
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             """,
             guild_id,
             name,
@@ -350,6 +397,7 @@ class Database:
             price,
             shop_section,
             emoji,
+            whitelist_enabled,
         )
 
     async def update_badge(
@@ -364,6 +412,7 @@ class Database:
         price: int,
         shop_section: str | None,
         emoji: str | None,
+        whitelist_enabled: bool,
     ):
         result = await self._pool().execute(
             """
@@ -375,7 +424,8 @@ class Database:
                 purchasable = $7,
                 price = $8,
                 shop_section = $9,
-                emoji = $10
+                emoji = $10,
+                whitelist_enabled = $11
             WHERE guild_id = $1 AND name_key = $2
             """,
             guild_id,
@@ -388,6 +438,7 @@ class Database:
             price,
             shop_section,
             emoji,
+            whitelist_enabled,
         )
         return result == "UPDATE 1"
 
@@ -429,15 +480,25 @@ class Database:
             """
             SELECT
                 'badge' AS item_type, name, name_key, price, shop_section,
-                emoji, badge_role_id, color_role_id, NULL::BIGINT AS modifier_id
+                emoji, badge_role_id, color_role_id, NULL::BIGINT AS modifier_id,
+                NULL::BIGINT AS ticket_id, NULL::TEXT AS description
             FROM badges
             WHERE guild_id = $1 AND purchasable = TRUE
             UNION ALL
             SELECT
                 'modifier' AS item_type, name, name_key, price, shop_section,
                 emoji, NULL::BIGINT AS badge_role_id,
-                NULL::BIGINT AS color_role_id, id AS modifier_id
+                NULL::BIGINT AS color_role_id, id AS modifier_id,
+                NULL::BIGINT AS ticket_id, NULL::TEXT AS description
             FROM modifiers
+            WHERE guild_id = $1 AND purchasable = TRUE
+            UNION ALL
+            SELECT
+                'ticket' AS item_type, name, name_key, price, shop_section,
+                emoji, NULL::BIGINT AS badge_role_id,
+                NULL::BIGINT AS color_role_id, NULL::BIGINT AS modifier_id,
+                id AS ticket_id, description
+            FROM tickets
             WHERE guild_id = $1 AND purchasable = TRUE
             ORDER BY shop_section NULLS FIRST, price, name
             """,
@@ -520,6 +581,104 @@ class Database:
             name_key,
         )
 
+    async def get_ticket(self, guild_id: int, name_key: str):
+        return await self._pool().fetchrow(
+            "SELECT * FROM tickets WHERE guild_id = $1 AND name_key = $2",
+            guild_id,
+            name_key,
+        )
+
+    async def list_tickets(self, guild_id: int, purchasable_only: bool = False):
+        if purchasable_only:
+            return await self._pool().fetch(
+                """
+                SELECT * FROM tickets
+                WHERE guild_id = $1 AND purchasable = TRUE
+                ORDER BY COALESCE(shop_section, 'General'), price, name
+                """,
+                guild_id,
+            )
+        return await self._pool().fetch(
+            "SELECT * FROM tickets WHERE guild_id = $1 ORDER BY name",
+            guild_id,
+        )
+
+    async def create_ticket(
+        self,
+        guild_id: int,
+        name: str,
+        name_key: str,
+        purchasable: bool,
+        price: int,
+        shop_section: str | None,
+        emoji: str | None,
+        description: str,
+    ) -> None:
+        await self._pool().execute(
+            """
+            INSERT INTO tickets (
+                guild_id, name, name_key, purchasable, price,
+                shop_section, emoji, description
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """,
+            guild_id,
+            name,
+            name_key,
+            purchasable,
+            price,
+            shop_section,
+            emoji,
+            description,
+        )
+
+    async def update_ticket(
+        self,
+        guild_id: int,
+        old_name_key: str,
+        name: str,
+        name_key: str,
+        purchasable: bool,
+        price: int,
+        shop_section: str | None,
+        emoji: str | None,
+        description: str,
+    ) -> bool:
+        result = await self._pool().execute(
+            """
+            UPDATE tickets
+            SET name = $3,
+                name_key = $4,
+                purchasable = $5,
+                price = $6,
+                shop_section = $7,
+                emoji = $8,
+                description = $9
+            WHERE guild_id = $1 AND name_key = $2
+            """,
+            guild_id,
+            old_name_key,
+            name,
+            name_key,
+            purchasable,
+            price,
+            shop_section,
+            emoji,
+            description,
+        )
+        return result == "UPDATE 1"
+
+    async def delete_ticket(self, guild_id: int, name_key: str):
+        return await self._pool().fetchrow(
+            """
+            DELETE FROM tickets
+            WHERE guild_id = $1 AND name_key = $2
+            RETURNING *
+            """,
+            guild_id,
+            name_key,
+        )
+
     async def list_modifier_inventory(self, guild_id: int, user_id: int):
         return await self._pool().fetch(
             """
@@ -574,6 +733,151 @@ class Database:
             quantity,
         )
         return int(value or 0)
+
+    async def list_ticket_inventory(self, guild_id: int, user_id: int):
+        return await self._pool().fetch(
+            """
+            SELECT ticket.*, inventory.quantity
+            FROM ticket_inventory AS inventory
+            JOIN tickets AS ticket ON ticket.id = inventory.ticket_id
+            WHERE inventory.guild_id = $1 AND inventory.user_id = $2
+              AND inventory.quantity > 0
+            ORDER BY ticket.name
+            """,
+            guild_id,
+            user_id,
+        )
+
+    async def add_ticket_inventory(
+        self,
+        guild_id: int,
+        user_id: int,
+        ticket_id: int,
+        quantity: int,
+    ) -> int:
+        return await self._pool().fetchval(
+            """
+            INSERT INTO ticket_inventory (guild_id, user_id, ticket_id, quantity)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (guild_id, user_id, ticket_id)
+            DO UPDATE SET quantity = ticket_inventory.quantity + EXCLUDED.quantity
+            RETURNING quantity
+            """,
+            guild_id,
+            user_id,
+            ticket_id,
+            quantity,
+        )
+
+    async def remove_ticket_inventory(
+        self,
+        guild_id: int,
+        user_id: int,
+        ticket_id: int,
+        quantity: int,
+    ) -> int:
+        value = await self._pool().fetchval(
+            """
+            UPDATE ticket_inventory
+            SET quantity = GREATEST(quantity - $4, 0)
+            WHERE guild_id = $1 AND user_id = $2 AND ticket_id = $3
+            RETURNING quantity
+            """,
+            guild_id,
+            user_id,
+            ticket_id,
+            quantity,
+        )
+        return int(value or 0)
+
+    async def consume_ticket(
+        self,
+        guild_id: int,
+        user_id: int,
+        name_key: str,
+    ) -> dict | None:
+        row = await self._pool().fetchrow(
+            """
+            UPDATE ticket_inventory AS inventory
+            SET quantity = inventory.quantity - 1
+            FROM tickets AS ticket
+            WHERE inventory.guild_id = $1
+              AND inventory.user_id = $2
+              AND inventory.quantity > 0
+              AND ticket.id = inventory.ticket_id
+              AND ticket.guild_id = $1
+              AND ticket.name_key = $3
+            RETURNING ticket.id, ticket.name, ticket.description,
+                      inventory.quantity
+            """,
+            guild_id,
+            user_id,
+            name_key,
+        )
+        return dict(row) if row is not None else None
+
+    async def purchase_ticket(
+        self,
+        guild_id: int,
+        user_id: int,
+        name_key: str,
+    ) -> dict | None:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                ticket = await connection.fetchrow(
+                    """
+                    SELECT * FROM tickets
+                    WHERE guild_id = $1 AND name_key = $2 AND purchasable = TRUE
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    name_key,
+                )
+                if ticket is None:
+                    return None
+                await connection.execute(
+                    """
+                    INSERT INTO balances (guild_id, user_id, balance)
+                    VALUES ($1, $2, 0)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    guild_id,
+                    user_id,
+                )
+                new_balance = await connection.fetchval(
+                    """
+                    UPDATE balances
+                    SET balance = balance - $3
+                    WHERE guild_id = $1 AND user_id = $2 AND balance >= $3
+                    RETURNING balance
+                    """,
+                    guild_id,
+                    user_id,
+                    ticket["price"],
+                )
+                if new_balance is None:
+                    return {"status": "insufficient"}
+                quantity = await connection.fetchval(
+                    """
+                    INSERT INTO ticket_inventory (
+                        guild_id, user_id, ticket_id, quantity
+                    )
+                    VALUES ($1, $2, $3, 1)
+                    ON CONFLICT (guild_id, user_id, ticket_id)
+                    DO UPDATE SET quantity = ticket_inventory.quantity + 1
+                    RETURNING quantity
+                    """,
+                    guild_id,
+                    user_id,
+                    ticket["id"],
+                )
+                return {
+                    "status": "purchased",
+                    "name": ticket["name"],
+                    "price": ticket["price"],
+                    "new_balance": new_balance,
+                    "quantity": quantity,
+                }
 
     async def purchase_modifier(
         self,
@@ -811,10 +1115,107 @@ class Database:
             """
         )
 
+    async def add_ticket_admin(self, guild_id: int, user_id: int) -> bool:
+        result = await self._pool().execute(
+            """
+            INSERT INTO ticket_admins (guild_id, user_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+            """,
+            guild_id,
+            user_id,
+        )
+        return result == "INSERT 0 1"
+
+    async def remove_ticket_admin(self, guild_id: int, user_id: int) -> bool:
+        result = await self._pool().execute(
+            "DELETE FROM ticket_admins WHERE guild_id = $1 AND user_id = $2",
+            guild_id,
+            user_id,
+        )
+        return result == "DELETE 1"
+
+    async def list_ticket_admins(self, guild_id: int):
+        return await self._pool().fetch(
+            "SELECT user_id FROM ticket_admins WHERE guild_id = $1 ORDER BY user_id",
+            guild_id,
+        )
+
+    async def add_whitelist_entry(
+        self,
+        guild_id: int,
+        target_type: str,
+        target_id: int,
+    ) -> bool:
+        result = await self._pool().execute(
+            """
+            INSERT INTO whitelist_entries (guild_id, target_type, target_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
+            """,
+            guild_id,
+            target_type,
+            target_id,
+        )
+        return result == "INSERT 0 1"
+
+    async def remove_whitelist_entry(
+        self,
+        guild_id: int,
+        target_type: str,
+        target_id: int,
+    ) -> bool:
+        result = await self._pool().execute(
+            """
+            DELETE FROM whitelist_entries
+            WHERE guild_id = $1 AND target_type = $2 AND target_id = $3
+            """,
+            guild_id,
+            target_type,
+            target_id,
+        )
+        return result == "DELETE 1"
+
+    async def list_whitelist_entries(self, guild_id: int):
+        return await self._pool().fetch(
+            """
+            SELECT target_type, target_id
+            FROM whitelist_entries
+            WHERE guild_id = $1
+            ORDER BY target_type, target_id
+            """,
+            guild_id,
+        )
+
+    async def is_whitelisted(
+        self,
+        guild_id: int,
+        user_id: int,
+        role_ids: list[int],
+    ) -> bool:
+        return bool(
+            await self._pool().fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM whitelist_entries
+                    WHERE guild_id = $1
+                      AND (
+                          (target_type = 'member' AND target_id = $2)
+                          OR (target_type = 'role' AND target_id = ANY($3::BIGINT[]))
+                      )
+                )
+                """,
+                guild_id,
+                user_id,
+                role_ids,
+            )
+        )
+
     async def get_log_settings(self, guild_id: int):
         return await self._pool().fetchrow(
             """
-            SELECT log_channel_id, logs_enabled, coin_emoji
+            SELECT log_channel_id, logs_enabled, coin_emoji, whitelist_emoji
             FROM guild_settings
             WHERE guild_id = $1
             """,
@@ -859,6 +1260,27 @@ class Database:
             SELECT guild_id, coin_emoji
             FROM guild_settings
             WHERE coin_emoji IS NOT NULL
+            """
+        )
+
+    async def set_whitelist_emoji(self, guild_id: int, emoji: str | None) -> None:
+        await self._pool().execute(
+            """
+            INSERT INTO guild_settings (guild_id, whitelist_emoji)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET whitelist_emoji = EXCLUDED.whitelist_emoji
+            """,
+            guild_id,
+            emoji,
+        )
+
+    async def list_whitelist_emojis(self):
+        return await self._pool().fetch(
+            """
+            SELECT guild_id, whitelist_emoji
+            FROM guild_settings
+            WHERE whitelist_emoji IS NOT NULL
             """
         )
 
@@ -964,8 +1386,11 @@ class Database:
                 (SELECT COALESCE(SUM(balance), 0) FROM balances WHERE guild_id = $1) AS total_money,
                 (SELECT COUNT(*) FROM badges WHERE guild_id = $1) AS badges,
                 (SELECT COUNT(*) FROM modifiers WHERE guild_id = $1) AS modifiers,
+                (SELECT COUNT(*) FROM tickets WHERE guild_id = $1) AS tickets,
+                (SELECT COUNT(*) FROM ticket_admins WHERE guild_id = $1) AS ticket_admins,
+                (SELECT COUNT(*) FROM whitelist_entries WHERE guild_id = $1) AS whitelist_entries,
                 (SELECT COUNT(*) FROM movements WHERE guild_id = $1) AS movements,
-                (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action IN ('purchase', 'modifier_purchase')) AS purchases,
+                (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action IN ('purchase', 'modifier_purchase', 'ticket_purchase')) AS purchases,
                 (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action = 'event_reward') AS event_wins,
                 (SELECT COUNT(*) FROM active_question_events WHERE guild_id = $1) AS active_events,
                 (SELECT COUNT(*) FROM active_modifiers WHERE guild_id = $1) AS active_modifiers
@@ -982,7 +1407,7 @@ class Database:
         badges = await self._pool().fetch(
             """
             SELECT name, name_key, badge_role_id, color_role_id,
-                   purchasable, price, shop_section, emoji
+                   purchasable, price, shop_section, emoji, whitelist_enabled
             FROM badges WHERE guild_id = $1 ORDER BY name
             """,
             guild_id,
@@ -995,11 +1420,27 @@ class Database:
             """,
             guild_id,
         )
+        tickets = await self._pool().fetch(
+            """
+            SELECT id, name, name_key, purchasable, price,
+                   shop_section, emoji, description
+            FROM tickets WHERE guild_id = $1 ORDER BY name
+            """,
+            guild_id,
+        )
         modifier_inventory = await self._pool().fetch(
             """
             SELECT user_id, modifier_id, quantity
             FROM modifier_inventory WHERE guild_id = $1
             ORDER BY user_id, modifier_id
+            """,
+            guild_id,
+        )
+        ticket_inventory = await self._pool().fetch(
+            """
+            SELECT user_id, ticket_id, quantity
+            FROM ticket_inventory WHERE guild_id = $1
+            ORDER BY user_id, ticket_id
             """,
             guild_id,
         )
@@ -1012,6 +1453,8 @@ class Database:
             guild_id,
         )
         settings = await self.get_log_settings(guild_id)
+        ticket_admins = await self.list_ticket_admins(guild_id)
+        whitelist_entries = await self.list_whitelist_entries(guild_id)
         movements = await self._pool().fetch(
             """
             SELECT user_id, actor_id, action, amount, description, created_at
@@ -1033,9 +1476,13 @@ class Database:
             "balances": [dict(row) for row in balances],
             "badges": [dict(row) for row in badges],
             "modifiers": [dict(row) for row in modifiers],
+            "tickets": [dict(row) for row in tickets],
             "modifier_inventory": [dict(row) for row in modifier_inventory],
+            "ticket_inventory": [dict(row) for row in ticket_inventory],
             "active_modifiers": [dict(row) for row in active_modifiers],
             "settings": dict(settings) if settings else None,
+            "ticket_admins": [dict(row) for row in ticket_admins],
+            "whitelist_entries": [dict(row) for row in whitelist_entries],
             "movements": [dict(row) for row in movements],
             "active_question_events": [dict(row) for row in active_events],
         }

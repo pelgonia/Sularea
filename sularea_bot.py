@@ -21,9 +21,11 @@ load_dotenv()
 MAX_MONEY = 1_000_000_000_000
 DEFAULT_SHOP_SECTION = "General"
 MAX_SHOP_SECTIONS = 25
+MAX_TICKET_ADMINS = 50
 MODIFIER_DURATION_MINUTES = 5
 MODIFIER_COOLDOWN_SECONDS = 10
 DEFAULT_COIN_EMOJI = "🪙"
+DEFAULT_WHITELIST_EMOJI = "⭐"
 
 
 def normalize_name(value: str) -> str:
@@ -164,6 +166,16 @@ def money(value: int, guild_id: int | None = None) -> str:
     return f"{emoji} {formatted}"
 
 
+def whitelist_marker(guild_id: int | None = None) -> str:
+    if guild_id is None:
+        return DEFAULT_WHITELIST_EMOJI
+    return getattr(
+        globals().get("bot"),
+        "whitelist_emojis",
+        {},
+    ).get(guild_id, DEFAULT_WHITELIST_EMOJI)
+
+
 async def answer(
     interaction: discord.Interaction,
     content: str | None = None,
@@ -189,6 +201,7 @@ class SulareaBot(commands.Bot):
         self.modifier_webhooks: dict[int, discord.Webhook] = {}
         self.application_emojis: dict[int, discord.Emoji] = {}
         self.coin_emojis: dict[int, str] = {}
+        self.whitelist_emojis: dict[int, str] = {}
         self.modifier_notification_interactions: dict[
             tuple[int, int], discord.Interaction
         ] = {}
@@ -205,6 +218,10 @@ class SulareaBot(commands.Bot):
         coin_rows = await self.db.list_coin_emojis()
         self.coin_emojis = {
             row["guild_id"]: row["coin_emoji"] for row in coin_rows
+        }
+        whitelist_rows = await self.db.list_whitelist_emojis()
+        self.whitelist_emojis = {
+            row["guild_id"]: row["whitelist_emoji"] for row in whitelist_rows
         }
         try:
             application_emojis = await self.fetch_application_emojis()
@@ -741,6 +758,20 @@ async def find_modifier(interaction: discord.Interaction, name: str):
     return await bot.db.get_modifier(interaction.guild_id, normalize_name(name))
 
 
+async def find_ticket(interaction: discord.Interaction, name: str):
+    if interaction.guild_id is None:
+        return None
+    return await bot.db.get_ticket(interaction.guild_id, normalize_name(name))
+
+
+async def member_is_whitelisted(member: discord.Member) -> bool:
+    return await bot.db.is_whitelisted(
+        member.guild.id,
+        member.id,
+        [role.id for role in member.roles],
+    )
+
+
 async def badge_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
@@ -779,22 +810,38 @@ async def owned_object_autocomplete(
         return []
     badges = await bot.db.list_badges(interaction.guild_id)
     modifiers = await bot.db.list_modifier_inventory(interaction.guild_id, member.id)
+    tickets = await bot.db.list_ticket_inventory(interaction.guild_id, member.id)
     owned_role_ids = {role.id for role in member.roles}
+    whitelisted = await member_is_whitelisted(member)
     search = normalize_name(current)
-    choices = [
-        app_commands.Choice(
-            name=f"Insignia · {row['name']}"[:100],
-            value=row["name"][:100],
+    choices = []
+    for row in badges:
+        owns_badge = row["badge_role_id"] in owned_role_ids
+        uses_whitelist = (
+            not owns_badge and whitelisted and row["whitelist_enabled"]
         )
-        for row in badges
-        if row["badge_role_id"] in owned_role_ids and search in row["name_key"]
-    ]
+        if (owns_badge or uses_whitelist) and search in row["name_key"]:
+            marker = f"{whitelist_marker(interaction.guild_id)} " if uses_whitelist else ""
+            choices.append(
+                app_commands.Choice(
+                    name=f"{marker}Insignia · {row['name']}"[:100],
+                    value=row["name"][:100],
+                )
+            )
     choices.extend(
         app_commands.Choice(
             name=f"Modificador · {row['name']} (x{row['quantity']})"[:100],
             value=row["name"][:100],
         )
         for row in modifiers
+        if search in row["name_key"]
+    )
+    choices.extend(
+        app_commands.Choice(
+            name=f"Ticket · {row['name']} (x{row['quantity']})"[:100],
+            value=row["name"][:100],
+        )
+        for row in tickets
         if search in row["name_key"]
     )
     return choices[:25]
@@ -814,6 +861,20 @@ async def modifier_autocomplete(
     ][:25]
 
 
+async def ticket_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None or not hasattr(bot, "db"):
+        return []
+    rows = await bot.db.list_tickets(interaction.guild_id)
+    search = normalize_name(current)
+    return [
+        app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
+        for row in rows
+        if search in row["name_key"]
+    ][:25]
+
+
 async def editable_object_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
@@ -821,6 +882,7 @@ async def editable_object_autocomplete(
         return []
     badges = await bot.db.list_badges(interaction.guild_id)
     modifiers = await bot.db.list_modifiers(interaction.guild_id)
+    tickets = await bot.db.list_tickets(interaction.guild_id)
     search = normalize_name(current)
     choices = [
         app_commands.Choice(
@@ -836,6 +898,14 @@ async def editable_object_autocomplete(
             value=row["name"][:100],
         )
         for row in modifiers
+        if search in row["name_key"]
+    )
+    choices.extend(
+        app_commands.Choice(
+            name=f"Ticket · {row['name']}"[:100],
+            value=row["name"][:100],
+        )
+        for row in tickets
         if search in row["name_key"]
     )
     return choices[:25]
@@ -854,7 +924,7 @@ async def shop_autocomplete(
         app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
         for row in rows
         if (
-            row["item_type"] == "modifier"
+            row["item_type"] in {"modifier", "ticket"}
             or row["badge_role_id"] not in owned_role_ids
         )
         and search in row["name_key"]
@@ -919,16 +989,24 @@ def make_shop_embed(
     selected_index: int,
 ) -> discord.Embed:
     section_name, rows = sections[selected_index]
-    items = "\n".join(
-        (
-            f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
-            f"(<@&{row['color_role_id']}>) — {money(row['price'], guild.id)}"
-            if row["item_type"] == "badge"
-            else f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
-            f"(modificador consumible · 5 min) — {money(row['price'], guild.id)}"
-        )
-        for row in rows
-    )
+    item_lines = []
+    for row in rows:
+        prefix = f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**"
+        if row["item_type"] == "badge":
+            item_lines.append(
+                f"{prefix} (<@&{row['color_role_id']}>) — {money(row['price'], guild.id)}"
+            )
+        elif row["item_type"] == "modifier":
+            item_lines.append(
+                f"{prefix} (modificador consumible · 5 min) — "
+                f"{money(row['price'], guild.id)}"
+            )
+        else:
+            item_lines.append(
+                f"{prefix} (ticket consumible) — {money(row['price'], guild.id)}\n"
+                f"  {row['description']}"
+            )
+    items = "\n".join(item_lines)
     embed = discord.Embed(
         title="Mercado de Sularea",
         description=f"__**{section_name}**__\n\n{items}"[:4000],
@@ -939,7 +1017,7 @@ def make_shop_embed(
     embed.set_footer(
         text=(
             f"Apartado {selected_index + 1} de {len(sections)} · "
-            "Usa el menú para cambiar y /comprar para obtener una insignia."
+            "Usa el menú para cambiar y /comprar para obtener un objeto."
         )
     )
     return embed
@@ -1056,6 +1134,11 @@ async def process_purchase(
         return
     badge = await find_badge(interaction, item_name)
     modifier = None if badge is not None else await find_modifier(interaction, item_name)
+    ticket = (
+        None
+        if badge is not None or modifier is not None
+        else await find_ticket(interaction, item_name)
+    )
     if modifier is not None and modifier["purchasable"]:
         await interaction.response.defer()
         lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
@@ -1092,6 +1175,51 @@ async def process_purchase(
             f"**Cantidad:** {result['quantity']}\n"
             f"**Nuevo balance:** {money(result['new_balance'], guild.id)}",
             color=0xA855F7,
+        )
+        await answer(
+            interaction,
+            f"{member.mention} compró **{result['name']}**. Ahora tiene "
+            f"**{result['quantity']}**. Su balance es "
+            f"**{money(result['new_balance'], guild.id)}**.",
+        )
+        return
+
+    if ticket is not None and ticket["purchasable"]:
+        await interaction.response.defer()
+        lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
+        async with lock:
+            result = await bot.db.purchase_ticket(
+                guild.id,
+                member.id,
+                ticket["name_key"],
+            )
+        if result is None:
+            await answer(interaction, "Ese ticket ya no está disponible.")
+            return
+        if result["status"] == "insufficient":
+            current = await bot.db.get_balance(guild.id, member.id)
+            await answer(
+                interaction,
+                f"No tienes suficiente dinero. Tienes **{money(current, guild.id)}**.",
+            )
+            return
+        await bot.db.record_movement(
+            guild.id,
+            member.id,
+            member.id,
+            "ticket_purchase",
+            -result["price"],
+            f"Compró el ticket {result['name']} por "
+            f"{money(result['price'], guild.id)}.",
+        )
+        await send_audit_log(
+            guild,
+            "Compra de ticket",
+            f"{member.mention} compró **{result['name']}** por "
+            f"**{money(result['price'], guild.id)}**.\n"
+            f"**Cantidad:** {result['quantity']}\n"
+            f"**Nuevo balance:** {money(result['new_balance'], guild.id)}",
+            color=0x06B6D4,
         )
         await answer(
             interaction,
@@ -1383,8 +1511,8 @@ async def cancelarevento(interaction: discord.Interaction) -> None:
         )
 
 
-@bot.tree.command(name="usar", description="Usa una insignia o un modificador que posees.")
-@app_commands.describe(objeto="Nombre de la insignia o modificador que quieres usar")
+@bot.tree.command(name="usar", description="Usa una insignia, modificador o ticket que posees.")
+@app_commands.describe(objeto="Nombre de la insignia, modificador o ticket que quieres usar")
 @app_commands.autocomplete(objeto=owned_object_autocomplete)
 @app_commands.guild_only()
 async def usar(interaction: discord.Interaction, objeto: str) -> None:
@@ -1396,7 +1524,116 @@ async def usar(interaction: discord.Interaction, objeto: str) -> None:
     if badge is None:
         modifier = await find_modifier(interaction, objeto)
         if modifier is None:
-            await answer(interaction, "Ese objeto no existe.")
+            ticket = await find_ticket(interaction, objeto)
+            if ticket is None:
+                await answer(interaction, "Ese objeto no existe.")
+                return
+            settings = await bot.db.get_log_settings(guild.id)
+            if (
+                settings is None
+                or not settings["logs_enabled"]
+                or settings["log_channel_id"] is None
+            ):
+                await answer(
+                    interaction,
+                    "No puedo usar ese ticket porque el canal de registros no está "
+                    "configurado o está desactivado. Avísale a un administrador.",
+                )
+                return
+            log_channel = guild.get_channel(settings["log_channel_id"])
+            if not isinstance(log_channel, discord.TextChannel):
+                await answer(
+                    interaction,
+                    "No puedo encontrar el canal de registros. Avísale a un administrador.",
+                )
+                return
+            bot_member = guild.me
+            if bot_member is None:
+                await answer(interaction, "No pude comprobar mis permisos en el canal de registros.")
+                return
+            permissions = log_channel.permissions_for(bot_member)
+            if not permissions.send_messages or not permissions.embed_links:
+                await answer(
+                    interaction,
+                    "No puedo usar ese ticket porque me falta **Enviar mensajes** o "
+                    "**Insertar enlaces** en el canal de registros.",
+                )
+                return
+            admin_rows = await bot.db.list_ticket_admins(guild.id)
+            ticket_admins = [
+                admin
+                for row in admin_rows
+                if (admin := guild.get_member(row["user_id"])) is not None
+                and not admin.bot
+            ]
+            if not ticket_admins:
+                await answer(
+                    interaction,
+                    "No puedo usar ese ticket porque no hay miembros activos en la "
+                    "lista de administradores de tickets. Avísale a un administrador.",
+                )
+                return
+
+            await interaction.response.defer()
+            result = await bot.db.consume_ticket(
+                guild.id,
+                member.id,
+                ticket["name_key"],
+            )
+            if result is None:
+                await answer(interaction, "No tienes ese ticket en tu inventario.")
+                return
+            alert_embed = discord.Embed(
+                title="🎟️ Ticket utilizado",
+                description=result["description"],
+                color=0x06B6D4,
+                timestamp=datetime.now(timezone.utc),
+            )
+            alert_embed.add_field(name="Miembro", value=member.mention)
+            alert_embed.add_field(name="Ticket", value=result["name"])
+            alert_embed.add_field(
+                name="Canal donde se usó",
+                value=f"<#{interaction.channel_id}>",
+                inline=False,
+            )
+            alert_embed.add_field(name="Unidades restantes", value=str(result["quantity"]))
+            alert_embed.set_thumbnail(url=member.display_avatar.url)
+            try:
+                await log_channel.send(
+                    " ".join(admin.mention for admin in ticket_admins),
+                    embed=alert_embed,
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False,
+                        users=True,
+                        roles=False,
+                    ),
+                )
+            except discord.HTTPException:
+                await bot.db.add_ticket_inventory(
+                    guild.id,
+                    member.id,
+                    result["id"],
+                    1,
+                )
+                await answer(
+                    interaction,
+                    "No pude avisar al equipo administrativo, así que devolví el ticket "
+                    "a tu inventario. Avísale a un administrador.",
+                )
+                return
+            await bot.db.record_movement(
+                guild.id,
+                member.id,
+                member.id,
+                "ticket_use",
+                None,
+                f"Usó el ticket {result['name']}. Restantes: {result['quantity']}.",
+            )
+            await answer(
+                interaction,
+                f"Usaste **{result['name']}**. El equipo de administración ya fue "
+                f"contactado. Te quedan **{result['quantity']}**.",
+            )
             return
         if interaction.channel_id is None:
             await answer(interaction, "No pude identificar el canal actual.")
@@ -1447,8 +1684,15 @@ async def usar(interaction: discord.Interaction, objeto: str) -> None:
     if badge_role is None or color_role is None:
         await answer(interaction, "La configuración de esa insignia tiene un rol eliminado.")
         return
-    if badge_role not in member.roles:
-        await answer(interaction, "No tienes esa insignia.")
+    has_badge = badge_role in member.roles
+    whitelist_access = (
+        badge["whitelist_enabled"] and await member_is_whitelisted(member)
+    )
+    if not has_badge and not whitelist_access:
+        await answer(
+            interaction,
+            "No tienes esa insignia ni acceso para usarla mediante la whitelist.",
+        )
         return
     if not role_can_be_managed(color_role):
         await answer(interaction, "No puedo asignar ese color. Coloca su rol debajo del rol del bot.")
@@ -1499,7 +1743,7 @@ async def quitar(interaction: discord.Interaction) -> None:
     await answer(interaction, "Quité tu rol de color. Tus insignias siguen intactas.")
 
 
-@bot.tree.command(name="inventario", description="Muestra tus insignias y modificadores.")
+@bot.tree.command(name="inventario", description="Muestra tus insignias y consumibles.")
 @app_commands.describe(miembro="Inventario de otro miembro; solo para administradores")
 @app_commands.guild_only()
 async def inventario(
@@ -1519,7 +1763,16 @@ async def inventario(
     member = miembro or requester
     rows = await bot.db.list_badges(guild.id)
     owned = [row for row in rows if guild.get_role(row["badge_role_id"]) in member.roles]
+    whitelisted = await member_is_whitelisted(member)
+    whitelist_badges = [
+        row
+        for row in rows
+        if whitelisted
+        and row["whitelist_enabled"]
+        and guild.get_role(row["badge_role_id"]) not in member.roles
+    ]
     modifiers = await bot.db.list_modifier_inventory(guild.id, member.id)
+    tickets = await bot.db.list_ticket_inventory(guild.id, member.id)
     embed = discord.Embed(title=f"Inventario de {member.display_name}", color=0x8B5CF6)
     embed.set_thumbnail(url=member.display_avatar.url)
     sections = []
@@ -1530,6 +1783,14 @@ async def inventario(
             for row in owned
         )
         sections.append(f"__**Insignias**__\n{badge_lines}")
+    if whitelist_badges:
+        whitelist_lines = "\n".join(
+            f"• {whitelist_marker(guild.id)} "
+            f"{badge_emoji(row['emoji'], guild)}**{row['name']}** "
+            f"(<@&{row['color_role_id']}>)"
+            for row in whitelist_badges
+        )
+        sections.append(f"__**Acceso por whitelist**__\n{whitelist_lines}")
     if modifiers:
         modifier_lines = "\n".join(
             f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
@@ -1537,18 +1798,25 @@ async def inventario(
             for row in modifiers
         )
         sections.append(f"__**Modificadores consumibles**__\n{modifier_lines}")
+    if tickets:
+        ticket_lines = "\n".join(
+            f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
+            f"× **{row['quantity']}**\n  {row['description']}"
+            for row in tickets
+        )
+        sections.append(f"__**Tickets consumibles**__\n{ticket_lines}")
     if sections:
         embed.description = "\n\n".join(sections)[:4000]
         if member.id == requester.id:
             embed.set_footer(
-                text="Usa /usar para activar una insignia o consumir un modificador."
+                text="Usa /usar para activar una insignia o consumir un objeto."
             )
     else:
         embed.description = (
-            "No tienes insignias ni modificadores. Puedes conseguir objetos en **/tienda** "
+            "No tienes insignias, modificadores ni tickets. Puedes conseguir objetos en **/tienda** "
             "y consultar tus monedas con **/balance**."
             if member.id == requester.id
-            else f"{member.mention} no tiene insignias ni modificadores."
+            else f"{member.mention} no tiene insignias, modificadores ni tickets."
         )
     await answer(interaction, embed=embed)
 
@@ -1563,6 +1831,7 @@ async def objetos(interaction: discord.Interaction) -> None:
         return
     badges = await bot.db.list_badges(guild.id)
     modifiers = await bot.db.list_modifiers(guild.id)
+    tickets = await bot.db.list_tickets(guild.id)
 
     embed = discord.Embed(title="Configuración de objetos", color=0x3B82F6)
     if guild.icon is not None:
@@ -1580,7 +1849,8 @@ async def objetos(interaction: discord.Interaction) -> None:
             badge_details.append(
                 f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
                 f"  Insignia: <@&{row['badge_role_id']}> · "
-                f"Color: <@&{row['color_role_id']}> · Comprable: {sale}"
+                f"Color: <@&{row['color_role_id']}> · Comprable: {sale} · "
+                f"Whitelist: **{'Sí' if row['whitelist_enabled'] else 'No'}**"
             )
         sections.append("__**Insignias**__\n" + "\n".join(badge_details))
     if modifiers:
@@ -1598,6 +1868,21 @@ async def objetos(interaction: discord.Interaction) -> None:
                 f"Mensajes: **{len(row['messages'])}**"
             )
         sections.append("__**Modificadores**__\n" + "\n".join(modifier_details))
+    if tickets:
+        ticket_details = []
+        for row in tickets:
+            sale = (
+                f"Sí — {money(row['price'], guild.id)} · "
+                f"Apartado: **{shop_section_name(row['shop_section'])}**"
+                if row["purchasable"]
+                else "No"
+            )
+            ticket_details.append(
+                f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
+                f"  Ticket consumible · Comprable: {sale}\n"
+                f"  Descripción: {row['description']}"
+            )
+        sections.append("__**Tickets**__\n" + "\n".join(ticket_details))
     embed.description = (
         "\n\n".join(sections)[:4000]
         if sections
@@ -1677,6 +1962,12 @@ async def historial(interaction: discord.Interaction) -> None:
         "modifier_grant": "🎁",
         "modifier_remove": "➖",
         "modifier_expire": "⌛",
+        "modifier_admin_activate": "✨",
+        "modifier_admin_deactivate": "⛔",
+        "ticket_purchase": "🎟️",
+        "ticket_use": "📣",
+        "ticket_grant": "🎁",
+        "ticket_remove": "➖",
     }
     embed.description = "\n".join(
         f"{icons.get(row['action'], '•')} {row['description']} "
@@ -1778,6 +2069,57 @@ async def configurarmoneda(
     )
 
 
+@bot.tree.command(
+    name="configuraremojiwhitelist",
+    description="Configura el emoji que identifica el acceso por whitelist.",
+)
+@app_commands.describe(
+    emoji="Emoji, :nombre: o ID del servidor/bot; escribe quitar para usar ⭐",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configuraremojiwhitelist(
+    interaction: discord.Interaction,
+    emoji: str,
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    emoji_value = edited_badge_emoji(emoji)
+    final_emoji, emoji_error = await resolve_configured_emoji(guild, emoji_value)
+    if emoji_error is not None:
+        await answer(interaction, emoji_error)
+        return
+    await bot.db.set_whitelist_emoji(interaction.guild_id, final_emoji)
+    if final_emoji is None:
+        bot.whitelist_emojis.pop(interaction.guild_id, None)
+        selected_emoji = DEFAULT_WHITELIST_EMOJI
+    else:
+        bot.whitelist_emojis[interaction.guild_id] = final_emoji
+        selected_emoji = final_emoji
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "whitelist_emoji_config",
+        None,
+        f"Configuró el emoji de whitelist como {selected_emoji}.",
+    )
+    await send_audit_log(
+        guild,
+        "Emoji de whitelist configurado",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Emoji:** {selected_emoji}",
+        color=0x22C55E,
+    )
+    await answer(
+        interaction,
+        f"El emoji de acceso por whitelist ahora es {selected_emoji}.",
+    )
+
+
 @bot.tree.command(name="configurarregistro", description="Configura el canal de movimientos.")
 @app_commands.describe(
     activado="Activa o desactiva el registro de movimientos",
@@ -1829,6 +2171,232 @@ async def configurarregistro(
         await answer(interaction, "Registro de movimientos desactivado.")
 
 
+@bot.tree.command(name="añadiradmin", description="Añade un miembro al equipo de tickets.")
+@app_commands.describe(miembro="Miembro que recibirá las alertas de tickets")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def añadiradmin(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+) -> None:
+    assert interaction.guild_id is not None
+    if miembro.bot:
+        await answer(interaction, "No puedes añadir bots al equipo de tickets.")
+        return
+    current = await bot.db.list_ticket_admins(interaction.guild_id)
+    if any(row["user_id"] == miembro.id for row in current):
+        await answer(interaction, f"{miembro.mention} ya está en el equipo de tickets.")
+        return
+    if len(current) >= MAX_TICKET_ADMINS:
+        await answer(
+            interaction,
+            f"El equipo de tickets admite un máximo de {MAX_TICKET_ADMINS} miembros.",
+        )
+        return
+    await bot.db.add_ticket_admin(interaction.guild_id, miembro.id)
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "ticket_admin_add",
+        None,
+        f"Añadió a {miembro} al equipo de tickets.",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Administrador de tickets añadido",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Miembro añadido:** {miembro.mention}",
+            color=0x22C55E,
+        )
+    await answer(
+        interaction,
+        f"Añadí a {miembro.mention} al equipo que recibe las alertas de tickets.",
+    )
+
+
+@bot.tree.command(name="quitaradmin", description="Quita un miembro del equipo de tickets.")
+@app_commands.describe(miembro="Miembro que dejará de recibir alertas de tickets")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def quitaradmin(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+) -> None:
+    assert interaction.guild_id is not None
+    removed = await bot.db.remove_ticket_admin(interaction.guild_id, miembro.id)
+    if not removed:
+        await answer(interaction, f"{miembro.mention} no está en el equipo de tickets.")
+        return
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "ticket_admin_remove",
+        None,
+        f"Quitó a {miembro} del equipo de tickets.",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Administrador de tickets retirado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Miembro retirado:** {miembro.mention}",
+            color=0xEF4444,
+        )
+    await answer(interaction, f"Quité a {miembro.mention} del equipo de tickets.")
+
+
+@bot.tree.command(name="admins", description="Muestra el equipo que recibe alertas de tickets.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def admins(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    rows = await bot.db.list_ticket_admins(guild.id)
+    active_members = [
+        member
+        for row in rows
+        if (member := guild.get_member(row["user_id"])) is not None
+    ]
+    missing_ids = [
+        row["user_id"] for row in rows if guild.get_member(row["user_id"]) is None
+    ]
+    embed = discord.Embed(title="Equipo de tickets", color=0x06B6D4)
+    if active_members:
+        embed.description = "\n".join(f"• {member.mention}" for member in active_members)
+    else:
+        embed.description = "No hay miembros activos configurados."
+    if missing_ids:
+        embed.add_field(
+            name="Ya no están en el servidor",
+            value="\n".join(f"• `{user_id}`" for user_id in missing_ids)[:1024],
+            inline=False,
+        )
+    embed.set_footer(text=f"{len(rows)} de {MAX_TICKET_ADMINS} espacios utilizados")
+    await answer(interaction, embed=embed)
+
+
+@bot.tree.command(name="añadirwhitelist", description="Añade un miembro o rol a la whitelist.")
+@app_commands.describe(objetivo="Miembro o rol que podrá usar insignias habilitadas")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def añadirwhitelist(
+    interaction: discord.Interaction,
+    objetivo: discord.Member | discord.Role,
+) -> None:
+    assert interaction.guild_id is not None
+    target_type = "member" if isinstance(objetivo, discord.Member) else "role"
+    if isinstance(objetivo, discord.Member) and objetivo.bot:
+        await answer(interaction, "No puedes añadir bots a la whitelist.")
+        return
+    if isinstance(objetivo, discord.Role) and objetivo.is_default():
+        await answer(interaction, "No puedes añadir el rol @everyone a la whitelist.")
+        return
+    added = await bot.db.add_whitelist_entry(
+        interaction.guild_id,
+        target_type,
+        objetivo.id,
+    )
+    if not added:
+        await answer(interaction, f"{objetivo.mention} ya está en la whitelist.")
+        return
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "whitelist_add",
+        None,
+        f"Añadió {objetivo} a la whitelist.",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Entrada añadida a la whitelist",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Objetivo:** {objetivo.mention}\n"
+            f"**Tipo:** {'Miembro' if target_type == 'member' else 'Rol'}",
+            color=0x22C55E,
+        )
+    await answer(interaction, f"Añadí {objetivo.mention} a la whitelist.")
+
+
+@bot.tree.command(name="quitarwhitelist", description="Quita un miembro o rol de la whitelist.")
+@app_commands.describe(objetivo="Miembro o rol que perderá el acceso por whitelist")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def quitarwhitelist(
+    interaction: discord.Interaction,
+    objetivo: discord.Member | discord.Role,
+) -> None:
+    assert interaction.guild_id is not None
+    target_type = "member" if isinstance(objetivo, discord.Member) else "role"
+    removed = await bot.db.remove_whitelist_entry(
+        interaction.guild_id,
+        target_type,
+        objetivo.id,
+    )
+    if not removed:
+        await answer(interaction, f"{objetivo.mention} no está en la whitelist.")
+        return
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "whitelist_remove",
+        None,
+        f"Quitó {objetivo} de la whitelist.",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Entrada retirada de la whitelist",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Objetivo:** {objetivo.mention}",
+            color=0xEF4444,
+        )
+    await answer(interaction, f"Quité {objetivo.mention} de la whitelist.")
+
+
+@bot.tree.command(name="whitelist", description="Muestra los miembros y roles de la whitelist.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def whitelist(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id is not None
+    rows = await bot.db.list_whitelist_entries(interaction.guild_id)
+    members = [row for row in rows if row["target_type"] == "member"]
+    roles = [row for row in rows if row["target_type"] == "role"]
+    embed = discord.Embed(title="Whitelist de insignias", color=0x22C55E)
+    embed.add_field(
+        name="Miembros",
+        value=(
+            "\n".join(f"• <@{row['target_id']}>" for row in members)[:1024]
+            if members
+            else "Ninguno"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Roles",
+        value=(
+            "\n".join(f"• <@&{row['target_id']}>" for row in roles)[:1024]
+            if roles
+            else "Ninguno"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"{len(rows)} entradas configuradas")
+    await answer(interaction, embed=embed)
+
+
 @bot.tree.command(name="estadisticas", description="Muestra estadísticas generales del sistema.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -1846,6 +2414,9 @@ async def estadisticas(interaction: discord.Interaction) -> None:
     )
     embed.add_field(name="Insignias configuradas", value=str(stats["badges"]))
     embed.add_field(name="Modificadores configurados", value=str(stats["modifiers"]))
+    embed.add_field(name="Tickets configurados", value=str(stats["tickets"]))
+    embed.add_field(name="Equipo de tickets", value=str(stats["ticket_admins"]))
+    embed.add_field(name="Entradas whitelist", value=str(stats["whitelist_entries"]))
     embed.add_field(name="Compras realizadas", value=str(stats["purchases"]))
     embed.add_field(name="Eventos ganados", value=str(stats["event_wins"]))
     embed.add_field(name="Eventos activos", value=str(stats["active_events"]))
@@ -1941,17 +2512,104 @@ async def setbalance(
     await handle_balance_command(interaction, objetivo, cantidad, "set")
 
 
-@bot.tree.command(name="darinsignia", description="Entrega una insignia a un miembro.")
-@app_commands.describe(miembro="Miembro que recibirá la insignia", insignia="Nombre de la insignia")
-@app_commands.autocomplete(insignia=badge_autocomplete)
+@bot.tree.command(name="darobjeto", description="Entrega un objeto a un miembro.")
+@app_commands.describe(
+    miembro="Miembro que recibirá el objeto",
+    objeto="Insignia, modificador o ticket que recibirá",
+    cantidad="Cantidad; para insignias debe ser 1",
+)
+@app_commands.autocomplete(objeto=editable_object_autocomplete)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def darinsignia(interaction: discord.Interaction, miembro: discord.Member, insignia: str) -> None:
+async def darobjeto(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+    objeto: str,
+    cantidad: app_commands.Range[int, 1, 1000] = 1,
+) -> None:
     guild = interaction.guild
-    badge = await find_badge(interaction, insignia)
-    if guild is None or badge is None:
-        await answer(interaction, "Esa insignia no existe.")
+    if guild is None:
+        return
+    badge = await find_badge(interaction, objeto)
+    modifier = None if badge is not None else await find_modifier(interaction, objeto)
+    ticket = (
+        None
+        if badge is not None or modifier is not None
+        else await find_ticket(interaction, objeto)
+    )
+    if badge is None and modifier is None and ticket is None:
+        await answer(interaction, "Ese objeto no existe.")
+        return
+
+    if modifier is not None:
+        await interaction.response.defer()
+        quantity = await bot.db.add_modifier_inventory(
+            guild.id,
+            miembro.id,
+            modifier["id"],
+            cantidad,
+        )
+        await bot.db.record_movement(
+            guild.id,
+            miembro.id,
+            interaction.user.id,
+            "modifier_grant",
+            cantidad,
+            f"Un administrador entregó {cantidad} de {modifier['name']}.",
+        )
+        await send_audit_log(
+            guild,
+            "Modificador entregado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Miembro:** {miembro.mention}\n"
+            f"**Modificador:** {modifier['name']}\n"
+            f"**Cantidad entregada:** {cantidad}\n"
+            f"**Total:** {quantity}",
+            color=0xA855F7,
+        )
+        await answer(
+            interaction,
+            f"Entregaste **{cantidad}** de **{modifier['name']}** a "
+            f"{miembro.mention}. Ahora tiene **{quantity}**.",
+        )
+        return
+
+    if ticket is not None:
+        await interaction.response.defer()
+        quantity = await bot.db.add_ticket_inventory(
+            guild.id,
+            miembro.id,
+            ticket["id"],
+            cantidad,
+        )
+        await bot.db.record_movement(
+            guild.id,
+            miembro.id,
+            interaction.user.id,
+            "ticket_grant",
+            cantidad,
+            f"Un administrador entregó {cantidad} de {ticket['name']}.",
+        )
+        await send_audit_log(
+            guild,
+            "Ticket entregado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Miembro:** {miembro.mention}\n"
+            f"**Ticket:** {ticket['name']}\n"
+            f"**Cantidad entregada:** {cantidad}\n"
+            f"**Total:** {quantity}",
+            color=0x06B6D4,
+        )
+        await answer(
+            interaction,
+            f"Entregaste **{cantidad}** de **{ticket['name']}** a "
+            f"{miembro.mention}. Ahora tiene **{quantity}**.",
+        )
+        return
+
+    if cantidad != 1:
+        await answer(interaction, "Las insignias son únicas; usa **cantidad: 1**.")
         return
     role = guild.get_role(badge["badge_role_id"])
     if role is None:
@@ -2030,6 +2688,7 @@ async def quitarinsignia(interaction: discord.Interaction, miembro: discord.Memb
     rol_insignia="Rol que representa la propiedad de la insignia",
     rol_color="Rol decorativo que se activará con /usar",
     comprable="Indica si aparecerá en la tienda",
+    permitir_whitelist="Permite usarla a miembros y roles de la whitelist",
     precio="Precio; usa 0 si será gratuita",
     nombre="Nombre para los comandos; por defecto usa el nombre del rol",
     apartado="Apartado de la tienda; por defecto será General",
@@ -2044,6 +2703,7 @@ async def configurarinsignia(
     rol_insignia: discord.Role,
     rol_color: discord.Role,
     comprable: bool,
+    permitir_whitelist: bool,
     precio: app_commands.Range[int, 0, MAX_MONEY] = 0,
     nombre: str | None = None,
     apartado: str | None = None,
@@ -2058,6 +2718,9 @@ async def configurarinsignia(
         return
     if await bot.db.get_modifier(interaction.guild_id, normalize_name(display_name)):
         await answer(interaction, "Ya existe un modificador con ese nombre.")
+        return
+    if await bot.db.get_ticket(interaction.guild_id, normalize_name(display_name)):
+        await answer(interaction, "Ya existe un ticket con ese nombre.")
         return
     if rol_insignia == rol_color:
         await answer(interaction, "El rol de insignia y el rol de color deben ser diferentes.")
@@ -2096,7 +2759,7 @@ async def configurarinsignia(
         await bot.db.create_badge(
             interaction.guild_id, display_name, normalize_name(display_name),
             rol_insignia.id, rol_color.id, comprable, precio, final_section,
-            final_emoji,
+            final_emoji, permitir_whitelist,
         )
     except asyncpg.UniqueViolationError:
         await answer(interaction, "Ya existe una insignia con ese nombre o ese rol.")
@@ -2118,6 +2781,7 @@ async def configurarinsignia(
             f"**Rol de insignia:** {rol_insignia.mention}\n"
             f"**Rol de color:** {rol_color.mention}\n"
             f"**Comprable:** {'Sí' if comprable else 'No'}\n"
+            f"**Acceso por whitelist:** {'Sí' if permitir_whitelist else 'No'}\n"
             f"**Precio:** {money(precio, interaction.guild_id)}\n"
             f"**Apartado:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}",
@@ -2158,6 +2822,9 @@ async def configurarmodificador(
     name_key = normalize_name(display_name)
     if await bot.db.get_badge(interaction.guild_id, name_key):
         await answer(interaction, "Ya existe una insignia con ese nombre.")
+        return
+    if await bot.db.get_ticket(interaction.guild_id, name_key):
+        await answer(interaction, "Ya existe un ticket con ese nombre.")
         return
     parsed_messages, messages_error = parse_modifier_messages(mensajes)
     if messages_error is not None or parsed_messages is None:
@@ -2228,17 +2895,121 @@ async def configurarmodificador(
     )
 
 
-@bot.tree.command(name="editar", description="Edita una insignia o un modificador.")
+@bot.tree.command(name="configurarticket", description="Configura un ticket consumible.")
+@app_commands.describe(
+    nombre="Nombre del ticket",
+    comprable="Indica si aparecerá en la tienda",
+    descripcion="Explica para qué sirve el ticket",
+    precio="Precio; usa 0 si no será comprable",
+    apartado="Apartado de la tienda; por defecto será General",
+    emoji="Emoji opcional: Unicode, :nombre: o ID del servidor/bot",
+)
+@app_commands.autocomplete(apartado=shop_section_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configurarticket(
+    interaction: discord.Interaction,
+    nombre: str,
+    comprable: bool,
+    descripcion: str,
+    precio: app_commands.Range[int, 0, MAX_MONEY] = 0,
+    apartado: str | None = None,
+    emoji: str | None = None,
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    display_name = nombre.strip()
+    if not display_name or len(display_name) > 100:
+        await answer(interaction, "El nombre debe tener entre 1 y 100 caracteres.")
+        return
+    final_description = descripcion.strip()
+    if not final_description or len(final_description) > 1000:
+        await answer(interaction, "La descripción debe tener entre 1 y 1.000 caracteres.")
+        return
+    name_key = normalize_name(display_name)
+    if await bot.db.get_badge(interaction.guild_id, name_key):
+        await answer(interaction, "Ya existe una insignia con ese nombre.")
+        return
+    if await bot.db.get_modifier(interaction.guild_id, name_key):
+        await answer(interaction, "Ya existe un modificador con ese nombre.")
+        return
+    if not comprable:
+        precio = 0
+    final_section = shop_section_name(apartado) if comprable else None
+    if final_section is not None and len(final_section) > 100:
+        await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
+        return
+    emoji_value = edited_badge_emoji(emoji)
+    final_emoji, emoji_error = await resolve_configured_emoji(guild, emoji_value)
+    if emoji_error is not None:
+        await answer(interaction, emoji_error)
+        return
+    if final_emoji is not None and (len(final_emoji) > 100 or "\n" in final_emoji):
+        await answer(interaction, "El emoji no es válido o es demasiado largo.")
+        return
+    if final_section is not None and not await shop_section_is_available(
+        interaction.guild_id,
+        final_section,
+    ):
+        await answer(
+            interaction,
+            f"La tienda admite un máximo de {MAX_SHOP_SECTIONS} apartados.",
+        )
+        return
+    await interaction.response.defer()
+    try:
+        await bot.db.create_ticket(
+            interaction.guild_id,
+            display_name,
+            name_key,
+            comprable,
+            precio,
+            final_section,
+            final_emoji,
+            final_description,
+        )
+    except asyncpg.UniqueViolationError:
+        await answer(interaction, "Ya existe un ticket con ese nombre.")
+        return
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "ticket_config_create",
+        None,
+        f"Configuró el ticket {display_name}.",
+    )
+    await send_audit_log(
+        guild,
+        "Ticket configurado",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Nombre:** {display_name}\n"
+        f"**Comprable:** {'Sí' if comprable else 'No'}\n"
+        f"**Precio:** {money(precio, interaction.guild_id)}\n"
+        f"**Apartado:** {final_section or 'No aplica'}\n"
+        f"**Emoji:** {final_emoji or 'Ninguno'}\n"
+        f"**Descripción:** {final_description}",
+        color=0x06B6D4,
+    )
+    await answer(interaction, f"Configuré el ticket **{display_name}** correctamente.")
+
+
+@bot.tree.command(name="editar", description="Edita una insignia, modificador o ticket.")
 @app_commands.describe(
     objeto="Nombre actual del objeto",
     nuevo_nombre="Nuevo nombre (opcional)",
-    rol_insignia="Nuevo rol de insignia; no aplica a modificadores",
-    rol_color="Nuevo rol de color; no aplica a modificadores",
+    rol_insignia="Nuevo rol de insignia; no aplica a consumibles",
+    rol_color="Nuevo rol de color; no aplica a consumibles",
     comprable="Cambiar si aparece en la tienda",
+    permitir_whitelist="Permitir o impedir el acceso por whitelist a esta insignia",
     precio="Nuevo precio",
     apartado="Nuevo apartado de la tienda",
     emoji="Emoji, :nombre: o ID; escribe quitar para eliminarlo",
     mensajes="Para modificadores: nueva lista separada por |",
+    descripcion="Para tickets: nueva descripción",
 )
 @app_commands.autocomplete(
     objeto=editable_object_autocomplete,
@@ -2254,10 +3025,12 @@ async def editar(
     rol_insignia: discord.Role | None = None,
     rol_color: discord.Role | None = None,
     comprable: bool | None = None,
+    permitir_whitelist: bool | None = None,
     precio: int | None = None,
     apartado: str | None = None,
     emoji: str | None = None,
     mensajes: str | None = None,
+    descripcion: str | None = None,
 ) -> None:
     assert interaction.guild_id is not None
     guild = interaction.guild
@@ -2267,11 +3040,16 @@ async def editar(
     current_modifier = (
         None if current_badge is not None else await find_modifier(interaction, objeto)
     )
-    if current_badge is None and current_modifier is None:
+    current_ticket = (
+        None
+        if current_badge is not None or current_modifier is not None
+        else await find_ticket(interaction, objeto)
+    )
+    if current_badge is None and current_modifier is None and current_ticket is None:
         await answer(interaction, "Ese objeto no existe.")
         return
 
-    current = current_badge or current_modifier
+    current = current_badge or current_modifier or current_ticket
     final_name = nuevo_nombre.strip() if nuevo_nombre is not None else current["name"]
     if not final_name or len(final_name) > 100:
         await answer(interaction, "El nombre debe tener entre 1 y 100 caracteres.")
@@ -2304,7 +3082,11 @@ async def editar(
         await answer(interaction, "El emoji no es válido o es demasiado largo.")
         return
 
-    item_type = "badge" if current_badge is not None else "modifier"
+    item_type = (
+        "badge"
+        if current_badge is not None
+        else "modifier" if current_modifier is not None else "ticket"
+    )
     if final_section is not None and not await shop_section_is_available(
         interaction.guild_id,
         final_section,
@@ -2320,8 +3102,20 @@ async def editar(
         if rol_insignia is not None or rol_color is not None:
             await answer(interaction, "Los modificadores no utilizan roles de Discord.")
             return
+        if descripcion is not None:
+            await answer(interaction, "La opción descripción solo se usa con tickets.")
+            return
+        if permitir_whitelist is not None:
+            await answer(
+                interaction,
+                "La opción permitir_whitelist solo se usa con insignias.",
+            )
+            return
         if await bot.db.get_badge(interaction.guild_id, final_name_key):
             await answer(interaction, "Ya existe una insignia con ese nombre.")
+            return
+        if await bot.db.get_ticket(interaction.guild_id, final_name_key):
+            await answer(interaction, "Ya existe un ticket con ese nombre.")
             return
         final_messages = list(current_modifier["messages"])
         if mensajes is not None:
@@ -2373,16 +3167,98 @@ async def editar(
         await answer(interaction, f"Actualicé el modificador **{final_name}**.")
         return
 
-    if mensajes is not None:
-        await answer(interaction, "La opción mensajes solo se usa con modificadores.")
+    if current_ticket is not None:
+        if rol_insignia is not None or rol_color is not None:
+            await answer(interaction, "Los tickets no utilizan roles de Discord.")
+            return
+        if mensajes is not None:
+            await answer(interaction, "La opción mensajes solo se usa con modificadores.")
+            return
+        if permitir_whitelist is not None:
+            await answer(
+                interaction,
+                "La opción permitir_whitelist solo se usa con insignias.",
+            )
+            return
+        if await bot.db.get_badge(interaction.guild_id, final_name_key):
+            await answer(interaction, "Ya existe una insignia con ese nombre.")
+            return
+        if await bot.db.get_modifier(interaction.guild_id, final_name_key):
+            await answer(interaction, "Ya existe un modificador con ese nombre.")
+            return
+        final_description = (
+            descripcion.strip() if descripcion is not None else current_ticket["description"]
+        )
+        if not final_description or len(final_description) > 1000:
+            await answer(
+                interaction,
+                "La descripción debe tener entre 1 y 1.000 caracteres.",
+            )
+            return
+        await interaction.response.defer()
+        try:
+            updated = await bot.db.update_ticket(
+                interaction.guild_id,
+                current_ticket["name_key"],
+                final_name,
+                final_name_key,
+                final_purchasable,
+                final_price,
+                final_section,
+                final_emoji,
+                final_description,
+            )
+        except asyncpg.UniqueViolationError:
+            await answer(interaction, "Ya existe un ticket con ese nombre.")
+            return
+        if not updated:
+            await answer(interaction, "No pude encontrar ese ticket.")
+            return
+        await bot.db.record_movement(
+            interaction.guild_id,
+            None,
+            interaction.user.id,
+            "ticket_config_edit",
+            None,
+            f"Editó el ticket {current_ticket['name']} como {final_name}.",
+        )
+        await send_audit_log(
+            guild,
+            "Ticket editado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Nombre anterior:** {current_ticket['name']}\n"
+            f"**Nombre actual:** {final_name}\n"
+            f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
+            f"**Precio:** {money(final_price, interaction.guild_id)}\n"
+            f"**Apartado:** {final_section or 'No aplica'}\n"
+            f"**Emoji:** {final_emoji or 'Ninguno'}\n"
+            f"**Descripción:** {final_description}",
+            color=0x06B6D4,
+        )
+        await answer(interaction, f"Actualicé el ticket **{final_name}**.")
+        return
+
+    if mensajes is not None or descripcion is not None:
+        await answer(
+            interaction,
+            "Las opciones mensajes y descripción no se usan con insignias.",
+        )
         return
     if await bot.db.get_modifier(interaction.guild_id, final_name_key):
         await answer(interaction, "Ya existe un modificador con ese nombre.")
+        return
+    if await bot.db.get_ticket(interaction.guild_id, final_name_key):
+        await answer(interaction, "Ya existe un ticket con ese nombre.")
         return
     final_badge_role = (
         rol_insignia.id if rol_insignia else current_badge["badge_role_id"]
     )
     final_color_role = rol_color.id if rol_color else current_badge["color_role_id"]
+    final_whitelist_enabled = (
+        permitir_whitelist
+        if permitir_whitelist is not None
+        else current_badge["whitelist_enabled"]
+    )
     if final_badge_role == final_color_role:
         await answer(interaction, "El rol de insignia y el rol de color deben ser diferentes.")
         return
@@ -2405,6 +3281,7 @@ async def editar(
             final_price,
             final_section,
             final_emoji,
+            final_whitelist_enabled,
         )
     except asyncpg.UniqueViolationError:
         await answer(interaction, "Ese nombre o rol ya pertenece a otra insignia.")
@@ -2429,6 +3306,7 @@ async def editar(
         f"**Rol de insignia:** <@&{final_badge_role}>\n"
         f"**Rol de color:** <@&{final_color_role}>\n"
         f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
+        f"**Acceso por whitelist:** {'Sí' if final_whitelist_enabled else 'No'}\n"
         f"**Precio:** {money(final_price, interaction.guild_id)}\n"
         f"**Apartado:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}",
@@ -2467,59 +3345,6 @@ async def borrarinsignia(interaction: discord.Interaction, insignia: str) -> Non
             color=0xEF4444,
         )
     await answer(interaction, f"Borré **{deleted['name']}**. No eliminé ningún rol del servidor.")
-
-
-@bot.tree.command(name="darmodificador", description="Entrega unidades de un modificador.")
-@app_commands.describe(
-    miembro="Miembro que recibirá el modificador",
-    modificador="Nombre del modificador",
-    cantidad="Cantidad que recibirá",
-)
-@app_commands.autocomplete(modificador=modifier_autocomplete)
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def darmodificador(
-    interaction: discord.Interaction,
-    miembro: discord.Member,
-    modificador: str,
-    cantidad: app_commands.Range[int, 1, 1000] = 1,
-) -> None:
-    assert interaction.guild_id is not None
-    item = await find_modifier(interaction, modificador)
-    if item is None:
-        await answer(interaction, "Ese modificador no existe.")
-        return
-    quantity = await bot.db.add_modifier_inventory(
-        interaction.guild_id,
-        miembro.id,
-        item["id"],
-        cantidad,
-    )
-    await bot.db.record_movement(
-        interaction.guild_id,
-        miembro.id,
-        interaction.user.id,
-        "modifier_grant",
-        cantidad,
-        f"Un administrador entregó {cantidad} de {item['name']}.",
-    )
-    if interaction.guild is not None:
-        await send_audit_log(
-            interaction.guild,
-            "Modificador entregado",
-            f"**Administrador:** {interaction.user.mention}\n"
-            f"**Miembro:** {miembro.mention}\n"
-            f"**Modificador:** {item['name']}\n"
-            f"**Cantidad entregada:** {cantidad}\n"
-            f"**Total:** {quantity}",
-            color=0xA855F7,
-        )
-    await answer(
-        interaction,
-        f"Entregaste **{cantidad}** de **{item['name']}** a {miembro.mention}. "
-        f"Ahora tiene **{quantity}**.",
-    )
 
 
 @bot.tree.command(name="quitarmodificador", description="Retira unidades de un modificador.")
@@ -2570,6 +3395,65 @@ async def quitarmodificador(
             f"**Administrador:** {interaction.user.mention}\n"
             f"**Miembro:** {miembro.mention}\n"
             f"**Modificador:** {item['name']}\n"
+            f"**Cantidad retirada:** {removed}\n"
+            f"**Restantes:** {quantity}",
+            color=0xEF4444,
+        )
+    await answer(
+        interaction,
+        f"Retiraste hasta **{cantidad}** de **{item['name']}** a {miembro.mention}. "
+        f"Ahora tiene **{quantity}**.",
+    )
+
+
+@bot.tree.command(name="quitarticket", description="Retira unidades de un ticket.")
+@app_commands.describe(
+    miembro="Miembro que perderá el ticket",
+    ticket="Nombre del ticket",
+    cantidad="Cantidad que se retirará",
+)
+@app_commands.autocomplete(ticket=ticket_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def quitarticket(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+    ticket: str,
+    cantidad: app_commands.Range[int, 1, 1000] = 1,
+) -> None:
+    assert interaction.guild_id is not None
+    item = await find_ticket(interaction, ticket)
+    if item is None:
+        await answer(interaction, "Ese ticket no existe.")
+        return
+    inventory = await bot.db.list_ticket_inventory(interaction.guild_id, miembro.id)
+    current_quantity = next(
+        (row["quantity"] for row in inventory if row["id"] == item["id"]),
+        0,
+    )
+    removed = min(current_quantity, cantidad)
+    quantity = await bot.db.remove_ticket_inventory(
+        interaction.guild_id,
+        miembro.id,
+        item["id"],
+        cantidad,
+    )
+    await bot.db.record_movement(
+        interaction.guild_id,
+        miembro.id,
+        interaction.user.id,
+        "ticket_remove",
+        -removed,
+        f"Un administrador retiró {removed} de {item['name']}.",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Ticket retirado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Miembro:** {miembro.mention}\n"
+            f"**Ticket:** {item['name']}\n"
             f"**Cantidad retirada:** {removed}\n"
             f"**Restantes:** {quantity}",
             color=0xEF4444,
@@ -2719,6 +3603,47 @@ async def borrarmodificador(
     )
 
 
+@bot.tree.command(name="borrarticket", description="Borra un ticket configurado.")
+@app_commands.describe(ticket="Nombre del ticket que se borrará")
+@app_commands.autocomplete(ticket=ticket_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def borrarticket(
+    interaction: discord.Interaction,
+    ticket: str,
+) -> None:
+    assert interaction.guild_id is not None
+    deleted = await bot.db.delete_ticket(
+        interaction.guild_id,
+        normalize_name(ticket),
+    )
+    if deleted is None:
+        await answer(interaction, "Ese ticket no existe.")
+        return
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "ticket_config_delete",
+        None,
+        f"Borró el ticket {deleted['name']}.",
+    )
+    if interaction.guild is not None:
+        await send_audit_log(
+            interaction.guild,
+            "Ticket borrado",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Ticket:** {deleted['name']}\n"
+            "Sus unidades de inventario también fueron eliminadas.",
+            color=0xEF4444,
+        )
+    await answer(
+        interaction,
+        f"Borré el ticket **{deleted['name']}** y sus unidades de inventario.",
+    )
+
+
 @bot.tree.command(name="ayuda", description="Muestra la guía de comandos de Sularea.")
 @app_commands.guild_only()
 async def ayuda(interaction: discord.Interaction) -> None:
@@ -2726,7 +3651,7 @@ async def ayuda(interaction: discord.Interaction) -> None:
     embed = discord.Embed(
         title="Ayuda de Sularea",
         description=(
-            "Participa en eventos para conseguir monedas, insignias y modificadores. "
+            "Participa en eventos para conseguir monedas, insignias, modificadores y tickets. "
             "Responde directamente al mensaje de cada pregunta. Después puedes "
             "comprar y activar roles de color especiales."
         ),
@@ -2737,8 +3662,8 @@ async def ayuda(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Inventario y objetos",
         value=(
-            "`/inventario` — Ver insignias y modificadores.\n"
-            "`/usar` — Usar una insignia o modificador.\n"
+            "`/inventario` — Ver insignias y consumibles.\n"
+            "`/usar` — Usar una insignia, modificador o ticket.\n"
             "`/quitar` — Quitar tu rol de color."
         ),
         inline=False,
@@ -2759,15 +3684,16 @@ async def ayuda(interaction: discord.Interaction) -> None:
             name="Administración",
             value=(
                 "`/inventario [miembro]` · `/objetos`\n"
-                "`/darinsignia` · `/quitarinsignia`\n"
-                "`/configurarinsignia` · `/configurarmodificador` · `/editar`\n"
-                "`/borrarinsignia` · `/borrarmodificador`\n"
-                "`/darmodificador` · `/quitarmodificador`\n"
+                "`/darobjeto` · `/quitarinsignia` · `/quitarmodificador` · `/quitarticket`\n"
+                "`/configurarinsignia` · `/configurarmodificador` · `/configurarticket`\n"
+                "`/editar` · `/borrarinsignia` · `/borrarmodificador` · `/borrarticket`\n"
                 "`/estadomodificador`\n"
+                "`/añadiradmin` · `/quitaradmin` · `/admins`\n"
+                "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`\n"
                 "`/revisarbalance` · `/añadirbalance` · `/quitarbalance` · `/setbalance`\n"
                 "`/eventopregunta` · `/cancelarevento`\n"
                 "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`"
-                "\n`/configurarmoneda`"
+                "\n`/configurarmoneda` · `/configuraremojiwhitelist`"
             ),
             inline=False,
         )
