@@ -1012,7 +1012,7 @@ async def ranking(interaction: discord.Interaction) -> None:
     if interaction.guild is not None and interaction.guild.icon is not None:
         embed.set_thumbnail(url=interaction.guild.icon.url)
     if not rows:
-        embed.description = "Todavía no hay miembros con dinero registrado."
+        embed.description = "Nadie tiene monedas aún. ¡Participa en los eventos de Sularea para conseguirlas!"
     else:
         medals = ["🥇", "🥈", "🥉"]
         embed.description = "\n".join(

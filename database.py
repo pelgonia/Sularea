@@ -428,7 +428,7 @@ class Database:
             """
             SELECT user_id, balance
             FROM balances
-            WHERE guild_id = $1
+            WHERE guild_id = $1 AND balance > 0
             ORDER BY balance DESC, user_id
             LIMIT $2
             """,
