@@ -278,6 +278,25 @@ def money(value: int, guild_id: int | None = None) -> str:
     return f"{emoji} {formatted}"
 
 
+def discounted_price(price: int, discount_percent: int) -> int:
+    discount_percent = max(0, min(100, discount_percent))
+    return price * (100 - discount_percent) // 100
+
+
+def shop_price_text(
+    price: int,
+    discount_percent: int,
+    guild_id: int,
+) -> str:
+    effective_price = discounted_price(price, discount_percent)
+    if discount_percent <= 0 or effective_price == price:
+        return money(price, guild_id)
+    return (
+        f"~~{money(price, guild_id)}~~ "
+        f"**{money(effective_price, guild_id)}**"
+    )
+
+
 def whitelist_marker(guild_id: int | None = None) -> str:
     if guild_id is None:
         return DEFAULT_WHITELIST_EMOJI
@@ -1662,6 +1681,7 @@ def make_shop_embed(
     guild: discord.Guild,
     sections: list[tuple[str, str, list]],
     selected_index: int,
+    discount_percent: int = 0,
 ) -> discord.Embed:
     section_name, section_description, rows = sections[selected_index]
     item_lines = []
@@ -1669,20 +1689,21 @@ def make_shop_embed(
         prefix = f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**"
         if row["item_type"] == "badge":
             item_lines.append(
-                f"{prefix} (<@&{row['color_role_id']}>) — {money(row['price'], guild.id)}"
+                f"{prefix} (<@&{row['color_role_id']}>) — "
+                f"{shop_price_text(row['price'], discount_percent, guild.id)}"
             )
         elif row["item_type"] == "modifier":
             item_lines.append(
                 f"{prefix} (Consumible "
                 f"{modifier_scope_label(row['effect_scope']).lower()} · "
                 f"{row['duration_minutes']} min) — "
-                f"{money(row['price'], guild.id)}"
+                f"{shop_price_text(row['price'], discount_percent, guild.id)}"
             )
         else:
             ticket_status = "activo" if row["active"] else "inactivo"
             item_lines.append(
                 f"{prefix} (ticket consumible · {ticket_status}) — "
-                f"{money(row['price'], guild.id)}\n"
+                f"{shop_price_text(row['price'], discount_percent, guild.id)}\n"
                 f"  {row['description']}"
             )
     items = "\n".join(item_lines) if item_lines else "*No hay objetos en esta categoría.*"
@@ -1702,6 +1723,11 @@ def make_shop_embed(
         text=(
             f"Categoría {selected_index + 1} de {len(sections)} · "
             "Usa el menú para cambiar y /comprar para obtener un objeto."
+            + (
+                f" · Descuento whitelist aplicado: {discount_percent}%"
+                if discount_percent > 0
+                else ""
+            )
         )
     )
     return embed
@@ -1746,6 +1772,7 @@ class ShopSectionSelect(discord.ui.Select):
                 self.shop_view.guild,
                 self.shop_view.sections,
                 selected_index,
+                self.shop_view.discount_percent,
             ),
             view=self.shop_view,
         )
@@ -1757,11 +1784,13 @@ class ShopView(discord.ui.View):
         guild: discord.Guild,
         sections: list[tuple[str, str, list]],
         author_id: int,
+        discount_percent: int = 0,
     ) -> None:
         super().__init__(timeout=300)
         self.guild = guild
         self.sections = sections
         self.author_id = author_id
+        self.discount_percent = discount_percent
         self.selected_index = 0
         self.message: discord.InteractionMessage | None = None
         self.add_item(ShopSectionSelect(self))
@@ -1909,6 +1938,11 @@ async def process_purchase(
     if disabled_message is not None:
         await answer(interaction, disabled_message)
         return
+    discount_percent = await bot.db.get_whitelist_discount(
+        guild.id,
+        member.id,
+        [role.id for role in member.roles],
+    )
     badge = await find_badge(interaction, item_name)
     modifier = None if badge is not None else await find_modifier(interaction, item_name)
     ticket = (
@@ -1924,6 +1958,7 @@ async def process_purchase(
                 guild.id,
                 member.id,
                 modifier["name_key"],
+                discount_percent,
             )
         if result is None:
             await answer(interaction, "Ese modificador ya no está disponible.")
@@ -1949,6 +1984,12 @@ async def process_purchase(
             "Compra de modificador",
             f"{member.mention} compró **{result['name']}** por "
             f"**{money(result['price'], guild.id)}**.\n"
+            + (
+                f"**Descuento whitelist:** {result['discount_percent']}%\n"
+                if result["price"] < result["original_price"]
+                else ""
+            )
+            +
             f"**Cantidad:** {result['quantity']}\n"
             f"**Nuevo balance:** {money(result['new_balance'], guild.id)}",
             color=0xA855F7,
@@ -1957,7 +1998,13 @@ async def process_purchase(
             interaction,
             f"{member.mention} compró **{result['name']}**. Ahora tiene "
             f"**{result['quantity']}**. Su balance es "
-            f"**{money(result['new_balance'], guild.id)}**.",
+            f"**{money(result['new_balance'], guild.id)}**."
+            + (
+                f" Se aplicó un descuento de whitelist del "
+                f"**{result['discount_percent']}%**."
+                if result["price"] < result["original_price"]
+                else ""
+            ),
         )
         return
 
@@ -1983,6 +2030,7 @@ async def process_purchase(
                 guild.id,
                 member.id,
                 ticket["name_key"],
+                discount_percent,
             )
         if result is None:
             await answer(interaction, "Ese ticket ya no está disponible.")
@@ -2008,6 +2056,12 @@ async def process_purchase(
             "Compra de ticket",
             f"{member.mention} compró **{result['name']}** por "
             f"**{money(result['price'], guild.id)}**.\n"
+            + (
+                f"**Descuento whitelist:** {result['discount_percent']}%\n"
+                if result["price"] < result["original_price"]
+                else ""
+            )
+            +
             f"**Cantidad:** {result['quantity']}\n"
             f"**Estado:** {'Activo' if result['active'] else 'Inactivo'}\n"
             f"**Nuevo balance:** {money(result['new_balance'], guild.id)}",
@@ -2024,7 +2078,14 @@ async def process_purchase(
             interaction,
             f"{member.mention} compró **{result['name']}**. Ahora tiene "
             f"**{result['quantity']}**. Su balance es "
-            f"**{money(result['new_balance'], guild.id)}**.\n{warning}",
+            f"**{money(result['new_balance'], guild.id)}**."
+            + (
+                f" Se aplicó un descuento de whitelist del "
+                f"**{result['discount_percent']}%**."
+                if result["price"] < result["original_price"]
+                else ""
+            )
+            + f"\n{warning}",
         )
         return
 
@@ -2047,11 +2108,19 @@ async def process_purchase(
 
     if not interaction.response.is_done():
         await interaction.response.defer()
+    effective_badge_price = discounted_price(
+        badge["price"],
+        discount_percent,
+    )
     async with purchase_lock(guild.id, member.id):
         if role in member.roles:
             await answer(interaction, "Ya tienes esa insignia.")
             return
-        new_balance = await bot.db.spend_balance(guild.id, member.id, badge["price"])
+        new_balance = await bot.db.spend_balance(
+            guild.id,
+            member.id,
+            effective_badge_price,
+        )
         if new_balance is None:
             current = await bot.db.get_balance(guild.id, member.id)
             await answer(
@@ -2062,7 +2131,11 @@ async def process_purchase(
         try:
             await member.add_roles(role, reason=f"Compra: {badge['name']}")
         except Exception:
-            await bot.db.add_balance(guild.id, member.id, badge["price"])
+            await bot.db.add_balance(
+                guild.id,
+                member.id,
+                effective_badge_price,
+            )
             raise
 
     await bot.db.record_movement(
@@ -2070,22 +2143,33 @@ async def process_purchase(
         member.id,
         member.id,
         "purchase",
-        -badge["price"],
-        f"Compró la insignia {badge['name']} por {money(badge['price'], guild.id)}.",
+        -effective_badge_price,
+        f"Compró la insignia {badge['name']} por "
+        f"{money(effective_badge_price, guild.id)}.",
     )
     await send_audit_log(
         guild,
         "Compra en el Mercado de Sularea",
         f"{member.mention} compró **{badge['name']}** (<@&{badge['color_role_id']}>) "
-        f"por **{money(badge['price'], guild.id)}**.\n"
-        f"**Nuevo balance:** {money(new_balance, guild.id)}",
+        f"por **{money(effective_badge_price, guild.id)}**.\n"
+        + (
+            f"**Descuento whitelist:** {discount_percent}%\n"
+            if effective_badge_price < badge["price"]
+            else ""
+        )
+        + f"**Nuevo balance:** {money(new_balance, guild.id)}",
         color=0xF59E0B,
     )
     await answer(
         interaction,
         f"{member.mention} compró **{badge['name']}** por "
-        f"**{money(badge['price'], guild.id)}**. Su nuevo balance es "
-        f"**{money(new_balance, guild.id)}**.",
+        f"**{money(effective_badge_price, guild.id)}**. Su nuevo balance es "
+        f"**{money(new_balance, guild.id)}**."
+        + (
+            f" Se aplicó un descuento de whitelist del **{discount_percent}%**."
+            if effective_badge_price < badge["price"]
+            else ""
+        ),
     )
 
 
@@ -3536,6 +3620,7 @@ async def mensajes(interaction: discord.Interaction) -> None:
 @app_commands.guild_only()
 async def tienda(interaction: discord.Interaction) -> None:
     assert interaction.guild_id is not None and interaction.guild is not None
+    member = guild_member(interaction)
     disabled_message = await object_section_disabled_message(
         interaction,
         "shop",
@@ -3543,9 +3628,18 @@ async def tienda(interaction: discord.Interaction) -> None:
     if disabled_message is not None:
         await answer(interaction, disabled_message)
         return
-    rows, categories = await asyncio.gather(
+    rows, categories, discount_percent = await asyncio.gather(
         bot.db.list_shop_items(interaction.guild_id),
         bot.db.list_shop_categories(interaction.guild_id),
+        (
+            bot.db.get_whitelist_discount(
+                interaction.guild_id,
+                member.id,
+                [role.id for role in member.roles],
+            )
+            if member is not None
+            else asyncio.sleep(0, result=0)
+        ),
     )
     if not rows and not categories:
         embed = discord.Embed(title="Mercado de Sularea", color=0xF59E0B)
@@ -3556,9 +3650,19 @@ async def tienda(interaction: discord.Interaction) -> None:
         return
 
     sections = group_shop_badges(list(rows), list(categories))
-    view = ShopView(interaction.guild, sections, interaction.user.id)
+    view = ShopView(
+        interaction.guild,
+        sections,
+        interaction.user.id,
+        discount_percent,
+    )
     await interaction.response.send_message(
-        embed=make_shop_embed(interaction.guild, sections, 0),
+        embed=make_shop_embed(
+            interaction.guild,
+            sections,
+            0,
+            discount_percent,
+        ),
         view=view,
     )
     view.message = await interaction.original_response()
@@ -3771,6 +3875,55 @@ async def configuraremojiwhitelist(
     await answer(
         interaction,
         f"El emoji de acceso por whitelist ahora es {selected_emoji}.",
+    )
+
+
+@bot.tree.command(
+    name="configurardescuentowhitelist",
+    description="Configura el descuento de tienda para la whitelist.",
+)
+@app_commands.describe(
+    porcentaje="Descuento entre 0% y 100%; usa 0 para desactivarlo",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configurardescuentowhitelist(
+    interaction: discord.Interaction,
+    porcentaje: app_commands.Range[int, 0, 100],
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    await bot.db.set_whitelist_discount(
+        interaction.guild_id,
+        porcentaje,
+    )
+    bot.invalidate_log_settings(interaction.guild_id)
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "whitelist_discount_config",
+        None,
+        f"Configuró el descuento de whitelist en {porcentaje}%.",
+    )
+    await send_audit_log(
+        guild,
+        "Descuento de whitelist configurado",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Descuento:** {porcentaje}%\n"
+        f"**Estado:** {'Activo' if porcentaje > 0 else 'Desactivado'}",
+        color=0xF59E0B,
+    )
+    await answer(
+        interaction,
+        (
+            f"El descuento de la whitelist ahora es de **{porcentaje}%**."
+            if porcentaje > 0
+            else "El descuento de la whitelist quedó **desactivado**."
+        ),
     )
 
 
@@ -4000,7 +4153,7 @@ async def editarmensajeautomatico(
         movement_action = "automatic_message_add"
         response = (
             f"Añadí el mensaje automático **#{changed['id']}**. "
-            "Se enviará cuando llegue su turno en la rotación."
+            "Se incluirá en la siguiente ronda aleatoria."
         )
     else:
         rows = await bot.db.list_automatic_messages(interaction.guild_id)
@@ -4147,7 +4300,12 @@ async def mensajesautomaticos(interaction: discord.Interaction) -> None:
                     ),
                     inline=False,
                 )
-        embed.set_footer(text="Los mensajes se envían en rotación y en este orden.")
+        embed.set_footer(
+            text=(
+                "El bot mezcla la lista y envía cada mensaje una vez antes "
+                "de volver a mezclar."
+            )
+        )
         if guild.icon is not None:
             embed.set_thumbnail(url=guild.icon.url)
         await interaction.followup.send(embed=embed)
@@ -4353,10 +4511,13 @@ async def quitarwhitelist(
 @app_commands.checks.has_permissions(administrator=True)
 async def whitelist(interaction: discord.Interaction) -> None:
     assert interaction.guild_id is not None
-    rows = await bot.db.list_whitelist_entries(interaction.guild_id)
+    rows, settings = await asyncio.gather(
+        bot.db.list_whitelist_entries(interaction.guild_id),
+        bot.db.get_log_settings(interaction.guild_id),
+    )
     members = [row for row in rows if row["target_type"] == "member"]
     roles = [row for row in rows if row["target_type"] == "role"]
-    embed = discord.Embed(title="Whitelist de insignias", color=0x22C55E)
+    embed = discord.Embed(title="Whitelist de Sularea", color=0x22C55E)
     embed.add_field(
         name="Miembros",
         value=(
@@ -4375,7 +4536,153 @@ async def whitelist(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
-    embed.set_footer(text=f"{len(rows)} entradas configuradas")
+    discount_percent = (
+        settings["whitelist_discount_percent"] if settings is not None else 0
+    )
+    embed.set_footer(
+        text=(
+            f"{len(rows)} entradas configuradas · "
+            f"Descuento de tienda: {discount_percent}%"
+        )
+    )
+    await answer(interaction, embed=embed)
+
+
+@bot.tree.command(
+    name="configuracion",
+    description="Muestra todas las configuraciones generales del bot.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configuracion(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    (
+        settings,
+        automatic_settings,
+        maintenance_rows,
+        statistics,
+        categories,
+        ticket_admins,
+        whitelist_entries,
+    ) = await asyncio.gather(
+        bot.db.get_log_settings(interaction.guild_id),
+        bot.db.get_automatic_message_settings(interaction.guild_id),
+        bot.db.list_object_section_settings(interaction.guild_id),
+        bot.db.get_statistics(interaction.guild_id),
+        bot.db.list_shop_categories(interaction.guild_id),
+        bot.db.list_ticket_admins(interaction.guild_id),
+        bot.db.list_whitelist_entries(interaction.guild_id),
+    )
+
+    coin_emoji = (
+        settings["coin_emoji"]
+        if settings is not None and settings["coin_emoji"]
+        else DEFAULT_COIN_EMOJI
+    )
+    configured_whitelist_emoji = (
+        settings["whitelist_emoji"]
+        if settings is not None and settings["whitelist_emoji"]
+        else DEFAULT_WHITELIST_EMOJI
+    )
+    discount_percent = (
+        settings["whitelist_discount_percent"] if settings is not None else 0
+    )
+    embed = discord.Embed(
+        title="Configuración actual de Sularea",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if guild.icon is not None:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(
+        name="Economía y whitelist",
+        value=(
+            f"**Emoji de moneda:** {coin_emoji}\n"
+            f"**Emoji whitelist:** {configured_whitelist_emoji}\n"
+            f"**Descuento whitelist:** {discount_percent}%\n"
+            f"**Entradas whitelist:** {len(whitelist_entries)}"
+        ),
+        inline=False,
+    )
+    logs_enabled = bool(settings is not None and settings["logs_enabled"])
+    log_channel_id = (
+        settings["log_channel_id"] if settings is not None else None
+    )
+    embed.add_field(
+        name="Registro de movimientos",
+        value=(
+            f"**Estado:** {'Activo' if logs_enabled else 'Inactivo'}\n"
+            f"**Canal:** {f'<#{log_channel_id}>' if log_channel_id else 'Sin configurar'}"
+        ),
+        inline=True,
+    )
+    if automatic_settings is None:
+        automatic_value = "Sin configurar."
+    else:
+        next_send_at = automatic_settings["next_send_at"]
+        automatic_value = (
+            f"**Estado:** "
+            f"{'Activo' if automatic_settings['enabled'] else 'Inactivo'}\n"
+            f"**Canal:** <#{automatic_settings['channel_id']}>\n"
+            f"**Intervalo:** {automatic_settings['interval_minutes']} min\n"
+            f"**Mensajes:** {automatic_settings['message_count']}\n"
+            f"**Orden:** Aleatorio sin repeticiones\n"
+            f"**Próximo envío:** <t:{int(next_send_at.timestamp())}:R>"
+        )
+    embed.add_field(
+        name="Mensajes automáticos",
+        value=automatic_value,
+        inline=True,
+    )
+    embed.add_field(
+        name="Objetos y tienda",
+        value=(
+            f"**Insignias:** {statistics['badges']}\n"
+            f"**Modificadores:** {statistics['modifiers']}\n"
+            f"**Tickets:** {statistics['tickets']}\n"
+            f"**Categorías:** {len(categories)}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Administración de tickets",
+        value=f"**Administradores configurados:** {len(ticket_admins)}",
+        inline=True,
+    )
+
+    maintenance_by_section = {
+        row["section"]: row for row in maintenance_rows
+    }
+    maintenance_lines = []
+    for section, label in OBJECT_SECTION_LABELS.items():
+        row = maintenance_by_section.get(section)
+        if row is None or row["enabled"]:
+            maintenance_lines.append(f"✅ **{label.capitalize()}**")
+            continue
+        reason = " ".join((row["disabled_reason"] or "Sin razón").split())[:100]
+        bypass = (
+            "admins permitidos"
+            if row["admins_bypass"]
+            else "admins bloqueados"
+        )
+        maintenance_lines.append(
+            f"⛔ **{label.capitalize()}** — {reason} ({bypass})"
+        )
+    embed.add_field(
+        name="Mantenimiento",
+        value="\n".join(maintenance_lines)[:1024],
+        inline=False,
+    )
+    embed.set_footer(
+        text=(
+            "Detalles: /objetos · /mensajes · /mensajesautomaticos · "
+            "/whitelist · /admins"
+        )
+    )
     await answer(interaction, embed=embed)
 
 
@@ -7046,7 +7353,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/configurarmodificador` · `/configurarticket`\n"
                 "`/editar` · `/editarmensajes`\n"
                 "`/añadiradmin` · `/quitaradmin` · `/admins`\n"
-                "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`"
+                "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`\n"
+                "`/configurardescuentowhitelist`"
             ),
             inline=False,
         )
@@ -7058,7 +7366,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`\n"
                 "`/configurarmensajeautomatico` · `/editarmensajeautomatico`\n"
                 "`/mensajesautomaticos`\n"
-                "`/configurarmoneda` · `/configuraremojiwhitelist`"
+                "`/configurarmoneda` · `/configuraremojiwhitelist`\n"
+                "`/configuracion`"
             ),
             inline=False,
         )
@@ -7103,7 +7412,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/ranking` — Ver los balances más altos.\n"
                 "`/tienda` — Abrir el mercado por categorías.\n"
                 "`/comprar objeto` — Comprar por nombre; un ticket inactivo pide "
-                "confirmación privada."
+                "confirmación privada.\n"
+                "La whitelist puede tener un descuento configurado para todo el mercado."
             ),
             inline=False,
         )

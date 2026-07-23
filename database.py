@@ -1,4 +1,5 @@
 import asyncio
+import random
 
 import asyncpg
 
@@ -213,7 +214,8 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     log_channel_id BIGINT,
     logs_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     coin_emoji TEXT,
-    whitelist_emoji TEXT
+    whitelist_emoji TEXT,
+    whitelist_discount_percent INTEGER NOT NULL DEFAULT 0
 );
 
 ALTER TABLE guild_settings
@@ -221,6 +223,16 @@ ADD COLUMN IF NOT EXISTS coin_emoji TEXT;
 
 ALTER TABLE guild_settings
 ADD COLUMN IF NOT EXISTS whitelist_emoji TEXT;
+
+ALTER TABLE guild_settings
+ADD COLUMN IF NOT EXISTS whitelist_discount_percent INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE guild_settings
+DROP CONSTRAINT IF EXISTS guild_settings_whitelist_discount_check;
+
+ALTER TABLE guild_settings
+ADD CONSTRAINT guild_settings_whitelist_discount_check
+CHECK (whitelist_discount_percent BETWEEN 0 AND 100);
 
 CREATE TABLE IF NOT EXISTS automatic_message_settings (
     guild_id BIGINT PRIMARY KEY,
@@ -231,9 +243,17 @@ CREATE TABLE IF NOT EXISTS automatic_message_settings (
     next_send_at TIMESTAMPTZ NOT NULL,
     next_message_index INTEGER NOT NULL DEFAULT 0
         CHECK (next_message_index >= 0),
+    message_order BIGINT[] NOT NULL DEFAULT ARRAY[]::BIGINT[],
+    last_message_id BIGINT,
     updated_by BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE automatic_message_settings
+ADD COLUMN IF NOT EXISTS message_order BIGINT[] NOT NULL DEFAULT ARRAY[]::BIGINT[];
+
+ALTER TABLE automatic_message_settings
+ADD COLUMN IF NOT EXISTS last_message_id BIGINT;
 
 CREATE INDEX IF NOT EXISTS automatic_message_settings_due_index
 ON automatic_message_settings (next_send_at)
@@ -441,6 +461,29 @@ def _question_events_with_rewards(event_rows, reward_rows) -> list[dict]:
         )
         events.append(event)
     return events
+
+
+def next_random_message_id(
+    message_ids: list[int],
+    pending_ids: list[int],
+    last_message_id: int | None,
+) -> tuple[int, list[int]]:
+    valid_ids = set(message_ids)
+    remaining = [message_id for message_id in pending_ids if message_id in valid_ids]
+    if not remaining:
+        remaining = list(message_ids)
+        random.shuffle(remaining)
+        if (
+            len(remaining) > 1
+            and remaining[0] == last_message_id
+        ):
+            swap_index = random.randrange(1, len(remaining))
+            remaining[0], remaining[swap_index] = (
+                remaining[swap_index],
+                remaining[0],
+            )
+    selected_id = remaining.pop(0)
+    return selected_id, remaining
 
 
 class Database:
@@ -1970,7 +2013,9 @@ class Database:
         guild_id: int,
         user_id: int,
         name_key: str,
+        discount_percent: int = 0,
     ) -> dict | None:
+        discount_percent = max(0, min(100, discount_percent))
         async with self._pool().acquire() as connection:
             async with connection.transaction():
                 ticket = await connection.fetchrow(
@@ -1984,6 +2029,9 @@ class Database:
                 )
                 if ticket is None:
                     return None
+                effective_price = (
+                    ticket["price"] * (100 - discount_percent) // 100
+                )
                 await connection.execute(
                     """
                     INSERT INTO balances (guild_id, user_id, balance)
@@ -2002,7 +2050,7 @@ class Database:
                     """,
                     guild_id,
                     user_id,
-                    ticket["price"],
+                    effective_price,
                 )
                 if new_balance is None:
                     return {"status": "insufficient"}
@@ -2023,7 +2071,9 @@ class Database:
                 return {
                     "status": "purchased",
                     "name": ticket["name"],
-                    "price": ticket["price"],
+                    "price": effective_price,
+                    "original_price": ticket["price"],
+                    "discount_percent": discount_percent,
                     "new_balance": new_balance,
                     "quantity": quantity,
                     "active": ticket["active"],
@@ -2034,7 +2084,9 @@ class Database:
         guild_id: int,
         user_id: int,
         name_key: str,
+        discount_percent: int = 0,
     ) -> dict | None:
+        discount_percent = max(0, min(100, discount_percent))
         async with self._pool().acquire() as connection:
             async with connection.transaction():
                 modifier = await connection.fetchrow(
@@ -2048,6 +2100,9 @@ class Database:
                 )
                 if modifier is None:
                     return None
+                effective_price = (
+                    modifier["price"] * (100 - discount_percent) // 100
+                )
                 await connection.execute(
                     """
                     INSERT INTO balances (guild_id, user_id, balance)
@@ -2066,7 +2121,7 @@ class Database:
                     """,
                     guild_id,
                     user_id,
-                    modifier["price"],
+                    effective_price,
                 )
                 if new_balance is None:
                     return {"status": "insufficient"}
@@ -2087,7 +2142,9 @@ class Database:
                 return {
                     "status": "purchased",
                     "name": modifier["name"],
-                    "price": modifier["price"],
+                    "price": effective_price,
+                    "original_price": modifier["price"],
+                    "discount_percent": discount_percent,
                     "new_balance": new_balance,
                     "quantity": quantity,
                 }
@@ -2985,6 +3042,7 @@ class Database:
             SELECT settings.guild_id, settings.channel_id,
                    settings.interval_minutes, settings.enabled,
                    settings.next_send_at, settings.next_message_index,
+                   settings.message_order, settings.last_message_id,
                    settings.updated_by, settings.updated_at,
                    (
                        SELECT COUNT(*)
@@ -3101,7 +3159,17 @@ class Database:
                         SET next_send_at = NOW() + (
                                 interval_minutes * INTERVAL '1 minute'
                             ),
-                            next_message_index = 0
+                            next_message_index = 0,
+                            message_order = ARRAY[]::BIGINT[]
+                        WHERE guild_id = $1
+                        """,
+                        guild_id,
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE automatic_message_settings
+                        SET message_order = ARRAY[]::BIGINT[]
                         WHERE guild_id = $1
                         """,
                         guild_id,
@@ -3179,7 +3247,18 @@ class Database:
                     await connection.execute(
                         """
                         UPDATE automatic_message_settings
-                        SET next_message_index = 0
+                        SET next_message_index = 0,
+                            message_order = ARRAY[]::BIGINT[],
+                            last_message_id = NULL
+                        WHERE guild_id = $1
+                        """,
+                        guild_id,
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE automatic_message_settings
+                        SET message_order = ARRAY[]::BIGINT[]
                         WHERE guild_id = $1
                         """,
                         guild_id,
@@ -3194,7 +3273,8 @@ class Database:
                     """
                     SELECT settings.guild_id, settings.channel_id,
                            settings.interval_minutes,
-                           settings.next_message_index
+                           settings.message_order,
+                           settings.last_message_id
                     FROM automatic_message_settings AS settings
                     WHERE settings.enabled = TRUE
                       AND settings.next_send_at <= NOW()
@@ -3221,14 +3301,21 @@ class Database:
                     )
                     if not messages:
                         continue
-                    selected_index = (
-                        settings["next_message_index"] % len(messages)
+                    messages_by_id = {
+                        message["id"]: message for message in messages
+                    }
+                    selected_id, pending_ids = next_random_message_id(
+                        list(messages_by_id),
+                        list(settings["message_order"]),
+                        settings["last_message_id"],
                     )
-                    selected = messages[selected_index]
+                    selected = messages_by_id[selected_id]
                     schedule = await connection.fetchrow(
                         """
                         UPDATE automatic_message_settings
-                        SET next_message_index = $2,
+                        SET next_message_index = 0,
+                            message_order = $2::BIGINT[],
+                            last_message_id = $3,
                             next_send_at = NOW() + (
                                 interval_minutes * INTERVAL '1 minute'
                             )
@@ -3236,7 +3323,8 @@ class Database:
                         RETURNING next_send_at
                         """,
                         settings["guild_id"],
-                        (selected_index + 1) % len(messages),
+                        pending_ids,
+                        selected_id,
                     )
                     claimed.append(
                         {
@@ -3253,9 +3341,80 @@ class Database:
     async def get_log_settings(self, guild_id: int):
         return await self._pool().fetchrow(
             """
-            SELECT log_channel_id, logs_enabled, coin_emoji, whitelist_emoji
+            SELECT log_channel_id, logs_enabled, coin_emoji, whitelist_emoji,
+                   whitelist_discount_percent
             FROM guild_settings
             WHERE guild_id = $1
+            """,
+            guild_id,
+        )
+
+    async def get_whitelist_discount(
+        self,
+        guild_id: int,
+        user_id: int,
+        role_ids: list[int],
+    ) -> int:
+        return int(
+            await self._pool().fetchval(
+                """
+                SELECT CASE
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM whitelist_entries
+                        WHERE guild_id = $1
+                          AND (
+                              (target_type = 'member' AND target_id = $2)
+                              OR (
+                                  target_type = 'role'
+                                  AND target_id = ANY($3::BIGINT[])
+                              )
+                          )
+                    )
+                    THEN COALESCE(
+                        (
+                            SELECT whitelist_discount_percent
+                            FROM guild_settings
+                            WHERE guild_id = $1
+                        ),
+                        0
+                    )
+                    ELSE 0
+                END
+                """,
+                guild_id,
+                user_id,
+                role_ids,
+            )
+            or 0
+        )
+
+    async def set_whitelist_discount(
+        self,
+        guild_id: int,
+        discount_percent: int,
+    ) -> None:
+        await self._pool().execute(
+            """
+            INSERT INTO guild_settings (
+                guild_id, whitelist_discount_percent
+            )
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET
+                whitelist_discount_percent = EXCLUDED.whitelist_discount_percent
+            """,
+            guild_id,
+            discount_percent,
+        )
+
+    async def list_object_section_settings(self, guild_id: int):
+        return await self._pool().fetch(
+            """
+            SELECT section, enabled, disabled_reason, admins_bypass
+            FROM object_section_settings
+            WHERE guild_id = $1
+            ORDER BY section
             """,
             guild_id,
         )
