@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS ticket_inventory (
 CREATE TABLE IF NOT EXISTS active_modifiers (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
+    owner_user_id BIGINT,
     modifier_id BIGINT NOT NULL REFERENCES modifiers(id) ON DELETE CASCADE,
     channel_id BIGINT,
     expires_at TIMESTAMPTZ NOT NULL,
@@ -127,6 +128,9 @@ ADD COLUMN IF NOT EXISTS channel_id BIGINT;
 
 ALTER TABLE active_modifiers
 ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 5;
+
+ALTER TABLE active_modifiers
+ADD COLUMN IF NOT EXISTS owner_user_id BIGINT;
 
 CREATE INDEX IF NOT EXISTS active_modifiers_expiration_index
 ON active_modifiers (expires_at);
@@ -144,6 +148,14 @@ ADD COLUMN IF NOT EXISTS coin_emoji TEXT;
 
 ALTER TABLE guild_settings
 ADD COLUMN IF NOT EXISTS whitelist_emoji TEXT;
+
+CREATE TABLE IF NOT EXISTS object_section_settings (
+    guild_id BIGINT NOT NULL,
+    section TEXT NOT NULL CHECK (section IN ('badges', 'modifiers', 'tickets')),
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    disabled_reason TEXT,
+    PRIMARY KEY (guild_id, section)
+);
 
 CREATE TABLE IF NOT EXISTS ticket_admins (
     guild_id BIGINT NOT NULL,
@@ -857,26 +869,56 @@ class Database:
         user_id: int,
         name_key: str,
     ) -> dict | None:
-        row = await self._pool().fetchrow(
-            """
-            UPDATE ticket_inventory AS inventory
-            SET quantity = inventory.quantity - 1
-            FROM tickets AS ticket
-            WHERE inventory.guild_id = $1
-              AND inventory.user_id = $2
-              AND inventory.quantity > 0
-              AND ticket.id = inventory.ticket_id
-              AND ticket.guild_id = $1
-              AND ticket.name_key = $3
-              AND ticket.active = TRUE
-            RETURNING ticket.id, ticket.name, ticket.description,
-                      inventory.quantity
-            """,
-            guild_id,
-            user_id,
-            name_key,
-        )
-        return dict(row) if row is not None else None
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    INSERT INTO object_section_settings (
+                        guild_id, section, enabled, disabled_reason
+                    )
+                    VALUES ($1, 'tickets', TRUE, NULL)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    guild_id,
+                )
+                section = await connection.fetchrow(
+                    """
+                    SELECT enabled, disabled_reason
+                    FROM object_section_settings
+                    WHERE guild_id = $1 AND section = 'tickets'
+                    FOR SHARE
+                    """,
+                    guild_id,
+                )
+                if not section["enabled"]:
+                    return {
+                        "status": "disabled",
+                        "reason": section["disabled_reason"],
+                    }
+                row = await connection.fetchrow(
+                    """
+                    UPDATE ticket_inventory AS inventory
+                    SET quantity = inventory.quantity - 1
+                    FROM tickets AS ticket
+                    WHERE inventory.guild_id = $1
+                      AND inventory.user_id = $2
+                      AND inventory.quantity > 0
+                      AND ticket.id = inventory.ticket_id
+                      AND ticket.guild_id = $1
+                      AND ticket.name_key = $3
+                      AND ticket.active = TRUE
+                    RETURNING ticket.id, ticket.name, ticket.description,
+                              inventory.quantity
+                    """,
+                    guild_id,
+                    user_id,
+                    name_key,
+                )
+                if row is None:
+                    return None
+                result = dict(row)
+                result["status"] = "consumed"
+                return result
 
     async def purchase_ticket(
         self,
@@ -1015,6 +1057,30 @@ class Database:
     ) -> dict:
         async with self._pool().acquire() as connection:
             async with connection.transaction():
+                await connection.execute(
+                    """
+                    INSERT INTO object_section_settings (
+                        guild_id, section, enabled, disabled_reason
+                    )
+                    VALUES ($1, 'modifiers', TRUE, NULL)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    guild_id,
+                )
+                section = await connection.fetchrow(
+                    """
+                    SELECT enabled, disabled_reason
+                    FROM object_section_settings
+                    WHERE guild_id = $1 AND section = 'modifiers'
+                    FOR SHARE
+                    """,
+                    guild_id,
+                )
+                if section is not None and not section["enabled"]:
+                    return {
+                        "status": "disabled",
+                        "reason": section["disabled_reason"],
+                    }
                 active = await connection.fetchrow(
                     """
                     SELECT m.name, a.expires_at
@@ -1067,17 +1133,18 @@ class Database:
                 expires_at = await connection.fetchval(
                     """
                     INSERT INTO active_modifiers (
-                        guild_id, user_id, modifier_id, channel_id, expires_at,
-                        duration_minutes
+                        guild_id, user_id, owner_user_id, modifier_id, channel_id,
+                        expires_at, duration_minutes
                     )
                     VALUES (
-                        $1, $2, $3, $4,
-                        NOW() + ($5::INTEGER * INTERVAL '1 minute'), $5
+                        $1, $2, $3, $4, $5,
+                        NOW() + ($6::INTEGER * INTERVAL '1 minute'), $6
                     )
                     RETURNING expires_at
                     """,
                     guild_id,
                     target_user_id,
+                    owner_user_id,
                     inventory["modifier_id"],
                     channel_id,
                     inventory["duration_minutes"],
@@ -1098,31 +1165,62 @@ class Database:
         channel_id: int,
         duration_minutes: int = 5,
     ):
-        return await self._pool().fetchrow(
-            """
-            INSERT INTO active_modifiers (
-                guild_id, user_id, modifier_id, channel_id, expires_at,
-                last_trigger_at, duration_minutes
-            )
-            VALUES (
-                $1, $2, $3, $4,
-                NOW() + ($5::INTEGER * INTERVAL '1 minute'), NULL, $5
-            )
-            ON CONFLICT (guild_id, user_id)
-            DO UPDATE SET
-                modifier_id = EXCLUDED.modifier_id,
-                channel_id = EXCLUDED.channel_id,
-                expires_at = EXCLUDED.expires_at,
-                last_trigger_at = NULL,
-                duration_minutes = EXCLUDED.duration_minutes
-            RETURNING expires_at
-            """,
-            guild_id,
-            user_id,
-            modifier_id,
-            channel_id,
-            duration_minutes,
-        )
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    INSERT INTO object_section_settings (
+                        guild_id, section, enabled, disabled_reason
+                    )
+                    VALUES ($1, 'modifiers', TRUE, NULL)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    guild_id,
+                )
+                section = await connection.fetchrow(
+                    """
+                    SELECT enabled, disabled_reason
+                    FROM object_section_settings
+                    WHERE guild_id = $1 AND section = 'modifiers'
+                    FOR SHARE
+                    """,
+                    guild_id,
+                )
+                if not section["enabled"]:
+                    return {
+                        "status": "disabled",
+                        "reason": section["disabled_reason"],
+                    }
+                activation = await connection.fetchrow(
+                    """
+                    INSERT INTO active_modifiers (
+                        guild_id, user_id, owner_user_id, modifier_id, channel_id,
+                        expires_at, last_trigger_at, duration_minutes
+                    )
+                    VALUES (
+                        $1, $2, NULL, $3, $4,
+                        NOW() + ($5::INTEGER * INTERVAL '1 minute'), NULL, $5
+                    )
+                    ON CONFLICT (guild_id, user_id)
+                    DO UPDATE SET
+                        modifier_id = EXCLUDED.modifier_id,
+                        owner_user_id = NULL,
+                        channel_id = EXCLUDED.channel_id,
+                        expires_at = EXCLUDED.expires_at,
+                        last_trigger_at = NULL,
+                        duration_minutes = EXCLUDED.duration_minutes
+                    RETURNING expires_at
+                    """,
+                    guild_id,
+                    user_id,
+                    modifier_id,
+                    channel_id,
+                    duration_minutes,
+                )
+                return {
+                    "status": "activated",
+                    "expires_at": activation["expires_at"],
+                }
 
     async def deactivate_modifier(self, guild_id: int, user_id: int):
         return await self._pool().fetchrow(
@@ -1140,6 +1238,81 @@ class Database:
             user_id,
         )
 
+    async def deactivate_and_refund_modifier(
+        self,
+        guild_id: int,
+        target_user_id: int,
+    ) -> dict | None:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                active = await connection.fetchrow(
+                    """
+                    SELECT active.owner_user_id, active.modifier_id,
+                           active.expires_at > NOW() AS is_active,
+                           modifier.name
+                    FROM active_modifiers AS active
+                    JOIN modifiers AS modifier ON modifier.id = active.modifier_id
+                    WHERE active.guild_id = $1 AND active.user_id = $2
+                    FOR UPDATE OF active
+                    """,
+                    guild_id,
+                    target_user_id,
+                )
+                if active is None:
+                    return None
+                await connection.execute(
+                    """
+                    DELETE FROM active_modifiers
+                    WHERE guild_id = $1 AND user_id = $2
+                    """,
+                    guild_id,
+                    target_user_id,
+                )
+                if not active["is_active"]:
+                    return {
+                        "status": "expired",
+                        "name": active["name"],
+                    }
+                if active["owner_user_id"] is None:
+                    return {
+                        "status": "deactivated_without_refund",
+                        "name": active["name"],
+                    }
+                quantity = await connection.fetchval(
+                    """
+                    INSERT INTO modifier_inventory (
+                        guild_id, user_id, modifier_id, quantity
+                    )
+                    VALUES ($1, $2, $3, 1)
+                    ON CONFLICT (guild_id, user_id, modifier_id)
+                    DO UPDATE SET quantity = modifier_inventory.quantity + 1
+                    RETURNING quantity
+                    """,
+                    guild_id,
+                    active["owner_user_id"],
+                    active["modifier_id"],
+                )
+                return {
+                    "status": "refunded",
+                    "name": active["name"],
+                    "owner_user_id": active["owner_user_id"],
+                    "quantity": quantity,
+                }
+
+    async def get_active_modifier(self, guild_id: int, user_id: int):
+        return await self._pool().fetchrow(
+            """
+            SELECT modifier.name, active.expires_at
+            FROM active_modifiers AS active
+            JOIN modifiers AS modifier ON modifier.id = active.modifier_id
+            WHERE active.guild_id = $1
+              AND active.user_id = $2
+              AND active.expires_at > NOW()
+            """,
+            guild_id,
+            user_id,
+        )
+
     async def try_trigger_modifier(
         self,
         guild_id: int,
@@ -1152,6 +1325,13 @@ class Database:
             FROM modifiers AS modifier
             WHERE active.guild_id = $1
               AND active.user_id = $2
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM object_section_settings AS section
+                  WHERE section.guild_id = active.guild_id
+                    AND section.section = 'modifiers'
+                    AND section.enabled = FALSE
+              )
               AND modifier.id = active.modifier_id
               AND active.expires_at > NOW()
               AND (
@@ -1291,6 +1471,117 @@ class Database:
             """,
             guild_id,
         )
+
+    async def get_object_section_setting(
+        self,
+        guild_id: int,
+        section: str,
+    ) -> dict:
+        row = await self._pool().fetchrow(
+            """
+            SELECT enabled, disabled_reason
+            FROM object_section_settings
+            WHERE guild_id = $1 AND section = $2
+            """,
+            guild_id,
+            section,
+        )
+        if row is None:
+            return {"enabled": True, "disabled_reason": None}
+        return dict(row)
+
+    async def toggle_object_section(
+        self,
+        guild_id: int,
+        section: str,
+        disabled_reason: str,
+    ) -> dict:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    INSERT INTO object_section_settings (
+                        guild_id, section, enabled, disabled_reason
+                    )
+                    VALUES ($1, $2, TRUE, NULL)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    guild_id,
+                    section,
+                )
+                current = await connection.fetchrow(
+                    """
+                    SELECT enabled
+                    FROM object_section_settings
+                    WHERE guild_id = $1 AND section = $2
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    section,
+                )
+                enabled = not current["enabled"]
+                await connection.execute(
+                    """
+                    UPDATE object_section_settings
+                    SET enabled = $3,
+                        disabled_reason = CASE WHEN $3 THEN NULL ELSE $4 END
+                    WHERE guild_id = $1 AND section = $2
+                    """,
+                    guild_id,
+                    section,
+                    enabled,
+                    disabled_reason,
+                )
+
+                removed = []
+                refunds = []
+                if section == "modifiers" and not enabled:
+                    removed = await connection.fetch(
+                        """
+                        WITH removed AS (
+                            DELETE FROM active_modifiers
+                            WHERE guild_id = $1
+                            RETURNING user_id, owner_user_id, modifier_id, expires_at
+                        )
+                        SELECT removed.user_id AS target_user_id,
+                               removed.owner_user_id,
+                               removed.modifier_id,
+                               modifier.name,
+                               (
+                                   removed.owner_user_id IS NOT NULL
+                                   AND removed.expires_at > NOW()
+                               ) AS refundable
+                        FROM removed
+                        JOIN modifiers AS modifier ON modifier.id = removed.modifier_id
+                        """,
+                        guild_id,
+                    )
+                    refunds = [row for row in removed if row["refundable"]]
+                    if refunds:
+                        await connection.executemany(
+                            """
+                            INSERT INTO modifier_inventory (
+                                guild_id, user_id, modifier_id, quantity
+                            )
+                            VALUES ($1, $2, $3, 1)
+                            ON CONFLICT (guild_id, user_id, modifier_id)
+                            DO UPDATE SET quantity = modifier_inventory.quantity + 1
+                            """,
+                            [
+                                (
+                                    guild_id,
+                                    row["owner_user_id"],
+                                    row["modifier_id"],
+                                )
+                                for row in refunds
+                            ],
+                        )
+                return {
+                    "enabled": enabled,
+                    "disabled_reason": None if enabled else disabled_reason,
+                    "removed": [dict(row) for row in removed],
+                    "refunds": [dict(row) for row in refunds],
+                }
 
     async def set_log_settings(
         self,
@@ -1518,10 +1809,19 @@ class Database:
         )
         active_modifiers = await self._pool().fetch(
             """
-            SELECT user_id, modifier_id, channel_id, expires_at, last_trigger_at,
-                   duration_minutes
+            SELECT user_id, owner_user_id, modifier_id, channel_id, expires_at,
+                   last_trigger_at, duration_minutes
             FROM active_modifiers WHERE guild_id = $1
             ORDER BY user_id
+            """,
+            guild_id,
+        )
+        object_section_settings = await self._pool().fetch(
+            """
+            SELECT section, enabled, disabled_reason
+            FROM object_section_settings
+            WHERE guild_id = $1
+            ORDER BY section
             """,
             guild_id,
         )
@@ -1553,6 +1853,9 @@ class Database:
             "modifier_inventory": [dict(row) for row in modifier_inventory],
             "ticket_inventory": [dict(row) for row in ticket_inventory],
             "active_modifiers": [dict(row) for row in active_modifiers],
+            "object_section_settings": [
+                dict(row) for row in object_section_settings
+            ],
             "settings": dict(settings) if settings else None,
             "ticket_admins": [dict(row) for row in ticket_admins],
             "whitelist_entries": [dict(row) for row in whitelist_entries],

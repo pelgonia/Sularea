@@ -31,6 +31,16 @@ MAX_MODIFIER_COOLDOWN_SECONDS = 3600
 MAX_MODIFIER_PROBABILITY_PART = 1_000_000
 DEFAULT_COIN_EMOJI = "🪙"
 DEFAULT_WHITELIST_EMOJI = "⭐"
+OBJECT_SECTION_LABELS = {
+    "badges": "insignias",
+    "modifiers": "modificadores",
+    "tickets": "tickets",
+}
+OBJECT_SECTION_SUBJECTS = {
+    "badges": "Las insignias",
+    "modifiers": "Los modificadores",
+    "tickets": "Los tickets",
+}
 
 
 def normalize_name(value: str) -> str:
@@ -450,35 +460,28 @@ async def modifier_expiration_loop() -> None:
         return
     for expired in expired_modifiers:
         guild = bot.get_guild(expired["guild_id"])
-        notification = bot.modifier_notification_interactions.pop(
+        bot.modifier_notification_interactions.pop(
             (expired["guild_id"], expired["user_id"]),
             None,
         )
-        notified_privately = False
-        if notification is not None:
-            try:
-                await notification.followup.send(
-                    f"Tu modificador **{expired['name']}** terminó después de "
-                    f"{expired['duration_minutes']} minutos.",
-                    ephemeral=True,
-                )
-                notified_privately = True
-            except discord.HTTPException:
-                pass
-        if not notified_privately and guild is not None and expired["channel_id"] is not None:
+        if guild is not None and expired["channel_id"] is not None:
             channel = guild.get_channel(expired["channel_id"]) or guild.get_thread(
                 expired["channel_id"]
             )
             if channel is not None and hasattr(channel, "send"):
+                member = guild.get_member(expired["user_id"])
+                member_name = (
+                    discord.utils.escape_mentions(
+                        discord.utils.escape_markdown(member.display_name)
+                    )
+                    if member is not None
+                    else f"Usuario {expired['user_id']}"
+                )
                 try:
                     await channel.send(
-                        f"<@{expired['user_id']}>, tu modificador "
-                        f"**{expired['name']}** terminó.",
-                        allowed_mentions=discord.AllowedMentions(
-                            everyone=False,
-                            users=True,
-                            roles=False,
-                        ),
+                        f"El modificador **{expired['name']}** de "
+                        f"**{member_name}** terminó.",
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                 except discord.HTTPException:
                     pass
@@ -801,6 +804,22 @@ async def find_ticket(interaction: discord.Interaction, name: str):
     if interaction.guild_id is None:
         return None
     return await bot.db.get_ticket(interaction.guild_id, normalize_name(name))
+
+
+def disabled_object_section_text(section: str, reason: str | None) -> str:
+    subject = OBJECT_SECTION_SUBJECTS[section]
+    detail = (reason or "Mantenimiento temporal.").strip()
+    return f"{subject} no se pueden usar temporalmente.\n**Razón:** {detail}"
+
+
+async def object_section_disabled_message(
+    guild_id: int,
+    section: str,
+) -> str | None:
+    setting = await bot.db.get_object_section_setting(guild_id, section)
+    if setting["enabled"]:
+        return None
+    return disabled_object_section_text(section, setting["disabled_reason"])
 
 
 async def member_is_whitelisted(member: discord.Member) -> bool:
@@ -1816,6 +1835,11 @@ async def activate_owned_modifier(
         modifier_name_key,
         interaction.channel_id,
     )
+    if result["status"] == "disabled":
+        return False, disabled_object_section_text(
+            "modifiers",
+            result.get("reason"),
+        )
     if result["status"] == "missing":
         return False, "No tienes ese modificador en tu inventario."
     if result["status"] == "already_active":
@@ -2010,6 +2034,13 @@ async def usar(
             if ticket is None:
                 await answer(interaction, "Ese objeto no existe.")
                 return
+            disabled_message = await object_section_disabled_message(
+                guild.id,
+                "tickets",
+            )
+            if disabled_message is not None:
+                await answer(interaction, disabled_message)
+                return
             if not ticket["active"]:
                 await answer(
                     interaction,
@@ -2069,7 +2100,23 @@ async def usar(
                 member.id,
                 ticket["name_key"],
             )
+            if result is not None and result.get("status") == "disabled":
+                await answer(
+                    interaction,
+                    disabled_object_section_text(
+                        "tickets",
+                        result.get("reason"),
+                    ),
+                )
+                return
             if result is None:
+                disabled_message = await object_section_disabled_message(
+                    guild.id,
+                    "tickets",
+                )
+                if disabled_message is not None:
+                    await answer(interaction, disabled_message)
+                    return
                 latest_ticket = await find_ticket(interaction, objeto)
                 if latest_ticket is not None and not latest_ticket["active"]:
                     await answer(
@@ -2132,6 +2179,13 @@ async def usar(
                 f"contactado. Te quedan **{result['quantity']}**.",
             )
             return
+        disabled_message = await object_section_disabled_message(
+            guild.id,
+            "modifiers",
+        )
+        if disabled_message is not None:
+            await answer(interaction, disabled_message)
+            return
         target = miembro or member
         if target.bot:
             await answer(interaction, "No puedes aplicar un modificador a un bot.")
@@ -2151,6 +2205,13 @@ async def usar(
             view=view,
             ephemeral=True,
         )
+        return
+    disabled_message = await object_section_disabled_message(
+        guild.id,
+        "badges",
+    )
+    if disabled_message is not None:
+        await answer(interaction, disabled_message)
         return
     if miembro is not None:
         await answer(
@@ -4277,13 +4338,115 @@ async def borrarobjeto(interaction: discord.Interaction, objeto: str) -> None:
 
 
 @bot.tree.command(
+    name="estadoobjetos",
+    description="Activa o desactiva temporalmente una sección completa de objetos.",
+)
+@app_commands.describe(
+    seccion="Sección cuyo estado quieres alternar",
+    razon="Motivo que verán los usuarios mientras esté desactivada",
+)
+@app_commands.choices(
+    seccion=[
+        app_commands.Choice(name="Insignias", value="badges"),
+        app_commands.Choice(name="Modificadores", value="modifiers"),
+        app_commands.Choice(name="Tickets", value="tickets"),
+    ]
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def estadoobjetos(
+    interaction: discord.Interaction,
+    seccion: app_commands.Choice[str],
+    razon: str | None = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    cleaned_reason = (razon or "Mantenimiento temporal.").strip()
+    if len(cleaned_reason) > 500:
+        await answer(interaction, "La razón puede tener hasta 500 caracteres.")
+        return
+    await interaction.response.defer()
+    result = await bot.db.toggle_object_section(
+        guild.id,
+        seccion.value,
+        cleaned_reason,
+    )
+    label = OBJECT_SECTION_LABELS[seccion.value]
+    if result["enabled"]:
+        action = "object_section_enable"
+        description = f"Reactivó la sección de {label}."
+        audit_description = (
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Sección:** {label.capitalize()}\n"
+            "**Nuevo estado:** Activa"
+        )
+        response = f"Activé nuevamente la sección de **{label}**. Ya se pueden usar."
+        color = 0x22C55E
+    else:
+        action = "object_section_disable"
+        description = f"Desactivó la sección de {label}. Razón: {cleaned_reason}"
+        removed = result["removed"]
+        refunds = result["refunds"]
+        for row in removed:
+            bot.modifier_notification_interactions.pop(
+                (guild.id, row["target_user_id"]),
+                None,
+            )
+        for row in refunds:
+            await bot.db.record_movement(
+                guild.id,
+                row["owner_user_id"],
+                interaction.user.id,
+                "modifier_section_refund",
+                None,
+                f"Recibió 1 unidad de {row['name']} porque se desactivaron "
+                "temporalmente los modificadores.",
+            )
+        modifier_summary = (
+            f"\n**Activaciones canceladas:** {len(removed)}"
+            f"\n**Unidades reembolsadas:** {len(refunds)}"
+            if seccion.value == "modifiers"
+            else ""
+        )
+        audit_description = (
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Sección:** {label.capitalize()}\n"
+            "**Nuevo estado:** Inactiva\n"
+            f"**Razón:** {cleaned_reason}"
+            f"{modifier_summary}"
+        )
+        response = (
+            f"Desactivé temporalmente la sección de **{label}**.\n"
+            f"**Razón:** {cleaned_reason}"
+            f"{modifier_summary}"
+        )
+        color = 0xEF4444
+    await bot.db.record_movement(
+        guild.id,
+        None,
+        interaction.user.id,
+        action,
+        None,
+        description,
+    )
+    await send_audit_log(
+        guild,
+        "Estado de sección de objetos",
+        audit_description,
+        color=color,
+    )
+    await answer(interaction, response)
+
+
+@bot.tree.command(
     name="estadomodificador",
-    description="Activa o desactiva un modificador para un miembro.",
+    description="Alterna el modificador activo de un miembro.",
 )
 @app_commands.describe(
     miembro="Miembro cuyo modificador quieres cambiar",
-    activado="Activa o desactiva el modificador",
-    modificador="Modificador que se activará; solo es necesario al activar",
+    modificador="Se exige únicamente cuando el miembro no tiene uno activo",
 )
 @app_commands.autocomplete(modificador=modifier_autocomplete)
 @app_commands.guild_only()
@@ -4292,7 +4455,6 @@ async def borrarobjeto(interaction: discord.Interaction, objeto: str) -> None:
 async def estadomodificador(
     interaction: discord.Interaction,
     miembro: discord.Member,
-    activado: bool,
     modificador: str | None = None,
 ) -> None:
     guild = interaction.guild
@@ -4300,147 +4462,276 @@ async def estadomodificador(
         return
 
     notification_key = (guild.id, miembro.id)
-    if activado:
-        if not modificador or not modificador.strip():
+    active = await bot.db.get_active_modifier(guild.id, miembro.id)
+    if active is not None:
+        deactivated = await bot.db.deactivate_modifier(guild.id, miembro.id)
+        bot.modifier_notification_interactions.pop(notification_key, None)
+        if deactivated is None:
             await answer(
                 interaction,
-                "Debes elegir un modificador cuando seleccionas **activado: Sí**.",
+                "El estado del modificador cambió al mismo tiempo. Intenta nuevamente.",
             )
             return
-        item = await find_modifier(interaction, modificador)
-        if item is None:
-            await answer(interaction, "Ese modificador no existe.")
-            return
-        activation = await bot.db.force_activate_modifier(
-            guild.id,
-            miembro.id,
-            item["id"],
-            interaction.channel_id,
-            item["duration_minutes"],
-        )
-        bot.modifier_notification_interactions.pop(notification_key, None)
-        expires_at = activation["expires_at"]
         await bot.db.record_movement(
             guild.id,
             miembro.id,
             interaction.user.id,
-            "modifier_admin_activate",
+            "modifier_admin_deactivate",
             None,
-            f"Un administrador activó {item['name']} durante "
-            f"{item['duration_minutes']} minutos.",
+            f"Un administrador desactivó {deactivated['name']}.",
         )
         await send_audit_log(
             guild,
-            "Modificador activado por administrador",
+            "Modificador desactivado por administrador",
             f"**Administrador:** {interaction.user.mention}\n"
             f"**Miembro:** {miembro.mention}\n"
-            f"**Modificador:** {item['name']}\n"
-            f"**Finaliza:** <t:{int(expires_at.timestamp())}:R>\n"
-            "No se descontó ninguna unidad del inventario.",
-            color=0xA855F7,
+            f"**Modificador:** {deactivated['name']}",
+            color=0xEF4444,
         )
         await answer(
             interaction,
-            f"Activaste **{item['name']}** para {miembro.mention} durante "
-            f"**{item['duration_minutes']} minutos**. "
-            f"Finaliza <t:{int(expires_at.timestamp())}:R>. "
-            "No se descontó de su inventario.",
+            f"Desactivaste **{deactivated['name']}** para {miembro.mention}.",
         )
         return
 
-    deactivated = await bot.db.deactivate_modifier(guild.id, miembro.id)
-    bot.modifier_notification_interactions.pop(notification_key, None)
-    if deactivated is None:
-        await answer(interaction, f"{miembro.mention} no tiene un modificador activo.")
+    if not modificador or not modificador.strip():
+        await answer(
+            interaction,
+            f"{miembro.mention} no tiene un modificador activo. Debes elegir cuál activar.",
+        )
         return
+    disabled_message = await object_section_disabled_message(
+        guild.id,
+        "modifiers",
+    )
+    if disabled_message is not None:
+        await answer(interaction, disabled_message)
+        return
+    item = await find_modifier(interaction, modificador)
+    if item is None:
+        await answer(interaction, "Ese modificador no existe.")
+        return
+    activation = await bot.db.force_activate_modifier(
+        guild.id,
+        miembro.id,
+        item["id"],
+        interaction.channel_id,
+        item["duration_minutes"],
+    )
+    if activation["status"] == "disabled":
+        await answer(
+            interaction,
+            disabled_object_section_text(
+                "modifiers",
+                activation.get("reason"),
+            ),
+        )
+        return
+    bot.modifier_notification_interactions.pop(notification_key, None)
+    expires_at = activation["expires_at"]
     await bot.db.record_movement(
         guild.id,
         miembro.id,
         interaction.user.id,
-        "modifier_admin_deactivate",
+        "modifier_admin_activate",
         None,
-        f"Un administrador desactivó {deactivated['name']}.",
+        f"Un administrador activó {item['name']} durante "
+        f"{item['duration_minutes']} minutos.",
     )
     await send_audit_log(
         guild,
-        "Modificador desactivado por administrador",
+        "Modificador activado por administrador",
         f"**Administrador:** {interaction.user.mention}\n"
         f"**Miembro:** {miembro.mention}\n"
-        f"**Modificador:** {deactivated['name']}",
-        color=0xEF4444,
+        f"**Modificador:** {item['name']}\n"
+        f"**Finaliza:** <t:{int(expires_at.timestamp())}:R>\n"
+        "No se descontó ninguna unidad del inventario.",
+        color=0xA855F7,
     )
     await answer(
         interaction,
-        f"Desactivaste **{deactivated['name']}** para {miembro.mention}.",
+        f"Activaste **{item['name']}** para {miembro.mention} durante "
+        f"**{item['duration_minutes']} minutos**. "
+        f"Finaliza <t:{int(expires_at.timestamp())}:R>. "
+        "No se descontó de su inventario.",
+    )
+
+
+@bot.tree.command(
+    name="reembolsarmodificador",
+    description="Quita un modificador activo y devuelve la unidad a quien la gastó.",
+)
+@app_commands.describe(miembro="Miembro que tiene activo el modificador")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def reembolsarmodificador(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    await interaction.response.defer()
+    result = await bot.db.deactivate_and_refund_modifier(guild.id, miembro.id)
+    if result is None:
+        await answer(interaction, f"{miembro.mention} no tiene un modificador activo.")
+        return
+    bot.modifier_notification_interactions.pop((guild.id, miembro.id), None)
+    if result["status"] == "expired":
+        await answer(
+            interaction,
+            f"**{result['name']}** ya había terminado para {miembro.mention}. "
+            "Retiré el registro pendiente, pero no correspondía un reembolso.",
+        )
+        return
+    if result["status"] == "deactivated_without_refund":
+        await bot.db.record_movement(
+            guild.id,
+            miembro.id,
+            interaction.user.id,
+            "modifier_admin_remove_without_refund",
+            None,
+            f"Retiró {result['name']}; la activación no había consumido una unidad.",
+        )
+        await send_audit_log(
+            guild,
+            "Modificador retirado sin reembolso",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Miembro afectado:** {miembro.mention}\n"
+            f"**Modificador:** {result['name']}\n"
+            "La activación no tenía un propietario de consumo registrado.",
+            color=0xF59E0B,
+        )
+        await answer(
+            interaction,
+            f"Retiré **{result['name']}** de {miembro.mention}. No devolví ninguna "
+            "unidad porque esa activación no había consumido un objeto del inventario.",
+        )
+        return
+
+    owner_id = result["owner_user_id"]
+    owner = guild.get_member(owner_id)
+    owner_label = owner.mention if owner is not None else f"<@{owner_id}>"
+    await bot.db.record_movement(
+        guild.id,
+        owner_id,
+        interaction.user.id,
+        "modifier_admin_refund",
+        None,
+        f"Recibió 1 unidad de {result['name']} tras retirar el efecto de "
+        f"{miembro}.",
+    )
+    await send_audit_log(
+        guild,
+        "Modificador retirado y reembolsado",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Miembro afectado:** {miembro.mention}\n"
+        f"**Modificador:** {result['name']}\n"
+        f"**Reembolso para:** {owner_label}\n"
+        f"**Cantidad actual:** {result['quantity']}",
+        color=0x22C55E,
+    )
+    await answer(
+        interaction,
+        f"Retiré **{result['name']}** de {miembro.mention} y devolví **1 unidad** "
+        f"a {owner_label}. Ahora tiene **{result['quantity']}**.",
     )
 
 
 @bot.tree.command(name="ayuda", description="Muestra la guía de comandos de Sularea.")
+@app_commands.describe(admin="Muestra únicamente la ayuda administrativa")
 @app_commands.guild_only()
-async def ayuda(interaction: discord.Interaction) -> None:
+async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
     member = guild_member(interaction)
+    if admin and (
+        member is None or not member.guild_permissions.administrator
+    ):
+        await answer(
+            interaction,
+            "Solo los administradores pueden abrir la sección administrativa de ayuda.",
+            ephemeral=True,
+        )
+        return
     embed = discord.Embed(
-        title="Ayuda de Sularea",
+        title="Ayuda administrativa de Sularea" if admin else "Ayuda de Sularea",
         description=(
-            "Participa en eventos para conseguir monedas, insignias, modificadores y tickets. "
-            "Responde directamente al mensaje de cada pregunta. Después puedes "
-            "comprar y activar roles de color especiales."
+            "Configuración y administración del mercado, objetos, eventos y registros."
+            if admin
+            else (
+                "Participa en eventos para conseguir monedas, insignias, modificadores "
+                "y tickets. Responde directamente al mensaje de cada pregunta. "
+                "Después puedes comprar y activar roles de color especiales."
+            )
         ),
-        color=0x8B5CF6,
+        color=0xEF4444 if admin else 0x8B5CF6,
     )
     if interaction.guild is not None and interaction.guild.icon is not None:
         embed.set_thumbnail(url=interaction.guild.icon.url)
-    embed.add_field(
-        name="Inventario y objetos",
-        value=(
-            "`/inventario [miembro]` — Ver insignias y consumibles; consultar a otro "
-            "miembro requiere Administrador.\n"
-            "`/usar objeto [miembro]` — Activar una insignia, consumir un ticket o "
-            "aplicar un modificador a ti u otra persona.\n"
-            "`/quitar` — Quitar tu color sin perder insignias."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Monedas y mercado",
-        value=(
-            "`/balance` — Consultar tus monedas.\n"
-            "`/historial` — Ver tus últimos 10 movimientos.\n"
-            "`/ranking` — Ver los balances más altos.\n"
-            "`/tienda` — Abrir el mercado por apartados.\n"
-            "`/comprar objeto` — Comprar por nombre; un ticket inactivo pide "
-            "confirmación privada."
-        ),
-        inline=False,
-    )
-    if member is not None and member.guild_permissions.administrator:
+    if admin:
         embed.add_field(
-            name="Administración",
+            name="Objetos e inventarios",
             value=(
                 "`/inventario [miembro]` · `/objetos` · `/mensajes`\n"
                 "`/darobjeto` · `/quitarobjeto` · `/borrarobjeto`\n"
-                "`/configurarinsignia` · `/configurarmodificador` · `/configurarticket`\n"
-                "`/editar` · `/editarmensajes` · `/estadomodificador`\n"
-                "`/añadiradmin` · `/quitaradmin` · `/admins`\n"
-                "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`\n"
-                "`/revisarbalance` · `/modificarbalance`\n"
-                "`/eventopregunta` · `/cancelarevento`\n"
-                "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`"
-                "\n`/configurarmoneda` · `/configuraremojiwhitelist`"
+                "`/estadoobjetos sección [razón]` · `/estadomodificador`\n"
+                "`/reembolsarmodificador miembro`"
             ),
             inline=False,
         )
         embed.add_field(
-            name="Probabilidad de modificadores",
+            name="Configuración de objetos",
             value=(
-                "En `/configurarmodificador` y `/editar`, escribe `25` para 25% "
-                "o `1/4` para la misma probabilidad. El cooldown se indica en "
-                "segundos y la duración en minutos. Usa `/editarmensajes` para "
-                "añadir, reemplazar o quitar mensajes individuales."
+                "`/configurarinsignia` · `/configurarmodificador` · `/configurarticket`\n"
+                "`/editar` · `/editarmensajes`\n"
+                "`/añadiradmin` · `/quitaradmin` · `/admins`\n"
+                "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`"
             ),
             inline=False,
         )
-    embed.set_footer(text="Los comandos administrativos requieren permiso de Administrador.")
+        embed.add_field(
+            name="Economía, eventos y servidor",
+            value=(
+                "`/revisarbalance` · `/modificarbalance`\n"
+                "`/eventopregunta` · `/cancelarevento`\n"
+                "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`\n"
+                "`/configurarmoneda` · `/configuraremojiwhitelist`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Notas de modificadores",
+            value=(
+                "`/estadomodificador miembro [modificador]` desactiva el efecto si el "
+                "miembro ya tiene uno; si no, exige elegir cuál activar. En la "
+                "probabilidad puedes usar `25` o `1/4`."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="Sección disponible únicamente para administradores.")
+    else:
+        embed.add_field(
+            name="Inventario y objetos",
+            value=(
+                "`/inventario` — Ver tus insignias y consumibles.\n"
+                "`/usar objeto [miembro]` — Activar una insignia, consumir un ticket o "
+                "aplicar un modificador a ti u otra persona.\n"
+                "`/quitar` — Quitar tu color sin perder insignias."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Monedas y mercado",
+            value=(
+                "`/balance` — Consultar tus monedas.\n"
+                "`/historial` — Ver tus últimos 10 movimientos.\n"
+                "`/ranking` — Ver los balances más altos.\n"
+                "`/tienda` — Abrir el mercado por apartados.\n"
+                "`/comprar objeto` — Comprar por nombre; un ticket inactivo pide "
+                "confirmación privada."
+            ),
+            inline=False,
+        )
     await answer(interaction, embed=embed)
 
 
