@@ -215,7 +215,8 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     logs_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     coin_emoji TEXT,
     whitelist_emoji TEXT,
-    whitelist_discount_percent INTEGER NOT NULL DEFAULT 0
+    whitelist_discount_percent INTEGER NOT NULL DEFAULT 0,
+    whitelist_event_multiplier_percent INTEGER NOT NULL DEFAULT 100
 );
 
 ALTER TABLE guild_settings
@@ -233,6 +234,17 @@ DROP CONSTRAINT IF EXISTS guild_settings_whitelist_discount_check;
 ALTER TABLE guild_settings
 ADD CONSTRAINT guild_settings_whitelist_discount_check
 CHECK (whitelist_discount_percent BETWEEN 0 AND 100);
+
+ALTER TABLE guild_settings
+ADD COLUMN IF NOT EXISTS whitelist_event_multiplier_percent INTEGER
+NOT NULL DEFAULT 100;
+
+ALTER TABLE guild_settings
+DROP CONSTRAINT IF EXISTS guild_settings_whitelist_event_multiplier_check;
+
+ALTER TABLE guild_settings
+ADD CONSTRAINT guild_settings_whitelist_event_multiplier_check
+CHECK (whitelist_event_multiplier_percent BETWEEN 100 AND 1000);
 
 CREATE TABLE IF NOT EXISTS automatic_message_settings (
     guild_id BIGINT PRIMARY KEY,
@@ -484,6 +496,11 @@ def next_random_message_id(
             )
     selected_id = remaining.pop(0)
     return selected_id, remaining
+
+
+def multiplied_coin_reward(reward: int, multiplier_percent: int) -> int:
+    safe_multiplier = max(100, min(1000, multiplier_percent))
+    return (reward * safe_multiplier + 50) // 100
 
 
 class Database:
@@ -3342,7 +3359,8 @@ class Database:
         return await self._pool().fetchrow(
             """
             SELECT log_channel_id, logs_enabled, coin_emoji, whitelist_emoji,
-                   whitelist_discount_percent
+                   whitelist_discount_percent,
+                   whitelist_event_multiplier_percent
             FROM guild_settings
             WHERE guild_id = $1
             """,
@@ -3406,6 +3424,26 @@ class Database:
             """,
             guild_id,
             discount_percent,
+        )
+
+    async def set_whitelist_event_multiplier(
+        self,
+        guild_id: int,
+        multiplier_percent: int,
+    ) -> None:
+        await self._pool().execute(
+            """
+            INSERT INTO guild_settings (
+                guild_id, whitelist_event_multiplier_percent
+            )
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET
+                whitelist_event_multiplier_percent =
+                    EXCLUDED.whitelist_event_multiplier_percent
+            """,
+            guild_id,
+            multiplier_percent,
         )
 
     async def list_object_section_settings(self, guild_id: int):
@@ -4025,6 +4063,7 @@ class Database:
         message_id: int,
         winner_id: int,
         expected_badge_role_ids: dict[int, int] | None = None,
+        winner_role_ids: list[int] | None = None,
     ) -> dict | None:
         async with self._pool().acquire() as connection:
             async with connection.transaction():
@@ -4116,6 +4155,48 @@ class Database:
                                     "reward_objects": reward_objects,
                                 }
 
+                whitelist_source = None
+                multiplier_percent = 100
+                awarded_reward = event["reward"]
+                if event["reward"] > 0:
+                    whitelist_source = await connection.fetchrow(
+                        """
+                        SELECT target_type, target_id
+                        FROM whitelist_entries
+                        WHERE guild_id = $1
+                          AND (
+                              (target_type = 'member' AND target_id = $2)
+                              OR (
+                                  target_type = 'role'
+                                  AND target_id = ANY($3::BIGINT[])
+                              )
+                          )
+                        ORDER BY
+                            CASE WHEN target_type = 'role' THEN 0 ELSE 1 END,
+                            target_id
+                        LIMIT 1
+                        """,
+                        guild_id,
+                        winner_id,
+                        winner_role_ids or [],
+                    )
+                    if whitelist_source is not None:
+                        multiplier_percent = int(
+                            await connection.fetchval(
+                                """
+                                SELECT whitelist_event_multiplier_percent
+                                FROM guild_settings
+                                WHERE guild_id = $1
+                                """,
+                                guild_id,
+                            )
+                            or 100
+                        )
+                        awarded_reward = multiplied_coin_reward(
+                            event["reward"],
+                            multiplier_percent,
+                        )
+
                 new_balance = None
                 if event["reward"] > 0:
                     new_balance = await connection.fetchval(
@@ -4128,7 +4209,7 @@ class Database:
                         """,
                         guild_id,
                         winner_id,
-                        event["reward"],
+                        awarded_reward,
                     )
 
                 new_quantities = []
@@ -4169,6 +4250,15 @@ class Database:
                         }
                     )
 
+                multiplier_description = ""
+                if awarded_reward > event["reward"]:
+                    multiplier_value = (
+                        f"{multiplier_percent / 100:.2f}".rstrip("0").rstrip(".")
+                    )
+                    multiplier_description = (
+                        f" (premio base: {event['reward']}, "
+                        f"multiplicador whitelist: {multiplier_value}x)"
+                    )
                 await connection.execute(
                     """
                     DELETE FROM active_question_events
@@ -4179,8 +4269,8 @@ class Database:
                 )
 
                 description_parts = []
-                if event["reward"] > 0:
-                    formatted_reward = f"{event['reward']:,}".replace(",", ".")
+                if awarded_reward > 0:
+                    formatted_reward = f"{awarded_reward:,}".replace(",", ".")
                     coin_emoji = await connection.fetchval(
                         "SELECT coin_emoji FROM guild_settings WHERE guild_id = $1",
                         guild_id,
@@ -4205,19 +4295,32 @@ class Database:
                     event["created_by"],
                     "event_object_reward" if reward_objects else "event_reward",
                     (
-                        event["reward"]
+                        awarded_reward
                         if event["reward"] > 0
                         else sum(row["quantity"] for row in reward_objects)
                     ),
                     (
                         "Ganó un evento de pregunta y recibió "
-                        f"{', '.join(description_parts)}: {event['question']}"
+                        f"{', '.join(description_parts)}{multiplier_description}: "
+                        f"{event['question']}"
                     ),
                 )
                 return {
                     "status": "claimed",
                     **dict(event),
                     "reward_objects": reward_objects,
+                    "awarded_reward": awarded_reward,
+                    "whitelist_multiplier_percent": multiplier_percent,
+                    "whitelist_source_type": (
+                        whitelist_source["target_type"]
+                        if whitelist_source is not None
+                        else None
+                    ),
+                    "whitelist_source_id": (
+                        whitelist_source["target_id"]
+                        if whitelist_source is not None
+                        else None
+                    ),
                     "new_balance": new_balance,
                     "new_quantities": new_quantities,
                 }

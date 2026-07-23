@@ -297,6 +297,15 @@ def shop_price_text(
     )
 
 
+def format_multiplier(multiplier_percent: int) -> str:
+    whole, decimals = divmod(multiplier_percent, 100)
+    if decimals == 0:
+        return f"{whole}×"
+    if decimals % 10 == 0:
+        return f"{whole}.{decimals // 10}×"
+    return f"{whole}.{decimals:02d}×"
+
+
 def whitelist_marker(guild_id: int | None = None) -> str:
     if guild_id is None:
         return DEFAULT_WHITELIST_EMOJI
@@ -2207,6 +2216,7 @@ async def process_question_reply(message: discord.Message) -> None:
                 winner = await message.guild.fetch_member(message.author.id)
             except (discord.HTTPException, discord.NotFound):
                 return
+        winner_role_ids_before_reward = [role.id for role in winner.roles]
 
         badge_rewards = [
             reward_object
@@ -2284,6 +2294,7 @@ async def process_question_reply(message: discord.Message) -> None:
                 event["message_id"],
                 winner.id,
                 expected_badge_role_ids,
+                winner_role_ids_before_reward,
             )
         except Exception:
             for added_badge_role in added_badge_roles:
@@ -2322,8 +2333,34 @@ async def process_question_reply(message: discord.Message) -> None:
             result,
             f"✅ Ganado por {message.author.mention}.",
         )
-        reward_text = question_event_reward_text(message.guild, result)
+        reward_text = question_reward_text(
+            message.guild,
+            result["awarded_reward"],
+            result["reward_objects"],
+        )
         result_details = []
+        bonus_detail = None
+        if result["awarded_reward"] > result["reward"]:
+            multiplier_label = format_multiplier(
+                result["whitelist_multiplier_percent"]
+            )
+            if result["whitelist_source_type"] == "role":
+                source_role = message.guild.get_role(
+                    result["whitelist_source_id"]
+                )
+                source_text = (
+                    f"por tener el rol {source_role.mention} en la whitelist"
+                    if source_role is not None
+                    else "por un rol configurado en la whitelist"
+                )
+            else:
+                source_text = "por estar añadido directamente a la whitelist"
+            bonus_detail = (
+                f"✨ Recibió **{money(result['awarded_reward'], message.guild.id)}** "
+                f"en vez de **{money(result['reward'], message.guild.id)}** gracias "
+                f"al multiplicador **{multiplier_label}** {source_text}."
+            )
+            result_details.append(bonus_detail)
         if result["new_balance"] is not None:
             result_details.append(
                 "Su nuevo balance es "
@@ -2358,7 +2395,12 @@ async def process_question_reply(message: discord.Message) -> None:
             f"**Pregunta:** {result['question']}\n"
             f"**Respuesta correcta:** {result['answer_text']}\n"
             f"**Recompensa:** {reward_text}\n"
-            f"**Canal:** {message.channel.mention}",
+            + (
+                f"**Bono de whitelist:** {bonus_detail}\n"
+                if bonus_detail is not None
+                else ""
+            )
+            + f"**Canal:** {message.channel.mention}",
             color=0x22C55E,
         )
 
@@ -3927,6 +3969,58 @@ async def configurardescuentowhitelist(
     )
 
 
+@bot.tree.command(
+    name="configurarmultiplicadorwhitelist",
+    description="Configura el multiplicador de monedas de eventos para la whitelist.",
+)
+@app_commands.describe(
+    multiplicador="Multiplicador entre 1 y 10; por ejemplo 1.5 o 2",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configurarmultiplicadorwhitelist(
+    interaction: discord.Interaction,
+    multiplicador: app_commands.Range[float, 1.0, 10.0],
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    multiplier_percent = max(100, min(1000, round(multiplicador * 100)))
+    multiplier_label = format_multiplier(multiplier_percent)
+    await bot.db.set_whitelist_event_multiplier(
+        interaction.guild_id,
+        multiplier_percent,
+    )
+    bot.invalidate_log_settings(interaction.guild_id)
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "whitelist_event_multiplier_config",
+        None,
+        f"Configuró el multiplicador de eventos de whitelist en {multiplier_label}.",
+    )
+    await send_audit_log(
+        guild,
+        "Multiplicador de eventos configurado",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Multiplicador:** {multiplier_label}\n"
+        f"**Estado:** {'Activo' if multiplier_percent > 100 else 'Desactivado'}",
+        color=0xEC4899,
+    )
+    await answer(
+        interaction,
+        (
+            f"El multiplicador de monedas para la whitelist ahora es "
+            f"**{multiplier_label}**."
+            if multiplier_percent > 100
+            else "El multiplicador de eventos quedó en **1×**, sin bono adicional."
+        ),
+    )
+
+
 @bot.tree.command(name="configurarregistro", description="Configura el canal de movimientos.")
 @app_commands.describe(
     activado="Activa o desactiva el registro de movimientos",
@@ -4539,10 +4633,16 @@ async def whitelist(interaction: discord.Interaction) -> None:
     discount_percent = (
         settings["whitelist_discount_percent"] if settings is not None else 0
     )
+    multiplier_percent = (
+        settings["whitelist_event_multiplier_percent"]
+        if settings is not None
+        else 100
+    )
     embed.set_footer(
         text=(
             f"{len(rows)} entradas configuradas · "
-            f"Descuento de tienda: {discount_percent}%"
+            f"Descuento de tienda: {discount_percent}% · "
+            f"Multiplicador de eventos: {format_multiplier(multiplier_percent)}"
         )
     )
     await answer(interaction, embed=embed)
@@ -4591,6 +4691,11 @@ async def configuracion(interaction: discord.Interaction) -> None:
     discount_percent = (
         settings["whitelist_discount_percent"] if settings is not None else 0
     )
+    event_multiplier_percent = (
+        settings["whitelist_event_multiplier_percent"]
+        if settings is not None
+        else 100
+    )
     embed = discord.Embed(
         title="Configuración actual de Sularea",
         color=0x5865F2,
@@ -4604,6 +4709,8 @@ async def configuracion(interaction: discord.Interaction) -> None:
             f"**Emoji de moneda:** {coin_emoji}\n"
             f"**Emoji whitelist:** {configured_whitelist_emoji}\n"
             f"**Descuento whitelist:** {discount_percent}%\n"
+            f"**Multiplicador en eventos:** "
+            f"{format_multiplier(event_multiplier_percent)}\n"
             f"**Entradas whitelist:** {len(whitelist_entries)}"
         ),
         inline=False,
@@ -7354,7 +7461,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/editar` · `/editarmensajes`\n"
                 "`/añadiradmin` · `/quitaradmin` · `/admins`\n"
                 "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`\n"
-                "`/configurardescuentowhitelist`"
+                "`/configurardescuentowhitelist`\n"
+                "`/configurarmultiplicadorwhitelist`"
             ),
             inline=False,
         )
@@ -7377,6 +7485,7 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/eventopregunta` permite combinar **monedas** con hasta "
                 "**tres objetos distintos**. La cantidad puede ser mayor para "
                 "modificadores y tickets; las insignias siempre entregan una. "
+                "El multiplicador de whitelist solo aumenta las monedas. "
                 "Al finalizar se revela la respuesta correcta."
             ),
             inline=False,
@@ -7413,7 +7522,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/tienda` — Abrir el mercado por categorías.\n"
                 "`/comprar objeto` — Comprar por nombre; un ticket inactivo pide "
                 "confirmación privada.\n"
-                "La whitelist puede tener un descuento configurado para todo el mercado."
+                "La whitelist puede tener descuento en el mercado y multiplicador "
+                "de monedas al ganar eventos."
             ),
             inline=False,
         )
