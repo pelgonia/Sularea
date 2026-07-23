@@ -1120,6 +1120,31 @@ async def find_ticket(interaction: discord.Interaction, name: str):
     return await bot.db.get_ticket(interaction.guild_id, normalize_name(name))
 
 
+def duplicate_object_name(source_name: str, copy_number: int = 1) -> str:
+    suffix = (
+        " (DUPLICADO)"
+        if copy_number == 1
+        else f" {copy_number} (DUPLICADO)"
+    )
+    base = source_name.strip()[: 100 - len(suffix)].rstrip()
+    return f"{base or 'Objeto'}{suffix}"
+
+
+async def next_duplicate_object_name(
+    guild_id: int,
+    source_name: str,
+) -> str | None:
+    for copy_number in range(1, 101):
+        candidate = duplicate_object_name(source_name, copy_number)
+        existing = await bot.db.get_configured_object(
+            guild_id,
+            normalize_name(candidate),
+        )
+        if existing is None:
+            return candidate
+    return None
+
+
 async def find_shop_category(interaction: discord.Interaction, name: str):
     if interaction.guild_id is None:
         return None
@@ -4178,85 +4203,25 @@ async def darobjeto(
 
 @bot.tree.command(
     name="quitarobjeto",
-    description="Retira un objeto a un miembro o elimina una categoría.",
+    description="Retira un objeto del inventario de un miembro.",
 )
 @app_commands.describe(
-    miembro="Miembro que perderá el objeto; no se usa para categorías",
+    miembro="Miembro que perderá el objeto",
     objeto="Elige primero al miembro; solo aparecen los objetos que posee",
-    categoria="Categoría que se eliminará; sus objetos pasarán a General",
     cantidad="Cantidad; para insignias debe ser 1",
 )
-@app_commands.autocomplete(
-    objeto=removable_object_autocomplete,
-    categoria=category_autocomplete,
-)
+@app_commands.autocomplete(objeto=removable_object_autocomplete)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def quitarobjeto(
     interaction: discord.Interaction,
-    miembro: discord.Member | None = None,
-    objeto: str | None = None,
-    categoria: str | None = None,
+    miembro: discord.Member,
+    objeto: str,
     cantidad: app_commands.Range[int, 1, 1000] = 1,
 ) -> None:
     guild = interaction.guild
     if guild is None:
-        return
-    if categoria is not None:
-        if miembro is not None or objeto is not None:
-            await answer(
-                interaction,
-                "Para eliminar una categoría, deja vacíos **miembro** y **objeto**.",
-            )
-            return
-        category = await find_shop_category(interaction, categoria)
-        if category is None:
-            await answer(
-                interaction,
-                "Esa categoría no existe. **General** solo puede quitarse si fue "
-                "configurada expresamente.",
-            )
-            return
-        await interaction.response.defer()
-        deleted = await bot.db.delete_shop_category(
-            guild.id,
-            category["name_key"],
-        )
-        if deleted is None:
-            await answer(interaction, "Esa categoría ya no existe.")
-            return
-        affected = deleted["affected_items"]
-        await bot.db.record_movement(
-            guild.id,
-            None,
-            interaction.user.id,
-            "shop_category_config_delete",
-            None,
-            f"Eliminó la categoría {deleted['name']}; {affected} objetos pasaron a General.",
-        )
-        await send_audit_log(
-            guild,
-            "Categoría eliminada",
-            f"**Administrador:** {interaction.user.mention}\n"
-            f"**Categoría:** {deleted['name']}\n"
-            f"**Objetos enviados a General:** {affected}",
-            color=0xEF4444,
-        )
-        await answer(
-            interaction,
-            f"Eliminé la categoría **{deleted['name']}**. "
-            f"**{affected}** objeto{'s' if affected != 1 else ''} "
-            f"{'pasaron' if affected != 1 else 'pasó'} a **General**.",
-        )
-        return
-
-    if miembro is None or objeto is None:
-        await answer(
-            interaction,
-            "Para retirar un objeto indica **miembro** y **objeto**; para eliminar "
-            "una categoría usa la opción **categoria**.",
-        )
         return
     badge = await find_badge(interaction, objeto)
     modifier = None if badge is not None else await find_modifier(interaction, objeto)
@@ -5691,14 +5656,80 @@ class DeleteObjectConfirmView(discord.ui.View):
         self.stop()
 
 
-@bot.tree.command(name="borrarobjeto", description="Borra un objeto configurado.")
-@app_commands.describe(objeto="Insignia, modificador o ticket que se borrará")
-@app_commands.autocomplete(objeto=deletable_object_autocomplete)
+@bot.tree.command(
+    name="borrarobjeto",
+    description="Borra un objeto configurado o una categoría de la tienda.",
+)
+@app_commands.describe(
+    objeto="Insignia, modificador o ticket que se borrará",
+    categoria="Categoría que se borrará; sus objetos pasarán a General",
+)
+@app_commands.autocomplete(
+    objeto=deletable_object_autocomplete,
+    categoria=category_autocomplete,
+)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def borrarobjeto(interaction: discord.Interaction, objeto: str) -> None:
+async def borrarobjeto(
+    interaction: discord.Interaction,
+    objeto: str | None = None,
+    categoria: str | None = None,
+) -> None:
     assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    if (objeto is None) == (categoria is None):
+        await answer(
+            interaction,
+            "Elige exactamente una opción: **objeto** o **categoria**.",
+        )
+        return
+    if categoria is not None:
+        category = await find_shop_category(interaction, categoria)
+        if category is None:
+            await answer(
+                interaction,
+                "Esa categoría no existe. **General** solo puede borrarse si fue "
+                "configurada expresamente.",
+            )
+            return
+        await interaction.response.defer()
+        deleted = await bot.db.delete_shop_category(
+            guild.id,
+            category["name_key"],
+        )
+        if deleted is None:
+            await answer(interaction, "Esa categoría ya no existe.")
+            return
+        affected = deleted["affected_items"]
+        await bot.db.record_movement(
+            guild.id,
+            None,
+            interaction.user.id,
+            "shop_category_config_delete",
+            None,
+            f"Eliminó la categoría {deleted['name']}; "
+            f"{affected} objetos pasaron a General.",
+        )
+        await send_audit_log(
+            guild,
+            "Categoría eliminada",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Categoría:** {deleted['name']}\n"
+            f"**Objetos enviados a General:** {affected}",
+            color=0xEF4444,
+        )
+        await answer(
+            interaction,
+            f"Eliminé la categoría **{deleted['name']}**. "
+            f"**{affected}** objeto{'s' if affected != 1 else ''} "
+            f"{'pasaron' if affected != 1 else 'pasó'} a **General**.",
+        )
+        return
+
+    assert objeto is not None
     badge = await find_badge(interaction, objeto)
     modifier = None if badge is not None else await find_modifier(interaction, objeto)
     ticket = (
@@ -5733,6 +5764,186 @@ async def borrarobjeto(interaction: discord.Interaction, objeto: str) -> None:
         "creadas directamente por un administrador no reciben reembolso.",
         view=view,
         ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="duplicar",
+    description="Duplica la configuración de una insignia, modificador o ticket.",
+)
+@app_commands.describe(objeto="Objeto configurado que se duplicará")
+@app_commands.autocomplete(objeto=deletable_object_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def duplicar(interaction: discord.Interaction, objeto: str) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    current = await bot.db.get_configured_object(
+        interaction.guild_id,
+        normalize_name(objeto),
+    )
+    if current is None:
+        await answer(interaction, "Ese objeto no existe.")
+        return
+    duplicated_name = await next_duplicate_object_name(
+        interaction.guild_id,
+        current["name"],
+    )
+    if duplicated_name is None:
+        await answer(
+            interaction,
+            "Ya existen demasiados duplicados de ese objeto. Renombra o borra uno "
+            "antes de intentarlo otra vez.",
+        )
+        return
+
+    item_type = current["item_type"]
+    original_badge_role = None
+    color_role = None
+    if item_type == "badge":
+        original_badge_role = guild.get_role(current["badge_role_id"])
+        color_role = guild.get_role(current["color_role_id"])
+        if original_badge_role is None or color_role is None:
+            await answer(
+                interaction,
+                "No puedo duplicar esa insignia porque uno de sus roles ya no existe.",
+            )
+            return
+
+    await interaction.response.defer()
+    duplicated_badge_role: discord.Role | None = None
+
+    async def remove_duplicated_role() -> None:
+        if duplicated_badge_role is None:
+            return
+        try:
+            await duplicated_badge_role.delete(
+                reason="Se revirtió la duplicación de una insignia",
+            )
+        except discord.HTTPException:
+            traceback.print_exc()
+
+    if original_badge_role is not None:
+        role_kwargs = {
+            "name": duplicate_object_name(original_badge_role.name),
+            "permissions": original_badge_role.permissions,
+            "colour": original_badge_role.colour,
+            "hoist": original_badge_role.hoist,
+            "mentionable": original_badge_role.mentionable,
+            "reason": f"Insignia duplicada por {interaction.user}",
+        }
+        secondary_colour = getattr(
+            original_badge_role,
+            "secondary_colour",
+            None,
+        )
+        tertiary_colour = getattr(
+            original_badge_role,
+            "tertiary_colour",
+            None,
+        )
+        if secondary_colour is not None:
+            role_kwargs["secondary_colour"] = secondary_colour
+        if tertiary_colour is not None:
+            role_kwargs["tertiary_colour"] = tertiary_colour
+        display_icon = getattr(original_badge_role, "display_icon", None)
+        if isinstance(display_icon, str):
+            role_kwargs["display_icon"] = display_icon
+        try:
+            duplicated_badge_role = await guild.create_role(**role_kwargs)
+        except discord.HTTPException:
+            await answer(
+                interaction,
+                "No pude crear el nuevo rol de insignia. Revisa mi permiso "
+                "**Gestionar roles**.",
+            )
+            return
+        if role_can_be_managed(original_badge_role):
+            try:
+                moved_role = await duplicated_badge_role.edit(
+                    position=original_badge_role.position,
+                    reason="Colocar el rol duplicado junto al original",
+                )
+                if moved_role is not None:
+                    duplicated_badge_role = moved_role
+            except discord.HTTPException:
+                pass
+
+    try:
+        result = await bot.db.duplicate_configured_object(
+            interaction.guild_id,
+            item_type,
+            current["name_key"],
+            duplicated_name,
+            normalize_name(duplicated_name),
+            (
+                duplicated_badge_role.id
+                if duplicated_badge_role is not None
+                else None
+            ),
+        )
+    except asyncpg.UniqueViolationError:
+        await remove_duplicated_role()
+        await answer(
+            interaction,
+            "El nombre o el rol del duplicado entró en conflicto con otro objeto.",
+        )
+        return
+    except Exception:
+        await remove_duplicated_role()
+        raise
+
+    if result["status"] != "duplicated":
+        await remove_duplicated_role()
+        await answer(
+            interaction,
+            (
+                "Ese objeto ya no existe."
+                if result["status"] == "not_found"
+                else "El nombre del duplicado ya está ocupado. Intenta nuevamente."
+            ),
+        )
+        return
+
+    type_label = {
+        "badge": "insignia",
+        "modifier": "modificador",
+        "ticket": "ticket",
+    }[item_type]
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        f"{item_type}_config_duplicate",
+        None,
+        f"Duplicó el {type_label} {current['name']} como {duplicated_name}.",
+    )
+    role_details = (
+        f"\n**Nuevo rol de insignia:** {duplicated_badge_role.name} "
+        f"(`{duplicated_badge_role.id}`)"
+        f"\n**Rol de color conservado:** {color_role.name} (`{color_role.id}`)"
+        if duplicated_badge_role is not None and color_role is not None
+        else ""
+    )
+    await send_audit_log(
+        guild,
+        "Objeto duplicado",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Tipo:** {type_label.capitalize()}\n"
+        f"**Original:** {current['name']}\n"
+        f"**Duplicado:** {duplicated_name}"
+        f"{role_details}",
+        color=0x3B82F6,
+    )
+    await answer(
+        interaction,
+        f"Dupliqué el {type_label} **{current['name']}** como "
+        f"**{duplicated_name}**.{role_details}\n"
+        "Puedes cambiar su configuración con `/editar`. No se copiaron "
+        "propietarios ni unidades de inventario.",
     )
 
 
@@ -6411,7 +6622,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
             name="Objetos e inventarios",
             value=(
                 "`/inventario [miembro]` · `/objetos` · `/mensajes`\n"
-                "`/darobjeto` · `/quitarobjeto` · `/borrarobjeto`\n"
+                "`/darobjeto` · `/quitarobjeto miembro objeto [cantidad]`\n"
+                "`/duplicar objeto` · `/borrarobjeto [objeto/categoría]`\n"
                 "`/estadoobjetos sección permitir_admins [razón]`\n"
                 "`/estadomodificador` · `/reembolsarmodificador [miembro/canal]`"
             ),

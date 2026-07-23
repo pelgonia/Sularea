@@ -836,20 +836,23 @@ class Database:
     async def get_configured_object(self, guild_id: int, name_key: str):
         return await self._pool().fetchrow(
             """
-            SELECT item_type, id, name, name_key, emoji, badge_role_id
+            SELECT item_type, id, name, name_key, emoji, badge_role_id,
+                   color_role_id
             FROM (
                 SELECT 'badge'::TEXT AS item_type, id, name, name_key, emoji,
-                       badge_role_id
+                       badge_role_id, color_role_id
                 FROM badges
                 WHERE guild_id = $1 AND name_key = $2
                 UNION ALL
                 SELECT 'modifier'::TEXT AS item_type, id, name, name_key, emoji,
-                       NULL::BIGINT AS badge_role_id
+                       NULL::BIGINT AS badge_role_id,
+                       NULL::BIGINT AS color_role_id
                 FROM modifiers
                 WHERE guild_id = $1 AND name_key = $2
                 UNION ALL
                 SELECT 'ticket'::TEXT AS item_type, id, name, name_key, emoji,
-                       NULL::BIGINT AS badge_role_id
+                       NULL::BIGINT AS badge_role_id,
+                       NULL::BIGINT AS color_role_id
                 FROM tickets
                 WHERE guild_id = $1 AND name_key = $2
             ) AS configured
@@ -858,6 +861,111 @@ class Database:
             guild_id,
             name_key,
         )
+
+    async def duplicate_configured_object(
+        self,
+        guild_id: int,
+        item_type: str,
+        source_name_key: str,
+        new_name: str,
+        new_name_key: str,
+        new_badge_role_id: int | None = None,
+    ) -> dict:
+        if item_type not in {"badge", "modifier", "ticket"}:
+            raise ValueError("Tipo de objeto no válido.")
+
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                name_exists = await connection.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM badges
+                        WHERE guild_id = $1 AND name_key = $2
+                        UNION ALL
+                        SELECT 1 FROM modifiers
+                        WHERE guild_id = $1 AND name_key = $2
+                        UNION ALL
+                        SELECT 1 FROM tickets
+                        WHERE guild_id = $1 AND name_key = $2
+                    )
+                    """,
+                    guild_id,
+                    new_name_key,
+                )
+                if name_exists:
+                    return {"status": "name_exists"}
+
+                if item_type == "badge":
+                    if new_badge_role_id is None:
+                        raise ValueError(
+                            "La insignia duplicada necesita un rol de propiedad nuevo."
+                        )
+                    duplicated = await connection.fetchrow(
+                        """
+                        INSERT INTO badges (
+                            guild_id, name, name_key, badge_role_id,
+                            color_role_id, purchasable, price, shop_section,
+                            emoji, whitelist_enabled
+                        )
+                        SELECT guild_id, $3, $4, $5, color_role_id, purchasable,
+                               price, shop_section, emoji, whitelist_enabled
+                        FROM badges
+                        WHERE guild_id = $1 AND name_key = $2
+                        RETURNING *
+                        """,
+                        guild_id,
+                        source_name_key,
+                        new_name,
+                        new_name_key,
+                        new_badge_role_id,
+                    )
+                elif item_type == "modifier":
+                    duplicated = await connection.fetchrow(
+                        """
+                        INSERT INTO modifiers (
+                            guild_id, name, name_key, purchasable, price,
+                            shop_section, emoji, messages, trigger_numerator,
+                            trigger_denominator, cooldown_seconds,
+                            duration_minutes, effect_scope
+                        )
+                        SELECT guild_id, $3, $4, purchasable, price,
+                               shop_section, emoji, messages, trigger_numerator,
+                               trigger_denominator, cooldown_seconds,
+                               duration_minutes, effect_scope
+                        FROM modifiers
+                        WHERE guild_id = $1 AND name_key = $2
+                        RETURNING *
+                        """,
+                        guild_id,
+                        source_name_key,
+                        new_name,
+                        new_name_key,
+                    )
+                else:
+                    duplicated = await connection.fetchrow(
+                        """
+                        INSERT INTO tickets (
+                            guild_id, name, name_key, purchasable, price,
+                            shop_section, emoji, description, active
+                        )
+                        SELECT guild_id, $3, $4, purchasable, price,
+                               shop_section, emoji, description, active
+                        FROM tickets
+                        WHERE guild_id = $1 AND name_key = $2
+                        RETURNING *
+                        """,
+                        guild_id,
+                        source_name_key,
+                        new_name,
+                        new_name_key,
+                    )
+                if duplicated is None:
+                    return {"status": "not_found"}
+                return {
+                    "status": "duplicated",
+                    "item_type": item_type,
+                    "item": dict(duplicated),
+                }
 
     async def search_shop_items(
         self,
