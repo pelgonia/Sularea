@@ -4,8 +4,10 @@ import io
 import json
 import os
 import random
+import time
 import traceback
 import unicodedata
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fractions import Fraction
 
@@ -29,8 +31,13 @@ MODIFIER_PROBABILITY = "10"
 MAX_MODIFIER_DURATION_MINUTES = 1440
 MAX_MODIFIER_COOLDOWN_SECONDS = 3600
 MAX_MODIFIER_PROBABILITY_PART = 1_000_000
+CACHE_TTL_SECONDS = 10
 DEFAULT_COIN_EMOJI = "🪙"
 DEFAULT_WHITELIST_EMOJI = "⭐"
+MODIFIER_SCOPE_LABELS = {
+    "individual": "Individual",
+    "channel": "Canal",
+}
 OBJECT_SECTION_LABELS = {
     "badges": "insignias",
     "modifiers": "modificadores",
@@ -197,6 +204,10 @@ def modifier_probability_label(numerator: int, denominator: int) -> str:
     return f"{numerator}/{denominator} ({shown_percentage}%)"
 
 
+def modifier_scope_label(scope: str) -> str:
+    return MODIFIER_SCOPE_LABELS.get(scope, "Individual")
+
+
 def answer_hash(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value)
     without_accents = "".join(
@@ -205,6 +216,45 @@ def answer_hash(value: str) -> str:
     )
     normalized = " ".join(without_accents.casefold().split())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def question_reward_text(
+    guild: discord.Guild,
+    reward_type: str,
+    reward: int,
+    reward_quantity: int = 1,
+    reward_name: str | None = None,
+    reward_emoji: str | None = None,
+) -> str:
+    if reward_type == "coins":
+        return money(reward, guild.id)
+    shown_name = reward_name or "Objeto no disponible"
+    emoji = badge_emoji(reward_emoji, guild)
+    type_label = {
+        "badge": "insignia",
+        "modifier": "modificador",
+        "ticket": "ticket",
+    }.get(reward_type, "objeto")
+    quantity = (
+        ""
+        if reward_type == "badge"
+        else f" × **{reward_quantity}**"
+    )
+    return f"{emoji}**{shown_name}**{quantity} ({type_label})"
+
+
+def question_event_reward_text(
+    guild: discord.Guild,
+    event,
+) -> str:
+    return question_reward_text(
+        guild,
+        event["reward_type"],
+        event["reward"],
+        event["reward_quantity"],
+        event["reward_name"],
+        event["reward_emoji"],
+    )
 
 
 def money(value: int, guild_id: int | None = None) -> str:
@@ -253,7 +303,7 @@ class SulareaCommandTree(app_commands.CommandTree):
         is_admin = bool(
             member is not None and member.guild_permissions.administrator
         )
-        blocker = await self.client.db.get_maintenance_block(
+        blocker = await self.client.get_maintenance_block_cached(
             interaction.guild_id,
             "all_commands",
             is_admin,
@@ -283,12 +333,22 @@ class SulareaBot(commands.Bot):
             tree_cls=SulareaCommandTree,
         )
         self.purchase_locks: dict[tuple[int, int], asyncio.Lock] = {}
+        self.purchase_lock_counts: dict[tuple[int, int], int] = {}
         self.modifier_webhooks: dict[int, discord.Webhook] = {}
         self.application_emojis: dict[int, discord.Emoji] = {}
         self.coin_emojis: dict[int, str] = {}
         self.whitelist_emojis: dict[int, str] = {}
-        self.modifier_notification_interactions: dict[
-            tuple[int, int], discord.Interaction
+        self.log_settings_cache: dict[int, tuple[float, dict | None]] = {}
+        self.maintenance_cache: dict[
+            tuple[int, str, bool],
+            tuple[float, dict | None],
+        ] = {}
+        self.active_modifier_users: set[tuple[int, int]] = set()
+        self.active_modifier_channels: set[tuple[int, int]] = set()
+        self.question_events: dict[tuple[int, int, int], dict] = {}
+        self.question_event_locks: dict[
+            tuple[int, int, int],
+            asyncio.Lock,
         ] = {}
 
     async def setup_hook(self) -> None:
@@ -300,13 +360,36 @@ class SulareaBot(commands.Bot):
             )
         self.db = Database(database_url)
         await self.db.connect()
-        coin_rows = await self.db.list_coin_emojis()
+        (
+            coin_rows,
+            whitelist_rows,
+            active_modifier_targets,
+            active_question_events,
+        ) = await asyncio.gather(
+            self.db.list_coin_emojis(),
+            self.db.list_whitelist_emojis(),
+            self.db.list_active_modifier_targets(),
+            self.db.list_active_question_events(),
+        )
         self.coin_emojis = {
             row["guild_id"]: row["coin_emoji"] for row in coin_rows
         }
-        whitelist_rows = await self.db.list_whitelist_emojis()
         self.whitelist_emojis = {
             row["guild_id"]: row["whitelist_emoji"] for row in whitelist_rows
+        }
+        self.active_modifier_users = {
+            (row["guild_id"], row["target_id"])
+            for row in active_modifier_targets
+            if row["target_kind"] == "individual"
+        }
+        self.active_modifier_channels = {
+            (row["guild_id"], row["target_id"])
+            for row in active_modifier_targets
+            if row["target_kind"] == "channel"
+        }
+        self.question_events = {
+            (row["guild_id"], row["channel_id"], row["message_id"]): dict(row)
+            for row in active_question_events
         }
         try:
             application_emojis = await self.fetch_application_emojis()
@@ -320,18 +403,113 @@ class SulareaBot(commands.Bot):
             event_expiration_loop.start()
         if not modifier_expiration_loop.is_running():
             modifier_expiration_loop.start()
+        if not state_cache_refresh_loop.is_running():
+            state_cache_refresh_loop.start()
+
+    async def get_log_settings_cached(self, guild_id: int) -> dict | None:
+        now = time.monotonic()
+        cached = self.log_settings_cache.get(guild_id)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        row = await self.db.get_log_settings(guild_id)
+        value = dict(row) if row is not None else None
+        self.log_settings_cache[guild_id] = (
+            now + CACHE_TTL_SECONDS,
+            value,
+        )
+        return value
+
+    def invalidate_log_settings(self, guild_id: int) -> None:
+        self.log_settings_cache.pop(guild_id, None)
+
+    async def get_maintenance_block_cached(
+        self,
+        guild_id: int,
+        section: str,
+        is_admin: bool,
+    ) -> dict | None:
+        now = time.monotonic()
+        key = (guild_id, section, is_admin)
+        cached = self.maintenance_cache.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        row = await self.db.get_maintenance_block(
+            guild_id,
+            section,
+            is_admin,
+        )
+        value = dict(row) if row is not None else None
+        self.maintenance_cache[key] = (
+            now + CACHE_TTL_SECONDS,
+            value,
+        )
+        return value
+
+    def invalidate_maintenance(self, guild_id: int) -> None:
+        stale_keys = [
+            key for key in self.maintenance_cache if key[0] == guild_id
+        ]
+        for key in stale_keys:
+            self.maintenance_cache.pop(key, None)
+
+    def cache_question_event(self, event: dict) -> None:
+        message_id = event.get("message_id")
+        if message_id is None:
+            return
+        stale_keys = [
+            key
+            for key in self.question_events
+            if key[0] == event["guild_id"] and key[1] == event["channel_id"]
+        ]
+        for stale_key in stale_keys:
+            self.question_events.pop(stale_key, None)
+            self.question_event_locks.pop(stale_key, None)
+        key = (event["guild_id"], event["channel_id"], message_id)
+        self.question_events[key] = event
+
+    def remove_question_event(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int | None,
+    ) -> None:
+        if message_id is None:
+            return
+        key = (guild_id, channel_id, message_id)
+        self.question_events.pop(key, None)
+        self.question_event_locks.pop(key, None)
 
     async def close(self) -> None:
         if event_expiration_loop.is_running():
             event_expiration_loop.cancel()
         if modifier_expiration_loop.is_running():
             modifier_expiration_loop.cancel()
+        if state_cache_refresh_loop.is_running():
+            state_cache_refresh_loop.cancel()
         if hasattr(self, "db"):
             await self.db.close()
         await super().close()
 
 
 bot = SulareaBot()
+
+
+@asynccontextmanager
+async def purchase_lock(guild_id: int, user_id: int):
+    key = (guild_id, user_id)
+    lock = bot.purchase_locks.setdefault(key, asyncio.Lock())
+    bot.purchase_lock_counts[key] = bot.purchase_lock_counts.get(key, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        remaining = bot.purchase_lock_counts.get(key, 1) - 1
+        if remaining <= 0:
+            bot.purchase_lock_counts.pop(key, None)
+            if bot.purchase_locks.get(key) is lock:
+                bot.purchase_locks.pop(key, None)
+        else:
+            bot.purchase_lock_counts[key] = remaining
 
 
 def guild_member(interaction: discord.Interaction) -> discord.Member | None:
@@ -357,7 +535,7 @@ async def send_audit_log(
     *,
     color: int = 0x5865F2,
 ) -> None:
-    settings = await bot.db.get_log_settings(guild.id)
+    settings = await bot.get_log_settings_cached(guild.id)
     if not settings or not settings["logs_enabled"] or not settings["log_channel_id"]:
         return
     channel = guild.get_channel(settings["log_channel_id"])
@@ -379,7 +557,7 @@ async def send_audit_log(
 def make_question_embed(
     guild: discord.Guild,
     question: str,
-    reward: int,
+    reward_text: str,
     *,
     expires_at: datetime | None = None,
     final_status: str | None = None,
@@ -389,7 +567,7 @@ def make_question_embed(
         description=question,
         color=0x6B7280 if final_status else 0xEC4899,
     )
-    embed.add_field(name="Recompensa", value=money(reward, guild.id))
+    embed.add_field(name="Recompensa", value=reward_text)
     if final_status is not None:
         embed.add_field(name="Finalizado", value=final_status)
         embed.set_footer(text="Este evento ya terminó.")
@@ -408,12 +586,11 @@ def make_question_embed(
 
 async def finalize_question_embed(
     guild: discord.Guild,
-    channel_id: int,
-    message_id: int | None,
-    question: str,
-    reward: int,
+    event,
     status: str,
 ) -> None:
+    channel_id = event["channel_id"]
+    message_id = event["message_id"]
     if message_id is None:
         return
     channel = guild.get_channel(channel_id) or guild.get_thread(channel_id)
@@ -424,8 +601,8 @@ async def finalize_question_embed(
         await message.edit(
             embed=make_question_embed(
                 guild,
-                question,
-                reward,
+                event["question"],
+                question_event_reward_text(guild, event),
                 final_status=status,
             )
         )
@@ -443,12 +620,22 @@ async def event_expiration_loop() -> None:
         traceback.print_exc()
         return
     for event in expired_events:
+        bot.remove_question_event(
+            event["guild_id"],
+            event["channel_id"],
+            event["message_id"],
+        )
+        movement_amount = (
+            event["reward"]
+            if event["reward_type"] == "coins"
+            else event["reward_quantity"]
+        )
         await bot.db.record_movement(
             event["guild_id"],
             None,
             event["created_by"],
             "event_expire",
-            event["reward"],
+            movement_amount,
             f"Caducó el evento de pregunta: {event['question']}",
         )
         guild = bot.get_guild(event["guild_id"])
@@ -456,10 +643,7 @@ async def event_expiration_loop() -> None:
             continue
         await finalize_question_embed(
             guild,
-            event["channel_id"],
-            event["message_id"],
-            event["question"],
-            event["reward"],
+            event,
             "⌛ Terminó sin ganador.",
         )
         channel = guild.get_channel(event["channel_id"]) or guild.get_thread(
@@ -476,7 +660,7 @@ async def event_expiration_loop() -> None:
             guild,
             "Evento de pregunta caducado",
             f"**Pregunta:** {event['question']}\n"
-            f"**Recompensa:** {money(event['reward'], guild.id)}\n"
+            f"**Recompensa:** {question_event_reward_text(guild, event)}\n"
             "Terminó sin ganador.",
             color=0x6B7280,
         )
@@ -487,20 +671,60 @@ async def before_event_expiration_loop() -> None:
     await bot.wait_until_ready()
 
 
+@tasks.loop(seconds=30)
+async def state_cache_refresh_loop() -> None:
+    if not hasattr(bot, "db"):
+        return
+    try:
+        active_targets, active_events = await asyncio.gather(
+            bot.db.list_active_modifier_targets(),
+            bot.db.list_active_question_events(),
+        )
+    except (OSError, asyncpg.PostgresError):
+        traceback.print_exc()
+        return
+    for row in active_targets:
+        key = (row["guild_id"], row["target_id"])
+        if row["target_kind"] == "individual":
+            bot.active_modifier_users.add(key)
+        else:
+            bot.active_modifier_channels.add(key)
+    now = datetime.now(timezone.utc)
+    for key, event in list(bot.question_events.items()):
+        if event["expires_at"] <= now:
+            bot.remove_question_event(*key)
+    for row in active_events:
+        key = (row["guild_id"], row["channel_id"], row["message_id"])
+        same_channel_exists = any(
+            cached_key[0] == row["guild_id"]
+            and cached_key[1] == row["channel_id"]
+            for cached_key in bot.question_events
+        )
+        if key in bot.question_events or not same_channel_exists:
+            bot.question_events[key] = dict(row)
+
+
+@state_cache_refresh_loop.before_loop
+async def before_state_cache_refresh_loop() -> None:
+    await bot.wait_until_ready()
+
+
 @tasks.loop(seconds=5)
 async def modifier_expiration_loop() -> None:
     if not hasattr(bot, "db"):
         return
     try:
-        expired_modifiers = await bot.db.pop_expired_modifiers()
+        expired_modifiers, expired_channel_modifiers = await asyncio.gather(
+            bot.db.pop_expired_modifiers(),
+            bot.db.pop_expired_channel_modifiers(),
+        )
     except (OSError, asyncpg.PostgresError):
         traceback.print_exc()
         return
     for expired in expired_modifiers:
         guild = bot.get_guild(expired["guild_id"])
-        bot.modifier_notification_interactions.pop(
-            (expired["guild_id"], expired["user_id"]),
-            None,
+        bot.active_modifier_users.discard(
+            (expired["guild_id"], expired["user_id"])
         )
         if guild is not None and expired["channel_id"] is not None:
             channel = guild.get_channel(expired["channel_id"]) or guild.get_thread(
@@ -536,6 +760,41 @@ async def modifier_expiration_loop() -> None:
                 guild,
                 "Modificador finalizado",
                 f"**Miembro:** <@{expired['user_id']}>\n"
+                f"**Modificador:** {expired['name']}",
+                color=0x6B7280,
+            )
+    for expired in expired_channel_modifiers:
+        guild = bot.get_guild(expired["guild_id"])
+        bot.active_modifier_channels.discard(
+            (expired["guild_id"], expired["channel_id"])
+        )
+        channel = (
+            guild.get_channel(expired["channel_id"])
+            if guild is not None
+            else None
+        )
+        if channel is not None and hasattr(channel, "send"):
+            try:
+                await channel.send(
+                    f"El modificador de canal **{expired['name']}** terminó.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                pass
+        await bot.db.record_movement(
+            expired["guild_id"],
+            expired["owner_user_id"],
+            expired["owner_user_id"],
+            "channel_modifier_expire",
+            None,
+            f"Terminó el modificador de canal {expired['name']} "
+            f"en el canal {expired['channel_id']}.",
+        )
+        if guild is not None:
+            await send_audit_log(
+                guild,
+                "Modificador de canal finalizado",
+                f"**Canal:** <#{expired['channel_id']}>\n"
                 f"**Modificador:** {expired['name']}",
                 color=0x6B7280,
             )
@@ -869,7 +1128,7 @@ async def object_section_disabled_message(
     is_admin = bool(
         member is not None and member.guild_permissions.administrator
     )
-    blocker = await bot.db.get_maintenance_block(
+    blocker = await bot.get_maintenance_block_cached(
         interaction.guild_id,
         section,
         is_admin,
@@ -922,13 +1181,16 @@ async def badge_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
-    rows = await bot.db.list_badges(interaction.guild_id)
     search = normalize_name(current)
+    rows = await bot.db.search_named_items(
+        interaction.guild_id,
+        "badge",
+        search,
+    )
     return [
         app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
         for row in rows
-        if search in row["name_key"]
-    ][:25]
+    ]
 
 
 async def owned_badge_autocomplete(
@@ -953,48 +1215,48 @@ async def owned_object_autocomplete(
     member = guild_member(interaction)
     if interaction.guild_id is None or member is None or not hasattr(bot, "db"):
         return []
-    badges, modifiers, tickets = await asyncio.gather(
-        bot.db.list_badges(interaction.guild_id),
-        bot.db.list_modifier_inventory(interaction.guild_id, member.id),
-        bot.db.list_ticket_inventory(interaction.guild_id, member.id),
-    )
-    owned_role_ids = {role.id for role in member.roles}
-    whitelisted = await member_is_whitelisted(member)
     search = normalize_name(current)
+    rows = await bot.db.search_owned_objects(
+        interaction.guild_id,
+        member.id,
+        [role.id for role in member.roles],
+        search,
+    )
     choices = []
-    for row in badges:
-        owns_badge = row["badge_role_id"] in owned_role_ids
-        uses_whitelist = (
-            not owns_badge and whitelisted and row["whitelist_enabled"]
-        )
-        if (owns_badge or uses_whitelist) and search in row["name_key"]:
-            marker = f"{whitelist_marker(interaction.guild_id)} " if uses_whitelist else ""
+    for row in rows:
+        if row["item_type"] == "badge":
+            marker = (
+                f"{whitelist_marker(interaction.guild_id)} "
+                if row["via_whitelist"]
+                else ""
+            )
             choices.append(
                 app_commands.Choice(
                     name=f"{marker}Insignia · {row['name']}"[:100],
                     value=row["name"][:100],
                 )
             )
-    choices.extend(
-        app_commands.Choice(
-            name=f"Modificador · {row['name']} (x{row['quantity']})"[:100],
-            value=row["name"][:100],
-        )
-        for row in modifiers
-        if search in row["name_key"]
-    )
-    choices.extend(
-        app_commands.Choice(
-            name=(
-                f"Ticket · {row['name']} (x{row['quantity']})"
-                f"{' · Inactivo' if not row['active'] else ''}"
-            )[:100],
-            value=row["name"][:100],
-        )
-        for row in tickets
-        if search in row["name_key"]
-    )
-    return choices[:25]
+        elif row["item_type"] == "modifier":
+            choices.append(
+                app_commands.Choice(
+                    name=(
+                        f"Modificador · {row['name']} "
+                        f"(x{row['quantity']})"
+                    )[:100],
+                    value=row["name"][:100],
+                )
+            )
+        else:
+            choices.append(
+                app_commands.Choice(
+                    name=(
+                        f"Ticket · {row['name']} (x{row['quantity']})"
+                        f"{' · Inactivo' if not row['active'] else ''}"
+                    )[:100],
+                    value=row["name"][:100],
+                )
+            )
+    return choices
 
 
 async def removable_object_autocomplete(
@@ -1018,38 +1280,32 @@ async def removable_object_autocomplete(
         except (discord.HTTPException, discord.NotFound):
             return []
 
-    badges, modifiers, tickets = await asyncio.gather(
-        bot.db.list_badges(interaction.guild_id),
-        bot.db.list_modifier_inventory(interaction.guild_id, member.id),
-        bot.db.list_ticket_inventory(interaction.guild_id, member.id),
-    )
-    owned_role_ids = {role.id for role in member.roles}
     search = normalize_name(current)
-    choices = [
+    rows = await bot.db.search_removable_objects(
+        interaction.guild_id,
+        member.id,
+        [role.id for role in member.roles],
+        search,
+    )
+    labels = {
+        "badge": "Insignia",
+        "modifier": "Modificador",
+        "ticket": "Ticket",
+    }
+    return [
         app_commands.Choice(
-            name=f"Insignia · {row['name']}"[:100],
+            name=(
+                f"{labels[row['item_type']]} · {row['name']}"
+                + (
+                    ""
+                    if row["item_type"] == "badge"
+                    else f" (x{row['quantity']})"
+                )
+            )[:100],
             value=row["name"][:100],
         )
-        for row in badges
-        if row["badge_role_id"] in owned_role_ids and search in row["name_key"]
+        for row in rows
     ]
-    choices.extend(
-        app_commands.Choice(
-            name=f"Modificador · {row['name']} (x{row['quantity']})"[:100],
-            value=row["name"][:100],
-        )
-        for row in modifiers
-        if search in row["name_key"]
-    )
-    choices.extend(
-        app_commands.Choice(
-            name=f"Ticket · {row['name']} (x{row['quantity']})"[:100],
-            value=row["name"][:100],
-        )
-        for row in tickets
-        if search in row["name_key"]
-    )
-    return choices[:25]
 
 
 async def modifier_autocomplete(
@@ -1057,13 +1313,16 @@ async def modifier_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
-    rows = await bot.db.list_modifiers(interaction.guild_id)
     search = normalize_name(current)
+    rows = await bot.db.search_named_items(
+        interaction.guild_id,
+        "modifier",
+        search,
+    )
     return [
         app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
         for row in rows
-        if search in row["name_key"]
-    ][:25]
+    ]
 
 
 async def modifier_message_autocomplete(
@@ -1118,13 +1377,16 @@ async def ticket_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
-    rows = await bot.db.list_tickets(interaction.guild_id)
     search = normalize_name(current)
+    rows = await bot.db.search_named_items(
+        interaction.guild_id,
+        "ticket",
+        search,
+    )
     return [
         app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
         for row in rows
-        if search in row["name_key"]
-    ][:25]
+    ]
 
 
 async def editable_object_autocomplete(
@@ -1132,55 +1394,53 @@ async def editable_object_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
-    badges = await bot.db.list_badges(interaction.guild_id)
-    modifiers = await bot.db.list_modifiers(interaction.guild_id)
-    tickets = await bot.db.list_tickets(interaction.guild_id)
-    categories = await bot.db.list_shop_categories(interaction.guild_id)
     search = normalize_name(current)
-    choices = [
+    rows = await bot.db.search_configured_objects(
+        interaction.guild_id,
+        search,
+        True,
+    )
+    labels = {
+        "badge": "Insignia",
+        "modifier": "Modificador",
+        "ticket": "Ticket",
+        "category": "Categoría",
+    }
+    return [
         app_commands.Choice(
-            name=f"Insignia · {row['name']}"[:100],
-            value=row["name"][:100],
+            name=f"{labels[row['item_type']]} · {row['name']}"[:100],
+            value=(
+                f"categoria:{row['name']}"[:100]
+                if row["item_type"] == "category"
+                else row["name"][:100]
+            ),
         )
-        for row in badges
-        if search in row["name_key"]
+        for row in rows
     ]
-    choices.extend(
-        app_commands.Choice(
-            name=f"Modificador · {row['name']}"[:100],
-            value=row["name"][:100],
-        )
-        for row in modifiers
-        if search in row["name_key"]
-    )
-    choices.extend(
-        app_commands.Choice(
-            name=f"Ticket · {row['name']}"[:100],
-            value=row["name"][:100],
-        )
-        for row in tickets
-        if search in row["name_key"]
-    )
-    choices.extend(
-        app_commands.Choice(
-            name=f"Categoría · {row['name']}"[:100],
-            value=f"categoria:{row['name']}"[:100],
-        )
-        for row in categories
-        if search in row["name_key"]
-    )
-    return choices[:25]
 
 
 async def deletable_object_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
-    choices = await editable_object_autocomplete(interaction, current)
+    if interaction.guild_id is None or not hasattr(bot, "db"):
+        return []
+    rows = await bot.db.search_configured_objects(
+        interaction.guild_id,
+        normalize_name(current),
+        False,
+    )
+    labels = {
+        "badge": "Insignia",
+        "modifier": "Modificador",
+        "ticket": "Ticket",
+    }
     return [
-        choice
-        for choice in choices
-        if not str(choice.value).startswith("categoria:")
-    ][:25]
+        app_commands.Choice(
+            name=f"{labels[row['item_type']]} · {row['name']}"[:100],
+            value=row["name"][:100],
+        )
+        for row in rows
+    ]
 
 
 async def shop_autocomplete(
@@ -1188,19 +1448,17 @@ async def shop_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
-    rows = await bot.db.list_shop_items(interaction.guild_id)
     member = guild_member(interaction)
-    owned_role_ids = {role.id for role in member.roles} if member is not None else set()
     search = normalize_name(current)
+    rows = await bot.db.search_shop_items(
+        interaction.guild_id,
+        search,
+        [role.id for role in member.roles] if member is not None else [],
+    )
     return [
         app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
         for row in rows
-        if (
-            row["item_type"] in {"modifier", "ticket"}
-            or row["badge_role_id"] not in owned_role_ids
-        )
-        and search in row["name_key"]
-    ][:25]
+    ]
 
 
 async def shop_section_autocomplete(
@@ -1208,8 +1466,12 @@ async def shop_section_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
-    rows = await bot.db.list_shop_categories(interaction.guild_id)
     search = normalize_name(current)
+    rows = await bot.db.search_named_items(
+        interaction.guild_id,
+        "category",
+        search,
+    )
     sections = {
         row["name_key"]: row["name"]
         for row in rows
@@ -1227,13 +1489,16 @@ async def category_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
-    rows = await bot.db.list_shop_categories(interaction.guild_id)
     search = normalize_name(current)
+    rows = await bot.db.search_named_items(
+        interaction.guild_id,
+        "category",
+        search,
+    )
     return [
         app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
         for row in rows
-        if search in row["name_key"]
-    ][:25]
+    ]
 
 
 async def resolve_shop_section(
@@ -1287,7 +1552,8 @@ def make_shop_embed(
             )
         elif row["item_type"] == "modifier":
             item_lines.append(
-                f"{prefix} (modificador consumible · "
+                f"{prefix} (modificador {modifier_scope_label(row['effect_scope']).lower()} "
+                "consumible · "
                 f"{row['duration_minutes']} min) — "
                 f"{money(row['price'], guild.id)}"
             )
@@ -1532,8 +1798,7 @@ async def process_purchase(
     if modifier is not None and modifier["purchasable"]:
         if not interaction.response.is_done():
             await interaction.response.defer()
-        lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
-        async with lock:
+        async with purchase_lock(guild.id, member.id):
             result = await bot.db.purchase_modifier(
                 guild.id,
                 member.id,
@@ -1592,8 +1857,7 @@ async def process_purchase(
             return
         if not interaction.response.is_done():
             await interaction.response.defer()
-        lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
-        async with lock:
+        async with purchase_lock(guild.id, member.id):
             result = await bot.db.purchase_ticket(
                 guild.id,
                 member.id,
@@ -1662,8 +1926,7 @@ async def process_purchase(
 
     if not interaction.response.is_done():
         await interaction.response.defer()
-    lock = bot.purchase_locks.setdefault((guild.id, member.id), asyncio.Lock())
-    async with lock:
+    async with purchase_lock(guild.id, member.id):
         if role in member.roles:
             await answer(interaction, "Ya tienes esa insignia.")
             return
@@ -1705,6 +1968,168 @@ async def process_purchase(
     )
 
 
+async def process_question_reply(message: discord.Message) -> None:
+    if (
+        message.guild is None
+        or message.reference is None
+        or message.reference.message_id is None
+    ):
+        return
+    key = (
+        message.guild.id,
+        message.channel.id,
+        message.reference.message_id,
+    )
+    cached_event = bot.question_events.get(key)
+    if (
+        cached_event is None
+        or answer_hash(message.content) != cached_event["answer_hash"]
+    ):
+        return
+
+    lock = bot.question_event_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        event = bot.question_events.get(key)
+        if event is None or answer_hash(message.content) != event["answer_hash"]:
+            return
+        winner = (
+            message.author
+            if isinstance(message.author, discord.Member)
+            else message.guild.get_member(message.author.id)
+        )
+        if winner is None:
+            try:
+                winner = await message.guild.fetch_member(message.author.id)
+            except (discord.HTTPException, discord.NotFound):
+                return
+
+        expected_badge_role_id = None
+        added_badge_role: discord.Role | None = None
+        badge_was_owned = False
+        if event["reward_type"] == "badge":
+            badge = await bot.db.get_badge_by_id(
+                message.guild.id,
+                event["reward_object_id"],
+            )
+            role = (
+                message.guild.get_role(badge["badge_role_id"])
+                if badge is not None
+                else None
+            )
+            if role is None:
+                await message.reply(
+                    "La respuesta es correcta, pero el rol de la insignia del premio "
+                    "ya no existe. El evento sigue activo; avisa a un administrador.",
+                    mention_author=False,
+                )
+                return
+            expected_badge_role_id = role.id
+            badge_was_owned = role in winner.roles
+            if not badge_was_owned and not role_can_be_managed(role):
+                await message.reply(
+                    "La respuesta es correcta, pero el bot no puede asignar la "
+                    "insignia del premio. El evento sigue activo; avisa a un "
+                    "administrador.",
+                    mention_author=False,
+                )
+                return
+            if not badge_was_owned:
+                try:
+                    await winner.add_roles(
+                        role,
+                        reason=f"Premio del evento: {event['question']}",
+                    )
+                except discord.HTTPException:
+                    await message.reply(
+                        "La respuesta es correcta, pero no pude entregar la insignia. "
+                        "El evento sigue activo; avisa a un administrador.",
+                        mention_author=False,
+                    )
+                    return
+                added_badge_role = role
+
+        try:
+            result = await bot.db.claim_question_event(
+                message.guild.id,
+                message.channel.id,
+                event["answer_hash"],
+                event["message_id"],
+                winner.id,
+                expected_badge_role_id,
+            )
+        except Exception:
+            if added_badge_role is not None:
+                try:
+                    await winner.remove_roles(
+                        added_badge_role,
+                        reason="La entrega del premio del evento no pudo confirmarse",
+                    )
+                except discord.HTTPException:
+                    traceback.print_exc()
+            raise
+
+        if result is None or result.get("status") != "claimed":
+            if added_badge_role is not None:
+                try:
+                    await winner.remove_roles(
+                        added_badge_role,
+                        reason="El evento ya no estaba disponible",
+                    )
+                except discord.HTTPException:
+                    traceback.print_exc()
+            if result is None:
+                bot.remove_question_event(*key)
+            else:
+                await message.reply(
+                    "La respuesta es correcta, pero el objeto configurado como premio "
+                    "ya no está disponible. El evento sigue activo; avisa a un "
+                    "administrador.",
+                    mention_author=False,
+                )
+            return
+
+        bot.remove_question_event(*key)
+        await finalize_question_embed(
+            message.guild,
+            result,
+            f"✅ Ganado por {message.author.mention}.",
+        )
+        reward_text = question_event_reward_text(message.guild, result)
+        if result["reward_type"] == "coins":
+            result_detail = (
+                f" Su nuevo balance es "
+                f"**{money(result['new_balance'], message.guild.id)}**!"
+            )
+        elif result["reward_type"] in {"modifier", "ticket"}:
+            result_detail = (
+                f" Ahora tiene **{result['new_quantity']}** unidades en su inventario."
+            )
+        else:
+            result_detail = (
+                " Ya tenía esa insignia, así que conserva una sola."
+                if badge_was_owned
+                else " La insignia ya fue añadida a sus roles."
+            )
+        await message.channel.send(
+            f"🎉 {message.author.mention} respondió correctamente y ganó "
+            f"{reward_text}.{result_detail}",
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                users=True,
+                roles=False,
+            ),
+        )
+        await send_audit_log(
+            message.guild,
+            "Evento de pregunta ganado",
+            f"**Ganador:** {message.author.mention}\n"
+            f"**Pregunta:** {result['question']}\n"
+            f"**Recompensa:** {reward_text}\n"
+            f"**Canal:** {message.channel.mention}",
+            color=0x22C55E,
+        )
+
+
 @bot.event
 async def on_ready() -> None:
     if bot.user:
@@ -1715,46 +2140,37 @@ async def on_ready() -> None:
 async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.guild is None or not hasattr(bot, "db"):
         return
-    if message.reference is not None and message.reference.message_id is not None:
-        event = await bot.db.claim_question_event(
+    try:
+        await process_question_reply(message)
+    except (OSError, asyncpg.PostgresError, discord.HTTPException):
+        traceback.print_exc()
+
+    channel_key = (message.guild.id, message.channel.id)
+    user_key = (message.guild.id, message.author.id)
+    if (
+        channel_key not in bot.active_modifier_channels
+        and user_key not in bot.active_modifier_users
+    ):
+        await bot.process_commands(message)
+        return
+    try:
+        modifier_result = await bot.db.try_trigger_message_modifier(
             message.guild.id,
             message.channel.id,
-            answer_hash(message.content),
-            message.reference.message_id,
             message.author.id,
         )
-        if event is not None:
-            await finalize_question_embed(
-                message.guild,
-                message.channel.id,
-                event["message_id"],
-                event["question"],
-                event["reward"],
-                f"✅ Ganado por {message.author.mention}.",
-            )
-            await message.channel.send(
-                f"🎉 {message.author.mention} respondió correctamente y ganó "
-                f"**{money(event['reward'], message.guild.id)}**. Su nuevo balance es "
-                f"**{money(event['new_balance'], message.guild.id)}**!"
-            )
-            await send_audit_log(
-                message.guild,
-                "Evento de pregunta ganado",
-                f"**Ganador:** {message.author.mention}\n"
-                f"**Pregunta:** {event['question']}\n"
-                f"**Recompensa:** {money(event['reward'], message.guild.id)}\n"
-                f"**Canal:** {message.channel.mention}",
-                color=0x22C55E,
-            )
-    try:
-        modifier = await bot.db.try_trigger_modifier(
-            message.guild.id,
-            message.author.id,
-        )
-        if modifier is not None and modifier["messages"]:
+        if modifier_result["channel_active"]:
+            bot.active_modifier_channels.add(channel_key)
+        else:
+            bot.active_modifier_channels.discard(channel_key)
+            if modifier_result["individual_active"]:
+                bot.active_modifier_users.add(user_key)
+            else:
+                bot.active_modifier_users.discard(user_key)
+        if modifier_result["messages"]:
             await send_modifier_webhook_message(
                 message,
-                random.choice(list(modifier["messages"])),
+                random.choice(list(modifier_result["messages"])),
             )
     except (OSError, asyncpg.PostgresError):
         traceback.print_exc()
@@ -1788,13 +2204,19 @@ async def say(interaction: discord.Interaction, mensaje: str) -> None:
     await interaction.delete_original_response()
 
 
-@bot.tree.command(name="eventopregunta", description="Crea una pregunta con recompensa.")
+@bot.tree.command(
+    name="eventopregunta",
+    description="Crea una pregunta con monedas o un objeto como recompensa.",
+)
 @app_commands.describe(
     pregunta="Pregunta o texto que se publicará",
     respuesta="Respuesta correcta (no se mostrará)",
     minutos="Minutos antes de que el evento caduque",
-    recompensa="Cantidad de monedas para el ganador",
+    recompensa="Monedas para el ganador; no se usa si eliges un objeto",
+    objeto="Insignia, modificador o ticket que recibirá el ganador",
+    cantidad="Unidades del objeto; las insignias siempre usan 1",
 )
+@app_commands.autocomplete(objeto=deletable_object_autocomplete)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -1803,19 +2225,92 @@ async def eventopregunta(
     pregunta: app_commands.Range[str, 1, 1000],
     respuesta: app_commands.Range[str, 1, 200],
     minutos: app_commands.Range[int, 1, 1440],
-    recompensa: app_commands.Range[int, 1, MAX_MONEY],
+    recompensa: app_commands.Range[int, 1, MAX_MONEY] | None = None,
+    objeto: str | None = None,
+    cantidad: app_commands.Range[int, 1, 1000] = 1,
 ) -> None:
     assert interaction.guild_id is not None and interaction.channel_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
     if not " ".join(respuesta.split()):
         await answer(interaction, "La respuesta no puede estar vacía.", ephemeral=True)
         return
+    if (recompensa is None) == (objeto is None):
+        await answer(
+            interaction,
+            "Elige exactamente una recompensa: **monedas** en `recompensa` o "
+            "un `objeto`.",
+            ephemeral=True,
+        )
+        return
+
     await interaction.response.defer(ephemeral=True)
+    reward_type = "coins"
+    reward_amount = recompensa or 0
+    reward_object_id = None
+    reward_name = None
+    reward_emoji = None
+    if objeto is None:
+        if cantidad != 1:
+            await answer(
+                interaction,
+                "La opción `cantidad` solo se usa con recompensas de objetos.",
+                ephemeral=True,
+            )
+            return
+    else:
+        badge = await find_badge(interaction, objeto)
+        modifier = (
+            None if badge is not None else await find_modifier(interaction, objeto)
+        )
+        ticket = (
+            None
+            if badge is not None or modifier is not None
+            else await find_ticket(interaction, objeto)
+        )
+        configured_object = badge or modifier or ticket
+        if configured_object is None:
+            await answer(interaction, "Ese objeto no existe.", ephemeral=True)
+            return
+        reward_type = (
+            "badge"
+            if badge is not None
+            else "modifier" if modifier is not None else "ticket"
+        )
+        if reward_type == "badge" and cantidad != 1:
+            await answer(
+                interaction,
+                "Las insignias son únicas; usa **cantidad: 1**.",
+                ephemeral=True,
+            )
+            return
+        if badge is not None:
+            badge_role = guild.get_role(badge["badge_role_id"])
+            if badge_role is None or not role_can_be_managed(badge_role):
+                await answer(
+                    interaction,
+                    "No puedo usar esa insignia como premio. Comprueba que su rol "
+                    "exista y esté debajo del rol del bot.",
+                    ephemeral=True,
+                )
+                return
+        reward_object_id = configured_object["id"]
+        reward_name = configured_object["name"]
+        reward_emoji = configured_object["emoji"]
+        reward_amount = 0
+
     expires_at = await bot.db.create_question_event(
         interaction.guild_id,
         interaction.channel_id,
         pregunta.strip(),
         answer_hash(respuesta),
-        recompensa,
+        reward_amount,
+        reward_type,
+        reward_object_id,
+        cantidad,
+        reward_name,
+        reward_emoji,
         minutos,
         interaction.user.id,
     )
@@ -1828,11 +2323,18 @@ async def eventopregunta(
         )
         return
 
-    assert interaction.guild is not None
+    reward_text = question_reward_text(
+        guild,
+        reward_type,
+        reward_amount,
+        cantidad,
+        reward_name,
+        reward_emoji,
+    )
     embed = make_question_embed(
-        interaction.guild,
+        guild,
         pregunta.strip(),
-        recompensa,
+        reward_text,
         expires_at=expires_at,
     )
     if interaction.channel is None:
@@ -1860,27 +2362,45 @@ async def eventopregunta(
             content="No pude guardar el mensaje del evento. Intenta nuevamente."
         )
         return
+    bot.cache_question_event(
+        {
+            "guild_id": interaction.guild_id,
+            "channel_id": interaction.channel_id,
+            "message_id": event_message.id,
+            "question": pregunta.strip(),
+            "answer_hash": answer_hash(respuesta),
+            "reward": reward_amount,
+            "reward_type": reward_type,
+            "reward_object_id": reward_object_id,
+            "reward_quantity": cantidad,
+            "reward_name": reward_name,
+            "reward_emoji": reward_emoji,
+            "expires_at": expires_at,
+            "created_by": interaction.user.id,
+        }
+    )
     await interaction.delete_original_response()
 
+    movement_amount = reward_amount if reward_type == "coins" else cantidad
     await bot.db.record_movement(
         interaction.guild_id,
         None,
         interaction.user.id,
         "event_create",
-        recompensa,
-        f"Creó un evento de pregunta: {pregunta.strip()}",
+        movement_amount,
+        f"Creó un evento de pregunta con premio {reward_text}: "
+        f"{pregunta.strip()}",
     )
-    if interaction.guild is not None:
-        await send_audit_log(
-            interaction.guild,
-            "Evento de pregunta creado",
-            f"**Administrador:** {interaction.user.mention}\n"
-            f"**Pregunta:** {pregunta.strip()}\n"
-            f"**Recompensa:** {money(recompensa, interaction.guild_id)}\n"
-            f"**Duración:** {minutos} minutos\n"
-            f"**Canal:** <#{interaction.channel_id}>",
-            color=0xEC4899,
-        )
+    await send_audit_log(
+        guild,
+        "Evento de pregunta creado",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Pregunta:** {pregunta.strip()}\n"
+        f"**Recompensa:** {reward_text}\n"
+        f"**Duración:** {minutos} minutos\n"
+        f"**Canal:** <#{interaction.channel_id}>",
+        color=0xEC4899,
+    )
 
 
 @bot.tree.command(name="cancelarevento", description="Cancela la pregunta activa de este canal.")
@@ -1896,30 +2416,43 @@ async def cancelarevento(interaction: discord.Interaction) -> None:
     if event is None:
         await answer(interaction, "No hay un evento de pregunta activo en este canal.")
         return
+    bot.remove_question_event(
+        interaction.guild_id,
+        interaction.channel_id,
+        event["message_id"],
+    )
     if interaction.guild is not None:
         await finalize_question_embed(
             interaction.guild,
-            interaction.channel_id,
-            event["message_id"],
-            event["question"],
-            event["reward"],
+            {
+                **dict(event),
+                "guild_id": interaction.guild_id,
+                "channel_id": interaction.channel_id,
+            },
             "🚫 Cancelado por un administrador.",
         )
     await answer(interaction, f"Cancelé el evento **{event['question']}**.")
+    movement_amount = (
+        event["reward"]
+        if event["reward_type"] == "coins"
+        else event["reward_quantity"]
+    )
     await bot.db.record_movement(
         interaction.guild_id,
         None,
         interaction.user.id,
         "event_cancel",
-        event["reward"],
+        movement_amount,
         f"Canceló el evento de pregunta: {event['question']}",
     )
     if interaction.guild is not None:
+        reward_text = question_event_reward_text(interaction.guild, event)
         await send_audit_log(
             interaction.guild,
             "Evento de pregunta cancelado",
             f"**Administrador:** {interaction.user.mention}\n"
             f"**Pregunta:** {event['question']}\n"
+            f"**Recompensa:** {reward_text}\n"
             f"**Canal:** <#{interaction.channel_id}>",
             color=0xEF4444,
         )
@@ -1957,12 +2490,17 @@ async def activate_owned_modifier(
         )
     if result["status"] == "missing":
         return False, "No tienes ese modificador en tu inventario."
+    if result["status"] == "wrong_scope":
+        return False, (
+            "La configuración de ese modificador cambió. Vuelve a ejecutar `/usar`."
+        )
     if result["status"] == "already_active":
         subject = "Ya tienes" if target.id == owner.id else f"{target.mention} ya tiene"
         return False, (
             f"{subject} activo **{result['name']}**. Termina "
             f"<t:{int(result['expires_at'].timestamp())}:R>. No se consumió otra unidad."
         )
+    bot.active_modifier_users.add((guild.id, target.id))
     await bot.db.record_movement(
         guild.id,
         owner.id,
@@ -1983,11 +2521,6 @@ async def activate_owned_modifier(
         f"**Finaliza:** <t:{int(result['expires_at'].timestamp())}:R>",
         color=0xA855F7,
     )
-    notification_key = (guild.id, target.id)
-    if target.id == owner.id:
-        bot.modifier_notification_interactions[notification_key] = interaction
-    else:
-        bot.modifier_notification_interactions.pop(notification_key, None)
     if target.id == owner.id:
         public_message = (
             f"{owner.mention} activó **{result['name']}** sobre sí mismo durante "
@@ -2002,20 +2535,85 @@ async def activate_owned_modifier(
     return True, public_message
 
 
+async def activate_owned_channel_modifier(
+    interaction: discord.Interaction,
+    modifier_name_key: str,
+    target_channel_id: int,
+) -> tuple[bool, str]:
+    owner = guild_member(interaction)
+    guild = interaction.guild
+    if owner is None or guild is None:
+        return False, "No pude identificar el miembro o servidor."
+    target_channel = guild.get_channel(target_channel_id)
+    if not isinstance(target_channel, discord.TextChannel):
+        return False, "El canal elegido ya no está disponible."
+    result = await bot.db.activate_channel_modifier(
+        guild.id,
+        owner.id,
+        target_channel.id,
+        modifier_name_key,
+        owner.guild_permissions.administrator,
+    )
+    if result["status"] == "disabled":
+        return False, disabled_object_section_text(
+            result.get("section", "modifiers"),
+            result.get("reason"),
+        )
+    if result["status"] == "missing":
+        return False, "No tienes ese modificador en tu inventario."
+    if result["status"] == "wrong_scope":
+        return False, (
+            "La configuración de ese modificador cambió. Vuelve a ejecutar `/usar`."
+        )
+    if result["status"] == "already_active":
+        return False, (
+            f"{target_channel.mention} ya tiene activo **{result['name']}**. Termina "
+            f"<t:{int(result['expires_at'].timestamp())}:R>. No se consumió otra unidad."
+        )
+    bot.active_modifier_channels.add((guild.id, target_channel.id))
+    await bot.db.record_movement(
+        guild.id,
+        owner.id,
+        owner.id,
+        "channel_modifier_use",
+        None,
+        f"Usó el modificador {result['name']} en {target_channel} durante "
+        f"{result['duration_minutes']} minutos.",
+    )
+    await send_audit_log(
+        guild,
+        "Modificador de canal activado",
+        f"**Propietario:** {owner.mention}\n"
+        f"**Canal:** {target_channel.mention}\n"
+        f"**Modificador:** {result['name']}\n"
+        f"**Restantes:** {result['quantity']}\n"
+        f"**Duración:** {result['duration_minutes']} minutos\n"
+        f"**Finaliza:** <t:{int(result['expires_at'].timestamp())}:R>",
+        color=0xA855F7,
+    )
+    return True, (
+        f"{owner.mention} activó **{result['name']}** en {target_channel.mention} "
+        f"durante **{result['duration_minutes']} minutos**. Afectará a cualquiera "
+        f"que escriba allí y quedan **{result['quantity']}** unidades."
+    )
+
+
 class ModifierUseConfirmView(discord.ui.View):
     def __init__(
         self,
         author_id: int,
         modifier_name: str,
         modifier_name_key: str,
-        target_user_id: int,
+        target_kind: str,
+        target_id: int,
         source_interaction: discord.Interaction,
     ) -> None:
         super().__init__(timeout=60)
         self.author_id = author_id
         self.modifier_name = modifier_name
         self.modifier_name_key = modifier_name_key
-        self.target_user_id = target_user_id
+        self.target_kind = target_kind
+        self.target_id = target_id
         self.source_interaction = source_interaction
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -2061,26 +2659,36 @@ class ModifierUseConfirmView(discord.ui.View):
             content=f"Activando **{self.modifier_name}**...",
             view=self,
         )
-        activated, result = await activate_owned_modifier(
-            interaction,
-            self.modifier_name_key,
-            self.target_user_id,
-        )
+        if self.target_kind == "channel":
+            activated, result = await activate_owned_channel_modifier(
+                interaction,
+                self.modifier_name_key,
+                self.target_id,
+            )
+        else:
+            activated, result = await activate_owned_modifier(
+                interaction,
+                self.modifier_name_key,
+                self.target_id,
+            )
         if not activated:
             await interaction.edit_original_response(content=result, view=None)
             self.stop()
             return
-        if interaction.channel is None:
+        announcement_channel = interaction.channel
+        if self.target_kind == "channel" and interaction.guild is not None:
+            announcement_channel = interaction.guild.get_channel(self.target_id)
+        if announcement_channel is None:
             await interaction.edit_original_response(
                 content=(
                     f"{result}\nEl modificador sí se activó, pero no pude encontrar "
-                    "el canal para publicar la confirmación."
+                    "el canal donde debía publicar la confirmación."
                 ),
                 view=None,
             )
         else:
             try:
-                await interaction.channel.send(
+                await announcement_channel.send(
                     result,
                     allowed_mentions=discord.AllowedMentions(
                         everyone=False,
@@ -2092,7 +2700,7 @@ class ModifierUseConfirmView(discord.ui.View):
                 await interaction.edit_original_response(
                     content=(
                         f"{result}\nEl modificador sí se activó, pero no pude publicar "
-                        "la confirmación en el canal."
+                        "la confirmación en el canal objetivo."
                     ),
                     view=None,
                 )
@@ -2122,7 +2730,8 @@ class ModifierUseConfirmView(discord.ui.View):
 @bot.tree.command(name="usar", description="Activa una insignia o consume un modificador o ticket.")
 @app_commands.describe(
     objeto="Nombre de la insignia, modificador o ticket que quieres usar",
-    miembro="Opcional: miembro al que aplicarás el modificador",
+    miembro="Objetivo de un modificador Individual; por defecto eres tú",
+    canal="Canal donde activarás un modificador de tipo Canal",
 )
 @app_commands.autocomplete(objeto=owned_object_autocomplete)
 @app_commands.guild_only()
@@ -2130,6 +2739,7 @@ async def usar(
     interaction: discord.Interaction,
     objeto: str,
     miembro: discord.Member | None = None,
+    canal: discord.TextChannel | None = None,
 ) -> None:
     member = guild_member(interaction)
     guild = interaction.guild
@@ -2139,10 +2749,10 @@ async def usar(
     if badge is None:
         modifier = await find_modifier(interaction, objeto)
         if modifier is None:
-            if miembro is not None:
+            if miembro is not None or canal is not None:
                 await answer(
                     interaction,
-                    "La opción miembro solo se puede usar con modificadores.",
+                    "Las opciones miembro y canal solo se pueden usar con modificadores.",
                 )
                 return
             ticket = await find_ticket(interaction, objeto)
@@ -2163,7 +2773,7 @@ async def usar(
                     "Sigue en tu inventario y podrás usarlo cuando vuelva a activarse.",
                 )
                 return
-            settings = await bot.db.get_log_settings(guild.id)
+            settings = await bot.get_log_settings_cached(guild.id)
             if (
                 settings is None
                 or not settings["logs_enabled"]
@@ -2302,22 +2912,81 @@ async def usar(
         if disabled_message is not None:
             await answer(interaction, disabled_message)
             return
-        target = miembro or member
-        if target.bot:
-            await answer(interaction, "No puedes aplicar un modificador a un bot.")
-            return
+        channel_warning = ""
+        if modifier["effect_scope"] == "channel":
+            if miembro is not None:
+                await answer(
+                    interaction,
+                    "Este modificador es de **Canal**; usa la opción **canal**, no miembro.",
+                )
+                return
+            if canal is None:
+                await answer(
+                    interaction,
+                    "Este modificador es de **Canal**. Debes seleccionar dónde activarlo.",
+                )
+                return
+            bot_member = guild.me
+            if bot_member is None:
+                await answer(interaction, "No pude comprobar mis permisos en ese canal.")
+                return
+            permissions = canal.permissions_for(bot_member)
+            if not permissions.send_messages or not permissions.manage_webhooks:
+                await answer(
+                    interaction,
+                    f"Necesito **Enviar mensajes** y **Gestionar webhooks** en "
+                    f"{canal.mention}.",
+                )
+                return
+            target_kind = "channel"
+            target_id = canal.id
+            target_text = f"en {canal.mention}"
+        else:
+            if canal is not None:
+                await answer(
+                    interaction,
+                    "Este modificador es **Individual**; usa miembro o déjalo vacío "
+                    "para aplicártelo a ti.",
+                )
+                return
+            target = miembro or member
+            if target.bot:
+                await answer(interaction, "No puedes aplicar un modificador a un bot.")
+                return
+            target_kind = "individual"
+            target_id = target.id
+            target_text = (
+                "sobre ti" if target.id == member.id else f"sobre {target.mention}"
+            )
+            active_channel_modifiers = await bot.db.list_active_channel_modifiers(
+                guild.id
+            )
+            channel_mentions = [
+                f"<#{row['channel_id']}>"
+                for row in active_channel_modifiers[:10]
+            ]
+            if channel_mentions:
+                remaining = len(active_channel_modifiers) - len(channel_mentions)
+                extra = f" y **{remaining} más**" if remaining > 0 else ""
+                channel_warning = (
+                    "\n\n⚠️ **Aviso:** hay modificadores de Canal activos en "
+                    f"{', '.join(channel_mentions)}{extra}. Mientras sigan activos, "
+                    "el modificador Individual no funcionará cuando su objetivo "
+                    "escriba en esos canales."
+                )
         view = ModifierUseConfirmView(
             member.id,
             modifier["name"],
             modifier["name_key"],
-            target.id,
+            target_kind,
+            target_id,
             interaction,
         )
-        target_text = "sobre ti" if target.id == member.id else f"sobre {target.mention}"
         await interaction.response.send_message(
             f"¿Seguro que quieres usar **{modifier['name']}** {target_text}? Consumirá "
             f"**1 unidad** y permanecerá activo durante "
-            f"**{modifier['duration_minutes']} minutos**.",
+            f"**{modifier['duration_minutes']} minutos**."
+            f"{channel_warning if target_kind == 'individual' else ''}",
             view=view,
             ephemeral=True,
         )
@@ -2329,10 +2998,10 @@ async def usar(
     if disabled_message is not None:
         await answer(interaction, disabled_message)
         return
-    if miembro is not None:
+    if miembro is not None or canal is not None:
         await answer(
             interaction,
-            "La opción miembro solo se puede usar con modificadores.",
+            "Las opciones miembro y canal solo se pueden usar con modificadores.",
         )
         return
     badge_role = guild.get_role(badge["badge_role_id"])
@@ -2472,7 +3141,8 @@ async def inventario(
     if modifiers:
         modifier_lines = "\n".join(
             f"• {badge_emoji(row['emoji'], guild)}**{row['name']}** "
-            f"× **{row['quantity']}** · {row['duration_minutes']} min"
+            f"× **{row['quantity']}** · {modifier_scope_label(row['effect_scope'])} · "
+            f"{row['duration_minutes']} min"
             for row in modifiers
         )
         sections.append(f"__**Modificadores consumibles**__\n{modifier_lines}")
@@ -2550,7 +3220,8 @@ async def objetos(interaction: discord.Interaction) -> None:
             )
             modifier_details.append(
                 f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
-                f"  Modificador consumible · Comprable: {sale} · "
+                f"  Modificador {modifier_scope_label(row['effect_scope'])} consumible · "
+                f"Comprable: {sale} · "
                 f"Mensajes configurados: **{len(row['messages'])}**\n"
                 f"  Probabilidad: **{modifier_probability_label(row['trigger_numerator'], row['trigger_denominator'])}** · "
                 f"Cooldown: **{row['cooldown_seconds']} s** · "
@@ -2728,16 +3399,20 @@ async def historial(interaction: discord.Interaction) -> None:
         "balance_set": "⚙️",
         "purchase": "🛍️",
         "event_reward": "🎉",
+        "event_object_reward": "🎁",
         "badge_grant": "🏅",
         "badge_remove": "🗑️",
         "modifier_purchase": "🧪",
         "modifier_use": "✨",
+        "channel_modifier_use": "📢",
         "modifier_grant": "🎁",
         "modifier_remove": "➖",
         "modifier_expire": "⌛",
+        "channel_modifier_expire": "⌛",
         "modifier_admin_activate": "✨",
         "modifier_admin_deactivate": "⛔",
         "ticket_purchase": "🎟️",
+        "object_delete_refund": "💰",
         "ticket_use": "📣",
         "ticket_grant": "🎁",
         "ticket_remove": "➖",
@@ -2907,7 +3582,7 @@ async def configurarregistro(
     canal: discord.TextChannel | None = None,
 ) -> None:
     assert interaction.guild_id is not None and interaction.guild is not None
-    current = await bot.db.get_log_settings(interaction.guild_id)
+    current = await bot.get_log_settings_cached(interaction.guild_id)
     channel_id = canal.id if canal is not None else (
         current["log_channel_id"] if current else None
     )
@@ -2928,6 +3603,7 @@ async def configurarregistro(
             )
             return
     await bot.db.set_log_settings(interaction.guild_id, channel_id, activado)
+    bot.invalidate_log_settings(interaction.guild_id)
     if activado:
         await answer(
             interaction,
@@ -3776,12 +4452,19 @@ async def configurarinsignia(
     nombre="Nombre del modificador",
     comprable="Indica si aparecerá en la tienda",
     mensajes="Mensajes posibles separados por el símbolo |",
+    tipo="Individual para un miembro o Canal para todos los que escriban allí",
     probabilidad="Porcentaje (25) o fracción (1/4)",
     cooldown="Segundos mínimos entre mensajes generados",
     duracion="Minutos que permanecerá activo",
     precio="Precio; usa 0 si no será comprable",
     apartado="Categoría existente de la tienda; por defecto será General",
     emoji="Emoji opcional: Unicode, :nombre: o ID del servidor/bot",
+)
+@app_commands.choices(
+    tipo=[
+        app_commands.Choice(name="Individual", value="individual"),
+        app_commands.Choice(name="Canal", value="channel"),
+    ],
 )
 @app_commands.autocomplete(apartado=shop_section_autocomplete)
 @app_commands.guild_only()
@@ -3792,6 +4475,7 @@ async def configurarmodificador(
     nombre: str,
     comprable: bool,
     mensajes: str,
+    tipo: app_commands.Choice[str],
     probabilidad: str = MODIFIER_PROBABILITY,
     cooldown: app_commands.Range[int, 0, MAX_MODIFIER_COOLDOWN_SECONDS] = MODIFIER_COOLDOWN_SECONDS,
     duracion: app_commands.Range[int, 1, MAX_MODIFIER_DURATION_MINUTES] = MODIFIER_DURATION_MINUTES,
@@ -3861,6 +4545,7 @@ async def configurarmodificador(
             probability_denominator,
             cooldown,
             duracion,
+            tipo.value,
         )
     except asyncpg.UniqueViolationError:
         await answer(interaction, "Ya existe un modificador con ese nombre.")
@@ -3878,6 +4563,7 @@ async def configurarmodificador(
         "Modificador configurado",
         f"**Administrador:** {interaction.user.mention}\n"
         f"**Nombre:** {display_name}\n"
+        f"**Tipo:** {modifier_scope_label(tipo.value)}\n"
         f"**Comprable:** {'Sí' if comprable else 'No'}\n"
         f"**Precio:** {money(precio, interaction.guild_id)}\n"
         f"**Categoría:** {final_section or 'No aplica'}\n"
@@ -3891,6 +4577,7 @@ async def configurarmodificador(
     await answer(
         interaction,
         f"Configuré el modificador **{display_name}** con "
+        f"tipo **{modifier_scope_label(tipo.value)}**, "
         f"**{len(parsed_messages)} mensajes**, probabilidad "
         f"**{modifier_probability_label(probability_numerator, probability_denominator)}**, "
         f"cooldown de **{cooldown} segundos** y duración de **{duracion} minutos**.",
@@ -4028,6 +4715,7 @@ async def editarmensajes(
         current["trigger_denominator"],
         current["cooldown_seconds"],
         current["duration_minutes"],
+        current["effect_scope"],
     )
     if not updated:
         await answer(interaction, "Ese modificador ya no existe.")
@@ -4189,9 +4877,16 @@ async def configurarticket(
     emoji="Emoji, :nombre: o ID; escribe quitar para eliminarlo",
     descripcion="Para tickets o categorías: nueva descripción",
     activo="Para tickets: permitir o impedir su uso",
+    tipo_modificador="Para modificadores: Individual o Canal",
     probabilidad="Para modificadores: porcentaje (25) o fracción (1/4)",
     cooldown="Para modificadores: segundos entre intentos",
     duracion="Para modificadores: minutos que permanece activo",
+)
+@app_commands.choices(
+    tipo_modificador=[
+        app_commands.Choice(name="Individual", value="individual"),
+        app_commands.Choice(name="Canal", value="channel"),
+    ],
 )
 @app_commands.autocomplete(
     objeto=editable_object_autocomplete,
@@ -4213,6 +4908,7 @@ async def editar(
     emoji: str | None = None,
     descripcion: str | None = None,
     activo: bool | None = None,
+    tipo_modificador: app_commands.Choice[str] | None = None,
     probabilidad: str | None = None,
     cooldown: int | None = None,
     duracion: int | None = None,
@@ -4247,6 +4943,7 @@ async def editar(
             apartado,
             emoji,
             activo,
+            tipo_modificador,
             probabilidad,
             cooldown,
             duracion,
@@ -4406,6 +5103,11 @@ async def editar(
         final_duration = (
             duracion if duracion is not None else current_modifier["duration_minutes"]
         )
+        final_scope = (
+            tipo_modificador.value
+            if tipo_modificador is not None
+            else current_modifier["effect_scope"]
+        )
         if not 0 <= final_cooldown <= MAX_MODIFIER_COOLDOWN_SECONDS:
             await answer(
                 interaction,
@@ -4434,6 +5136,7 @@ async def editar(
                 final_probability_denominator,
                 final_cooldown,
                 final_duration,
+                final_scope,
             )
         except asyncpg.UniqueViolationError:
             await answer(interaction, "Ya existe un modificador con ese nombre.")
@@ -4455,6 +5158,7 @@ async def editar(
             f"**Administrador:** {interaction.user.mention}\n"
             f"**Nombre anterior:** {current_modifier['name']}\n"
             f"**Nombre actual:** {final_name}\n"
+            f"**Tipo:** {modifier_scope_label(final_scope)}\n"
             f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
             f"**Precio:** {money(final_price, interaction.guild_id)}\n"
             f"**Categoría:** {final_section or 'No aplica'}\n"
@@ -4477,6 +5181,12 @@ async def editar(
             await answer(
                 interaction,
                 "Las opciones probabilidad, cooldown y duracion solo se usan con modificadores.",
+            )
+            return
+        if tipo_modificador is not None:
+            await answer(
+                interaction,
+                "La opción tipo_modificador solo se usa con modificadores.",
             )
             return
         if permitir_whitelist is not None:
@@ -4549,6 +5259,7 @@ async def editar(
     if (
         descripcion is not None
         or activo is not None
+        or tipo_modificador is not None
         or probabilidad is not None
         or cooldown is not None
         or duracion is not None
@@ -4628,6 +5339,256 @@ async def editar(
     await answer(interaction, f"Actualicé la insignia **{final_name}**.")
 
 
+async def delete_configured_object(
+    interaction: discord.Interaction,
+    item_type: str,
+    name_key: str,
+    badge_role_id: int | None,
+    refund_enabled: bool,
+) -> str | None:
+    guild = interaction.guild
+    if guild is None:
+        return None
+    badge_user_ids = []
+    if item_type == "badge" and badge_role_id is not None:
+        badge_role = guild.get_role(badge_role_id)
+        if badge_role is not None:
+            badge_user_ids = [
+                member.id
+                for member in badge_role.members
+                if not member.bot
+            ]
+    result = await bot.db.delete_object_with_balance_refunds(
+        guild.id,
+        item_type,
+        name_key,
+        badge_user_ids,
+        refund_enabled,
+        interaction.user.id,
+        MAX_MONEY,
+    )
+    if result is None:
+        return None
+    for user_id in result["active_user_ids"]:
+        bot.active_modifier_users.discard((guild.id, user_id))
+    for channel_id in result["active_channel_ids"]:
+        bot.active_modifier_channels.discard((guild.id, channel_id))
+    for event in result["cancelled_events"]:
+        bot.remove_question_event(
+            guild.id,
+            event["channel_id"],
+            event["message_id"],
+        )
+        await finalize_question_embed(
+            guild,
+            event,
+            "🚫 Cancelado porque se eliminó el objeto del premio.",
+        )
+
+    item = result["item"]
+    type_label = {
+        "badge": "insignia",
+        "modifier": "modificador",
+        "ticket": "ticket",
+    }[item_type]
+    action = {
+        "badge": "badge_config_delete",
+        "modifier": "modifier_config_delete",
+        "ticket": "ticket_config_delete",
+    }[item_type]
+    extra = {
+        "badge": "Los roles de Discord no fueron eliminados.",
+        "modifier": "Sus unidades y activaciones también fueron eliminadas.",
+        "ticket": "Sus unidades de inventario también fueron eliminadas.",
+    }[item_type]
+    await bot.db.record_movement(
+        guild.id,
+        None,
+        interaction.user.id,
+        action,
+        None,
+        f"Borró el {type_label} {item['name']}.",
+    )
+
+    if refund_enabled:
+        refund_summary = (
+            f"**Personas consideradas:** {result['eligible_users']}\n"
+            f"**Unidades consideradas:** {result['eligible_units']}\n"
+            f"**Saldo reembolsado:** {money(result['total_credited'], guild.id)}"
+        )
+        if result["total_requested"] > result["total_credited"]:
+            refund_summary += (
+                "\nParte del reembolso se limitó porque algún balance alcanzó "
+                f"el máximo de {money(MAX_MONEY, guild.id)}."
+            )
+    else:
+        refund_summary = (
+            "**Reembolso:** No solicitado\n"
+            f"**Personas que perdieron objetos:** {result['eligible_users']}\n"
+            f"**Unidades eliminadas:** {result['eligible_units']}"
+        )
+    if result["direct_admin_activations"]:
+        refund_summary += (
+            "\n**Activaciones administrativas sin reembolso:** "
+            f"{result['direct_admin_activations']}"
+        )
+    if result["cancelled_events"]:
+        refund_summary += (
+            "\n**Eventos de pregunta cancelados:** "
+            f"{len(result['cancelled_events'])}"
+        )
+    await send_audit_log(
+        guild,
+        "Objeto borrado",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Tipo:** {type_label.capitalize()}\n"
+        f"**Objeto:** {item['name']}\n"
+        f"**Precio usado por unidad:** {money(result['price'], guild.id)}\n"
+        f"{refund_summary}\n"
+        f"{extra}",
+        color=0xEF4444,
+    )
+    return (
+        f"Borré el {type_label} **{item['name']}**. {extra}\n"
+        f"{refund_summary}"
+    )
+
+
+class DeleteObjectConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        author_id: int,
+        item_type: str,
+        name: str,
+        name_key: str,
+        price: int,
+        badge_role_id: int | None,
+        source_interaction: discord.Interaction,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.item_type = item_type
+        self.name = name
+        self.name_key = name_key
+        self.price = price
+        self.badge_role_id = badge_role_id
+        self.source_interaction = source_interaction
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Solo el administrador que abrió esta confirmación puede responder.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        try:
+            await self.source_interaction.edit_original_response(
+                content="La confirmación expiró. No se borró ningún objeto.",
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            await interaction.edit_original_response(
+                content="Ocurrió un error al borrar el objeto.",
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def finish_deletion(
+        self,
+        interaction: discord.Interaction,
+        refund_enabled: bool,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="Borrando el objeto y calculando los reembolsos...",
+            view=self,
+        )
+        response = await delete_configured_object(
+            interaction,
+            self.item_type,
+            self.name_key,
+            self.badge_role_id,
+            refund_enabled,
+        )
+        if response is None:
+            await interaction.edit_original_response(
+                content="Ese objeto ya no existe.",
+                view=None,
+            )
+            self.stop()
+            return
+        published = False
+        if interaction.channel is not None:
+            try:
+                await interaction.channel.send(
+                    response,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                published = True
+            except discord.HTTPException:
+                pass
+        await interaction.edit_original_response(
+            content=(
+                "Objeto borrado. El resultado se publicó en este canal."
+                if published
+                else f"El objeto se borró, pero no pude publicar el resultado.\n{response}"
+            ),
+            view=None,
+        )
+        self.stop()
+
+    @discord.ui.button(
+        label="Borrar y reembolsar",
+        style=discord.ButtonStyle.danger,
+        emoji="💰",
+    )
+    async def delete_with_refund(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.finish_deletion(interaction, True)
+
+    @discord.ui.button(
+        label="Borrar sin reembolsar",
+        style=discord.ButtonStyle.danger,
+        emoji="🗑️",
+    )
+    async def delete_without_refund(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.finish_deletion(interaction, False)
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Borrado cancelado. No se modificó ningún objeto ni balance.",
+            view=None,
+        )
+        self.stop()
+
+
 @bot.tree.command(name="borrarobjeto", description="Borra un objeto configurado.")
 @app_commands.describe(objeto="Insignia, modificador o ticket que se borrará")
 @app_commands.autocomplete(objeto=deletable_object_autocomplete)
@@ -4643,55 +5604,33 @@ async def borrarobjeto(interaction: discord.Interaction, objeto: str) -> None:
         if badge is not None or modifier is not None
         else await find_ticket(interaction, objeto)
     )
-    if badge is None and modifier is None and ticket is None:
+    current = badge or modifier or ticket
+    if current is None:
         await answer(interaction, "Ese objeto no existe.")
         return
-    await interaction.response.defer()
-    if badge is not None:
-        deleted = await bot.db.delete_badge(interaction.guild_id, badge["name_key"])
-        item_type = "insignia"
-        action = "badge_config_delete"
-        extra = "Los roles de Discord no fueron eliminados."
-    elif modifier is not None:
-        deleted = await bot.db.delete_modifier(
-            interaction.guild_id,
-            modifier["name_key"],
-        )
-        item_type = "modificador"
-        action = "modifier_config_delete"
-        extra = "Sus unidades y activaciones también fueron eliminadas."
-    else:
-        deleted = await bot.db.delete_ticket(
-            interaction.guild_id,
-            ticket["name_key"],
-        )
-        item_type = "ticket"
-        action = "ticket_config_delete"
-        extra = "Sus unidades de inventario también fueron eliminadas."
-    if deleted is None:
-        await answer(interaction, "Ese objeto ya no existe.")
-        return
-    await bot.db.record_movement(
-        interaction.guild_id,
-        None,
-        interaction.user.id,
-        action,
-        None,
-        f"Borró el {item_type} {deleted['name']}.",
+    item_type = (
+        "badge"
+        if badge is not None
+        else "modifier" if modifier is not None else "ticket"
     )
-    if interaction.guild is not None:
-        await send_audit_log(
-            interaction.guild,
-            "Objeto borrado",
-            f"**Administrador:** {interaction.user.mention}\n"
-            f"**Tipo:** {item_type.capitalize()}\n"
-            f"**Objeto:** {deleted['name']}\n"
-            f"{extra}",
-            color=0xEF4444,
-        )
-    await answer(
+    view = DeleteObjectConfirmView(
+        interaction.user.id,
+        item_type,
+        current["name"],
+        current["name_key"],
+        current["price"],
+        current["badge_role_id"] if badge is not None else None,
         interaction,
-        f"Borré el {item_type} **{deleted['name']}**. {extra}",
+    )
+    await interaction.response.send_message(
+        f"⚠️ Vas a borrar **{current['name']}** de forma permanente.\n"
+        f"¿Quieres reembolsar a cada propietario "
+        f"**{money(current['price'], interaction.guild_id)} por unidad**?\n\n"
+        "Se incluyen objetos comprados o entregados por administradores. En "
+        "modificadores activos se reembolsa a quien gastó la unidad; las activaciones "
+        "creadas directamente por un administrador no reciben reembolso.",
+        view=view,
+        ephemeral=True,
     )
 
 
@@ -4710,6 +5649,7 @@ async def apply_object_section_toggle(
         reason,
         admins_bypass,
     )
+    bot.invalidate_maintenance(guild.id)
     label = OBJECT_SECTION_LABELS[section]
     if result["enabled"]:
         action = "object_section_enable"
@@ -4727,10 +5667,14 @@ async def apply_object_section_toggle(
         removed = result["removed"]
         refunds = result["refunds"]
         for row in removed:
-            bot.modifier_notification_interactions.pop(
-                (guild.id, row["target_user_id"]),
-                None,
-            )
+            if row["target_kind"] == "individual":
+                bot.active_modifier_users.discard(
+                    (guild.id, row["target_id"])
+                )
+            else:
+                bot.active_modifier_channels.discard(
+                    (guild.id, row["target_id"])
+                )
         for row in refunds:
             await bot.db.record_movement(
                 guild.id,
@@ -4759,14 +5703,17 @@ async def apply_object_section_toggle(
         for row in removed:
             if row["refundable"]:
                 continue
-            target = guild.get_member(row["target_user_id"])
-            target_name = (
-                discord.utils.escape_mentions(
-                    discord.utils.escape_markdown(target.display_name)
+            if row["target_kind"] == "channel":
+                target_name = f"canal <#{row['target_id']}>"
+            else:
+                target = guild.get_member(row["target_id"])
+                target_name = (
+                    discord.utils.escape_mentions(
+                        discord.utils.escape_markdown(target.display_name)
+                    )
+                    if target is not None
+                    else f"Usuario {row['target_id']}"
                 )
-                if target is not None
-                else f"Usuario {row['target_user_id']}"
-            )
             if not row.get("was_active", False):
                 no_refund_reason = "el modificador ya había vencido"
             else:
@@ -5037,11 +5984,12 @@ async def estadoobjetos(
 
 @bot.tree.command(
     name="estadomodificador",
-    description="Alterna el modificador activo de un miembro.",
+    description="Alterna el modificador activo de un miembro o canal.",
 )
 @app_commands.describe(
-    miembro="Miembro cuyo modificador quieres cambiar",
-    modificador="Se exige únicamente cuando el miembro no tiene uno activo",
+    miembro="Objetivo para un modificador Individual",
+    canal="Objetivo para un modificador de Canal",
+    modificador="Se exige cuando el objetivo no tiene uno activo",
 )
 @app_commands.autocomplete(modificador=modifier_autocomplete)
 @app_commands.guild_only()
@@ -5049,18 +5997,37 @@ async def estadoobjetos(
 @app_commands.checks.has_permissions(administrator=True)
 async def estadomodificador(
     interaction: discord.Interaction,
-    miembro: discord.Member,
+    miembro: discord.Member | None = None,
+    canal: discord.TextChannel | None = None,
     modificador: str | None = None,
 ) -> None:
     guild = interaction.guild
     if guild is None or interaction.channel_id is None:
         return
-
-    notification_key = (guild.id, miembro.id)
-    active = await bot.db.get_active_modifier(guild.id, miembro.id)
+    if (miembro is None) == (canal is None):
+        await answer(
+            interaction,
+            "Selecciona exactamente un objetivo: **miembro** o **canal**.",
+        )
+        return
+    target_kind = "channel" if canal is not None else "individual"
+    target_id = canal.id if canal is not None else miembro.id
+    target_label = canal.mention if canal is not None else miembro.mention
+    active = (
+        await bot.db.get_active_channel_modifier(guild.id, target_id)
+        if target_kind == "channel"
+        else await bot.db.get_active_modifier(guild.id, target_id)
+    )
     if active is not None:
-        deactivated = await bot.db.deactivate_modifier(guild.id, miembro.id)
-        bot.modifier_notification_interactions.pop(notification_key, None)
+        deactivated = (
+            await bot.db.deactivate_and_refund_channel_modifier(guild.id, target_id)
+            if target_kind == "channel"
+            else await bot.db.deactivate_and_refund_modifier(guild.id, target_id)
+        )
+        if target_kind == "individual":
+            bot.active_modifier_users.discard((guild.id, target_id))
+        else:
+            bot.active_modifier_channels.discard((guild.id, target_id))
         if deactivated is None:
             await answer(
                 interaction,
@@ -5069,43 +6036,100 @@ async def estadomodificador(
             return
         await bot.db.record_movement(
             guild.id,
-            miembro.id,
+            target_id if target_kind == "individual" else None,
             interaction.user.id,
             "modifier_admin_deactivate",
             None,
-            f"Un administrador desactivó {deactivated['name']}.",
+            f"Un administrador desactivó {deactivated['name']} para {target_label}.",
         )
+        if deactivated["status"] == "refunded":
+            owner_id = deactivated["owner_user_id"]
+            owner = guild.get_member(owner_id)
+            owner_label = owner.mention if owner is not None else f"<@{owner_id}>"
+            refund_text = (
+                f"\n**Reembolso:** 1 unidad para {owner_label} "
+                f"(ahora tiene {deactivated['quantity']})."
+            )
+            await bot.db.record_movement(
+                guild.id,
+                owner_id,
+                interaction.user.id,
+                "modifier_admin_refund",
+                None,
+                f"Recibió 1 unidad de {deactivated['name']} al desactivarse "
+                f"el efecto de {target_label}.",
+            )
+        elif deactivated["status"] == "deactivated_without_refund":
+            refund_text = (
+                "\n**Reembolso:** No corresponde; era una activación creada "
+                "directamente por un administrador."
+            )
+        else:
+            refund_text = (
+                "\n**Reembolso:** No corresponde porque el efecto ya había vencido."
+            )
         await send_audit_log(
             guild,
             "Modificador desactivado por administrador",
             f"**Administrador:** {interaction.user.mention}\n"
-            f"**Miembro:** {miembro.mention}\n"
-            f"**Modificador:** {deactivated['name']}",
+            f"**Objetivo:** {target_label}\n"
+            f"**Modificador:** {deactivated['name']}"
+            f"{refund_text}",
             color=0xEF4444,
         )
         await answer(
             interaction,
-            f"Desactivaste **{deactivated['name']}** para {miembro.mention}.",
+            f"Desactivaste **{deactivated['name']}** para {target_label}."
+            f"{refund_text}",
         )
         return
 
     if not modificador or not modificador.strip():
         await answer(
             interaction,
-            f"{miembro.mention} no tiene un modificador activo. Debes elegir cuál activar.",
+            f"{target_label} no tiene un modificador activo. Debes elegir cuál activar.",
         )
         return
     item = await find_modifier(interaction, modificador)
     if item is None:
         await answer(interaction, "Ese modificador no existe.")
         return
-    activation = await bot.db.force_activate_modifier(
-        guild.id,
-        miembro.id,
-        item["id"],
-        interaction.channel_id,
-        item["duration_minutes"],
-    )
+    if item["effect_scope"] != target_kind:
+        await answer(
+            interaction,
+            f"**{item['name']}** es de tipo "
+            f"**{modifier_scope_label(item['effect_scope'])}**. Elige un objetivo compatible.",
+        )
+        return
+    if miembro is not None and miembro.bot:
+        await answer(interaction, "No puedes aplicar un modificador a un bot.")
+        return
+    if canal is not None:
+        bot_member = guild.me
+        if bot_member is None:
+            await answer(interaction, "No pude comprobar mis permisos en ese canal.")
+            return
+        permissions = canal.permissions_for(bot_member)
+        if not permissions.send_messages or not permissions.manage_webhooks:
+            await answer(
+                interaction,
+                f"Necesito **Enviar mensajes** y **Gestionar webhooks** en {canal.mention}.",
+            )
+            return
+        activation = await bot.db.force_activate_channel_modifier(
+            guild.id,
+            canal.id,
+            item["id"],
+            item["duration_minutes"],
+        )
+    else:
+        activation = await bot.db.force_activate_modifier(
+            guild.id,
+            miembro.id,
+            item["id"],
+            interaction.channel_id,
+            item["duration_minutes"],
+        )
     if activation["status"] == "disabled":
         await answer(
             interaction,
@@ -5115,22 +6139,26 @@ async def estadomodificador(
             ),
         )
         return
-    bot.modifier_notification_interactions.pop(notification_key, None)
+    if target_kind == "individual":
+        bot.active_modifier_users.add((guild.id, target_id))
+    else:
+        bot.active_modifier_channels.add((guild.id, target_id))
     expires_at = activation["expires_at"]
     await bot.db.record_movement(
         guild.id,
-        miembro.id,
+        target_id if target_kind == "individual" else None,
         interaction.user.id,
         "modifier_admin_activate",
         None,
-        f"Un administrador activó {item['name']} durante "
+        f"Un administrador activó {item['name']} para {target_label} durante "
         f"{item['duration_minutes']} minutos.",
     )
     await send_audit_log(
         guild,
         "Modificador activado por administrador",
         f"**Administrador:** {interaction.user.mention}\n"
-        f"**Miembro:** {miembro.mention}\n"
+        f"**Objetivo:** {target_label}\n"
+        f"**Tipo:** {modifier_scope_label(item['effect_scope'])}\n"
         f"**Modificador:** {item['name']}\n"
         f"**Finaliza:** <t:{int(expires_at.timestamp())}:R>\n"
         "No se descontó ninguna unidad del inventario.",
@@ -5138,7 +6166,7 @@ async def estadomodificador(
     )
     await answer(
         interaction,
-        f"Activaste **{item['name']}** para {miembro.mention} durante "
+        f"Activaste **{item['name']}** para {target_label} durante "
         f"**{item['duration_minutes']} minutos**. "
         f"Finaliza <t:{int(expires_at.timestamp())}:R>. "
         "No se descontó de su inventario.",
@@ -5149,34 +6177,54 @@ async def estadomodificador(
     name="reembolsarmodificador",
     description="Quita un modificador activo y devuelve la unidad a quien la gastó.",
 )
-@app_commands.describe(miembro="Miembro que tiene activo el modificador")
+@app_commands.describe(
+    miembro="Miembro que tiene activo un modificador Individual",
+    canal="Canal que tiene activo un modificador de Canal",
+)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def reembolsarmodificador(
     interaction: discord.Interaction,
-    miembro: discord.Member,
+    miembro: discord.Member | None = None,
+    canal: discord.TextChannel | None = None,
 ) -> None:
     guild = interaction.guild
     if guild is None:
         return
-    await interaction.response.defer()
-    result = await bot.db.deactivate_and_refund_modifier(guild.id, miembro.id)
-    if result is None:
-        await answer(interaction, f"{miembro.mention} no tiene un modificador activo.")
+    if (miembro is None) == (canal is None):
+        await answer(
+            interaction,
+            "Selecciona exactamente un objetivo: **miembro** o **canal**.",
+        )
         return
-    bot.modifier_notification_interactions.pop((guild.id, miembro.id), None)
+    target_kind = "channel" if canal is not None else "individual"
+    target_id = canal.id if canal is not None else miembro.id
+    target_label = canal.mention if canal is not None else miembro.mention
+    await interaction.response.defer()
+    result = (
+        await bot.db.deactivate_and_refund_channel_modifier(guild.id, target_id)
+        if target_kind == "channel"
+        else await bot.db.deactivate_and_refund_modifier(guild.id, target_id)
+    )
+    if result is None:
+        await answer(interaction, f"{target_label} no tiene un modificador activo.")
+        return
+    if target_kind == "individual":
+        bot.active_modifier_users.discard((guild.id, target_id))
+    else:
+        bot.active_modifier_channels.discard((guild.id, target_id))
     if result["status"] == "expired":
         await answer(
             interaction,
-            f"**{result['name']}** ya había terminado para {miembro.mention}. "
+            f"**{result['name']}** ya había terminado para {target_label}. "
             "Retiré el registro pendiente, pero no correspondía un reembolso.",
         )
         return
     if result["status"] == "deactivated_without_refund":
         await bot.db.record_movement(
             guild.id,
-            miembro.id,
+            target_id if target_kind == "individual" else None,
             interaction.user.id,
             "modifier_admin_remove_without_refund",
             None,
@@ -5186,14 +6234,14 @@ async def reembolsarmodificador(
             guild,
             "Modificador retirado sin reembolso",
             f"**Administrador:** {interaction.user.mention}\n"
-            f"**Miembro afectado:** {miembro.mention}\n"
+            f"**Objetivo afectado:** {target_label}\n"
             f"**Modificador:** {result['name']}\n"
             "La activación no tenía un propietario de consumo registrado.",
             color=0xF59E0B,
         )
         await answer(
             interaction,
-            f"Retiré **{result['name']}** de {miembro.mention}. No devolví ninguna "
+            f"Retiré **{result['name']}** de {target_label}. No devolví ninguna "
             "unidad porque esa activación no había consumido un objeto del inventario.",
         )
         return
@@ -5208,13 +6256,13 @@ async def reembolsarmodificador(
         "modifier_admin_refund",
         None,
         f"Recibió 1 unidad de {result['name']} tras retirar el efecto de "
-        f"{miembro}.",
+        f"{target_label}.",
     )
     await send_audit_log(
         guild,
         "Modificador retirado y reembolsado",
         f"**Administrador:** {interaction.user.mention}\n"
-        f"**Miembro afectado:** {miembro.mention}\n"
+        f"**Objetivo afectado:** {target_label}\n"
         f"**Modificador:** {result['name']}\n"
         f"**Reembolso para:** {owner_label}\n"
         f"**Cantidad actual:** {result['quantity']}",
@@ -5222,7 +6270,7 @@ async def reembolsarmodificador(
     )
     await answer(
         interaction,
-        f"Retiré **{result['name']}** de {miembro.mention} y devolví **1 unidad** "
+        f"Retiré **{result['name']}** de {target_label} y devolví **1 unidad** "
         f"a {owner_label}. Ahora tiene **{result['quantity']}**.",
     )
 
@@ -5263,7 +6311,7 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/inventario [miembro]` · `/objetos` · `/mensajes`\n"
                 "`/darobjeto` · `/quitarobjeto` · `/borrarobjeto`\n"
                 "`/estadoobjetos sección permitir_admins [razón]`\n"
-                "`/estadomodificador` · `/reembolsarmodificador miembro`"
+                "`/estadomodificador` · `/reembolsarmodificador [miembro/canal]`"
             ),
             inline=False,
         )
@@ -5289,11 +6337,22 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
             inline=False,
         )
         embed.add_field(
+            name="Premios de eventos",
+            value=(
+                "`/eventopregunta` exige elegir **monedas** o un **objeto**. "
+                "La cantidad puede ser mayor para modificadores y tickets; "
+                "las insignias siempre entregan una."
+            ),
+            inline=False,
+        )
+        embed.add_field(
             name="Notas de modificadores",
             value=(
-                "`/estadomodificador miembro [modificador]` desactiva el efecto si el "
-                "miembro ya tiene uno; si no, exige elegir cuál activar. En la "
-                "probabilidad puedes usar `25` o `1/4`."
+                "Cada modificador es **Individual** o de **Canal**. "
+                "`/estadomodificador` alterna el efecto del miembro o canal elegido; "
+                "si no hay uno activo, exige seleccionar un modificador compatible. "
+                "El de Canal tiene prioridad sobre los Individuales dentro de ese "
+                "canal. La probabilidad acepta `25` o `1/4`."
             ),
             inline=False,
         )
@@ -5303,8 +6362,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
             name="Inventario y objetos",
             value=(
                 "`/inventario` — Ver tus insignias y consumibles.\n"
-                "`/usar objeto [miembro]` — Activar una insignia, consumir un ticket o "
-                "aplicar un modificador a ti u otra persona.\n"
+                "`/usar objeto [miembro/canal]` — Activar una insignia, consumir un "
+                "ticket o aplicar un modificador Individual o de Canal.\n"
                 "`/quitar` — Quitar tu color sin perder insignias."
             ),
             inline=False,
