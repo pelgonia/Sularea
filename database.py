@@ -151,10 +151,26 @@ ADD COLUMN IF NOT EXISTS whitelist_emoji TEXT;
 
 CREATE TABLE IF NOT EXISTS object_section_settings (
     guild_id BIGINT NOT NULL,
-    section TEXT NOT NULL CHECK (section IN ('badges', 'modifiers', 'tickets')),
+    section TEXT NOT NULL,
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     disabled_reason TEXT,
+    admins_bypass BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (guild_id, section)
+);
+
+ALTER TABLE object_section_settings
+ADD COLUMN IF NOT EXISTS admins_bypass BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE object_section_settings
+DROP CONSTRAINT IF EXISTS object_section_settings_section_check;
+
+ALTER TABLE object_section_settings
+ADD CONSTRAINT object_section_settings_section_check
+CHECK (
+    section IN (
+        'badges', 'modifiers', 'tickets', 'shop',
+        'all_objects', 'all_commands'
+    )
 );
 
 CREATE TABLE IF NOT EXISTS ticket_admins (
@@ -868,32 +884,46 @@ class Database:
         guild_id: int,
         user_id: int,
         name_key: str,
+        user_is_admin: bool = False,
     ) -> dict | None:
         async with self._pool().acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
                     """
                     INSERT INTO object_section_settings (
-                        guild_id, section, enabled, disabled_reason
+                        guild_id, section, enabled, disabled_reason, admins_bypass
                     )
-                    VALUES ($1, 'tickets', TRUE, NULL)
+                    SELECT $1, section, TRUE, NULL, FALSE
+                    FROM UNNEST(ARRAY['all_objects', 'tickets']) AS sections(section)
                     ON CONFLICT DO NOTHING
                     """,
                     guild_id,
                 )
-                section = await connection.fetchrow(
+                sections = await connection.fetch(
                     """
-                    SELECT enabled, disabled_reason
+                    SELECT section, enabled, disabled_reason, admins_bypass
                     FROM object_section_settings
-                    WHERE guild_id = $1 AND section = 'tickets'
+                    WHERE guild_id = $1
+                      AND section IN ('all_objects', 'tickets')
+                    ORDER BY CASE WHEN section = 'all_objects' THEN 0 ELSE 1 END
                     FOR SHARE
                     """,
                     guild_id,
                 )
-                if not section["enabled"]:
+                blocker = next(
+                    (
+                        row
+                        for row in sections
+                        if not row["enabled"]
+                        and not (user_is_admin and row["admins_bypass"])
+                    ),
+                    None,
+                )
+                if blocker is not None:
                     return {
                         "status": "disabled",
-                        "reason": section["disabled_reason"],
+                        "section": blocker["section"],
+                        "reason": blocker["disabled_reason"],
                     }
                 row = await connection.fetchrow(
                     """
@@ -1054,32 +1084,46 @@ class Database:
         target_user_id: int,
         name_key: str,
         channel_id: int,
+        owner_is_admin: bool = False,
     ) -> dict:
         async with self._pool().acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
                     """
                     INSERT INTO object_section_settings (
-                        guild_id, section, enabled, disabled_reason
+                        guild_id, section, enabled, disabled_reason, admins_bypass
                     )
-                    VALUES ($1, 'modifiers', TRUE, NULL)
+                    SELECT $1, section, TRUE, NULL, FALSE
+                    FROM UNNEST(ARRAY['all_objects', 'modifiers']) AS sections(section)
                     ON CONFLICT DO NOTHING
                     """,
                     guild_id,
                 )
-                section = await connection.fetchrow(
+                sections = await connection.fetch(
                     """
-                    SELECT enabled, disabled_reason
+                    SELECT section, enabled, disabled_reason, admins_bypass
                     FROM object_section_settings
-                    WHERE guild_id = $1 AND section = 'modifiers'
+                    WHERE guild_id = $1
+                      AND section IN ('all_objects', 'modifiers')
+                    ORDER BY CASE WHEN section = 'all_objects' THEN 0 ELSE 1 END
                     FOR SHARE
                     """,
                     guild_id,
                 )
-                if section is not None and not section["enabled"]:
+                blocker = next(
+                    (
+                        row
+                        for row in sections
+                        if not row["enabled"]
+                        and not (owner_is_admin and row["admins_bypass"])
+                    ),
+                    None,
+                )
+                if blocker is not None:
                     return {
                         "status": "disabled",
-                        "reason": section["disabled_reason"],
+                        "section": blocker["section"],
+                        "reason": blocker["disabled_reason"],
                     }
                 active = await connection.fetchrow(
                     """
@@ -1167,30 +1211,6 @@ class Database:
     ):
         async with self._pool().acquire() as connection:
             async with connection.transaction():
-                await connection.execute(
-                    """
-                    INSERT INTO object_section_settings (
-                        guild_id, section, enabled, disabled_reason
-                    )
-                    VALUES ($1, 'modifiers', TRUE, NULL)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    guild_id,
-                )
-                section = await connection.fetchrow(
-                    """
-                    SELECT enabled, disabled_reason
-                    FROM object_section_settings
-                    WHERE guild_id = $1 AND section = 'modifiers'
-                    FOR SHARE
-                    """,
-                    guild_id,
-                )
-                if not section["enabled"]:
-                    return {
-                        "status": "disabled",
-                        "reason": section["disabled_reason"],
-                    }
                 activation = await connection.fetchrow(
                     """
                     INSERT INTO active_modifiers (
@@ -1325,12 +1345,16 @@ class Database:
             FROM modifiers AS modifier
             WHERE active.guild_id = $1
               AND active.user_id = $2
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM object_section_settings AS section
-                  WHERE section.guild_id = active.guild_id
-                    AND section.section = 'modifiers'
-                    AND section.enabled = FALSE
+              AND (
+                  active.owner_user_id IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM object_section_settings AS section
+                      WHERE section.guild_id = active.guild_id
+                        AND section.section IN ('all_objects', 'modifiers')
+                        AND section.enabled = FALSE
+                        AND section.admins_bypass = FALSE
+                  )
               )
               AND modifier.id = active.modifier_id
               AND active.expires_at > NOW()
@@ -1479,7 +1503,7 @@ class Database:
     ) -> dict:
         row = await self._pool().fetchrow(
             """
-            SELECT enabled, disabled_reason
+            SELECT enabled, disabled_reason, admins_bypass
             FROM object_section_settings
             WHERE guild_id = $1 AND section = $2
             """,
@@ -1487,23 +1511,55 @@ class Database:
             section,
         )
         if row is None:
-            return {"enabled": True, "disabled_reason": None}
+            return {
+                "enabled": True,
+                "disabled_reason": None,
+                "admins_bypass": False,
+            }
         return dict(row)
+
+    async def get_maintenance_block(
+        self,
+        guild_id: int,
+        section: str,
+        is_admin: bool,
+    ) -> dict | None:
+        sections = [section]
+        if section in {"badges", "modifiers", "tickets", "shop"}:
+            sections.insert(0, "all_objects")
+        rows = await self._pool().fetch(
+            """
+            SELECT section, disabled_reason, admins_bypass
+            FROM object_section_settings
+            WHERE guild_id = $1
+              AND section = ANY($2::TEXT[])
+              AND enabled = FALSE
+            ORDER BY ARRAY_POSITION($2::TEXT[], section)
+            """,
+            guild_id,
+            sections,
+        )
+        for row in rows:
+            if is_admin and row["admins_bypass"]:
+                continue
+            return dict(row)
+        return None
 
     async def toggle_object_section(
         self,
         guild_id: int,
         section: str,
         disabled_reason: str,
+        admins_bypass: bool,
     ) -> dict:
         async with self._pool().acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
                     """
                     INSERT INTO object_section_settings (
-                        guild_id, section, enabled, disabled_reason
+                        guild_id, section, enabled, disabled_reason, admins_bypass
                     )
-                    VALUES ($1, $2, TRUE, NULL)
+                    VALUES ($1, $2, TRUE, NULL, FALSE)
                     ON CONFLICT DO NOTHING
                     """,
                     guild_id,
@@ -1524,18 +1580,20 @@ class Database:
                     """
                     UPDATE object_section_settings
                     SET enabled = $3,
-                        disabled_reason = CASE WHEN $3 THEN NULL ELSE $4 END
+                        disabled_reason = CASE WHEN $3 THEN NULL ELSE $4 END,
+                        admins_bypass = CASE WHEN $3 THEN FALSE ELSE $5 END
                     WHERE guild_id = $1 AND section = $2
                     """,
                     guild_id,
                     section,
                     enabled,
                     disabled_reason,
+                    admins_bypass,
                 )
 
                 removed = []
                 refunds = []
-                if section == "modifiers" and not enabled:
+                if section in {"modifiers", "all_objects"} and not enabled:
                     removed = await connection.fetch(
                         """
                         WITH removed AS (
@@ -1579,6 +1637,7 @@ class Database:
                 return {
                     "enabled": enabled,
                     "disabled_reason": None if enabled else disabled_reason,
+                    "admins_bypass": False if enabled else admins_bypass,
                     "removed": [dict(row) for row in removed],
                     "refunds": [dict(row) for row in refunds],
                 }
@@ -1818,7 +1877,7 @@ class Database:
         )
         object_section_settings = await self._pool().fetch(
             """
-            SELECT section, enabled, disabled_reason
+            SELECT section, enabled, disabled_reason, admins_bypass
             FROM object_section_settings
             WHERE guild_id = $1
             ORDER BY section

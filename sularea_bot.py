@@ -35,11 +35,17 @@ OBJECT_SECTION_LABELS = {
     "badges": "insignias",
     "modifiers": "modificadores",
     "tickets": "tickets",
+    "shop": "tienda",
+    "all_objects": "todos los objetos y la tienda",
+    "all_commands": "todos los comandos del bot",
 }
-OBJECT_SECTION_SUBJECTS = {
-    "badges": "Las insignias",
-    "modifiers": "Los modificadores",
-    "tickets": "Los tickets",
+OBJECT_SECTION_DISABLED_MESSAGES = {
+    "badges": "Las insignias no se pueden usar temporalmente.",
+    "modifiers": "Los modificadores no se pueden usar temporalmente.",
+    "tickets": "Los tickets no se pueden usar temporalmente.",
+    "shop": "La tienda no está disponible temporalmente.",
+    "all_objects": "Los objetos y la tienda no están disponibles temporalmente.",
+    "all_commands": "Los comandos del bot están en mantenimiento temporalmente.",
 }
 
 
@@ -236,6 +242,34 @@ async def answer(
         await interaction.response.send_message(content, embed=embed, ephemeral=ephemeral)
 
 
+class SulareaCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        command = interaction.command
+        if command is not None and command.name == "estadoobjetos":
+            return True
+        if interaction.guild_id is None or not hasattr(self.client, "db"):
+            return True
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        is_admin = bool(
+            member is not None and member.guild_permissions.administrator
+        )
+        blocker = await self.client.db.get_maintenance_block(
+            interaction.guild_id,
+            "all_commands",
+            is_admin,
+        )
+        if blocker is None:
+            return True
+        await answer(
+            interaction,
+            disabled_object_section_text(
+                blocker["section"],
+                blocker["disabled_reason"],
+            ),
+        )
+        return False
+
+
 class SulareaBot(commands.Bot):
     db: Database
 
@@ -243,7 +277,11 @@ class SulareaBot(commands.Bot):
         intents = discord.Intents.default()
         intents.members = True
         intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            tree_cls=SulareaCommandTree,
+        )
         self.purchase_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self.modifier_webhooks: dict[int, discord.Webhook] = {}
         self.application_emojis: dict[int, discord.Emoji] = {}
@@ -807,19 +845,31 @@ async def find_ticket(interaction: discord.Interaction, name: str):
 
 
 def disabled_object_section_text(section: str, reason: str | None) -> str:
-    subject = OBJECT_SECTION_SUBJECTS[section]
     detail = (reason or "Mantenimiento temporal.").strip()
-    return f"{subject} no se pueden usar temporalmente.\n**Razón:** {detail}"
+    return f"{OBJECT_SECTION_DISABLED_MESSAGES[section]}\n**Razón:** {detail}"
 
 
 async def object_section_disabled_message(
-    guild_id: int,
+    interaction: discord.Interaction,
     section: str,
 ) -> str | None:
-    setting = await bot.db.get_object_section_setting(guild_id, section)
-    if setting["enabled"]:
+    if interaction.guild_id is None:
         return None
-    return disabled_object_section_text(section, setting["disabled_reason"])
+    member = guild_member(interaction)
+    is_admin = bool(
+        member is not None and member.guild_permissions.administrator
+    )
+    blocker = await bot.db.get_maintenance_block(
+        interaction.guild_id,
+        section,
+        is_admin,
+    )
+    if blocker is None:
+        return None
+    return disabled_object_section_text(
+        blocker["section"],
+        blocker["disabled_reason"],
+    )
 
 
 async def member_is_whitelisted(member: discord.Member) -> bool:
@@ -1408,6 +1458,13 @@ async def process_purchase(
     guild = interaction.guild
     if member is None or guild is None:
         return
+    disabled_message = await object_section_disabled_message(
+        interaction,
+        "shop",
+    )
+    if disabled_message is not None:
+        await answer(interaction, disabled_message)
+        return
     badge = await find_badge(interaction, item_name)
     modifier = None if badge is not None else await find_modifier(interaction, item_name)
     ticket = (
@@ -1834,10 +1891,11 @@ async def activate_owned_modifier(
         target.id,
         modifier_name_key,
         interaction.channel_id,
+        owner.guild_permissions.administrator,
     )
     if result["status"] == "disabled":
         return False, disabled_object_section_text(
-            "modifiers",
+            result.get("section", "modifiers"),
             result.get("reason"),
         )
     if result["status"] == "missing":
@@ -2035,7 +2093,7 @@ async def usar(
                 await answer(interaction, "Ese objeto no existe.")
                 return
             disabled_message = await object_section_disabled_message(
-                guild.id,
+                interaction,
                 "tickets",
             )
             if disabled_message is not None:
@@ -2099,19 +2157,20 @@ async def usar(
                 guild.id,
                 member.id,
                 ticket["name_key"],
+                member.guild_permissions.administrator,
             )
             if result is not None and result.get("status") == "disabled":
                 await answer(
                     interaction,
                     disabled_object_section_text(
-                        "tickets",
+                        result.get("section", "tickets"),
                         result.get("reason"),
                     ),
                 )
                 return
             if result is None:
                 disabled_message = await object_section_disabled_message(
-                    guild.id,
+                    interaction,
                     "tickets",
                 )
                 if disabled_message is not None:
@@ -2180,7 +2239,7 @@ async def usar(
             )
             return
         disabled_message = await object_section_disabled_message(
-            guild.id,
+            interaction,
             "modifiers",
         )
         if disabled_message is not None:
@@ -2207,7 +2266,7 @@ async def usar(
         )
         return
     disabled_message = await object_section_disabled_message(
-        guild.id,
+        interaction,
         "badges",
     )
     if disabled_message is not None:
@@ -2277,6 +2336,13 @@ async def usar(
 async def quitar(interaction: discord.Interaction) -> None:
     member = guild_member(interaction)
     if member is None or interaction.guild_id is None:
+        return
+    disabled_message = await object_section_disabled_message(
+        interaction,
+        "badges",
+    )
+    if disabled_message is not None:
+        await answer(interaction, disabled_message)
         return
     rows = await bot.db.list_badges(interaction.guild_id)
     color_ids = {row["color_role_id"] for row in rows}
@@ -2536,6 +2602,13 @@ async def mensajes(interaction: discord.Interaction) -> None:
 @app_commands.guild_only()
 async def tienda(interaction: discord.Interaction) -> None:
     assert interaction.guild_id is not None and interaction.guild is not None
+    disabled_message = await object_section_disabled_message(
+        interaction,
+        "shop",
+    )
+    if disabled_message is not None:
+        await answer(interaction, disabled_message)
+        return
     rows = await bot.db.list_shop_items(interaction.guild_id)
     if not rows:
         embed = discord.Embed(title="Mercado de Sularea", color=0xF59E0B)
@@ -4337,43 +4410,22 @@ async def borrarobjeto(interaction: discord.Interaction, objeto: str) -> None:
     )
 
 
-@bot.tree.command(
-    name="estadoobjetos",
-    description="Activa o desactiva temporalmente una sección completa de objetos.",
-)
-@app_commands.describe(
-    seccion="Sección cuyo estado quieres alternar",
-    razon="Motivo que verán los usuarios mientras esté desactivada",
-)
-@app_commands.choices(
-    seccion=[
-        app_commands.Choice(name="Insignias", value="badges"),
-        app_commands.Choice(name="Modificadores", value="modifiers"),
-        app_commands.Choice(name="Tickets", value="tickets"),
-    ]
-)
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def estadoobjetos(
+async def apply_object_section_toggle(
     interaction: discord.Interaction,
-    seccion: app_commands.Choice[str],
-    razon: str | None = None,
-) -> None:
+    section: str,
+    reason: str,
+    admins_bypass: bool,
+) -> str:
     guild = interaction.guild
     if guild is None:
-        return
-    cleaned_reason = (razon or "Mantenimiento temporal.").strip()
-    if len(cleaned_reason) > 500:
-        await answer(interaction, "La razón puede tener hasta 500 caracteres.")
-        return
-    await interaction.response.defer()
+        return "No pude identificar el servidor."
     result = await bot.db.toggle_object_section(
         guild.id,
-        seccion.value,
-        cleaned_reason,
+        section,
+        reason,
+        admins_bypass,
     )
-    label = OBJECT_SECTION_LABELS[seccion.value]
+    label = OBJECT_SECTION_LABELS[section]
     if result["enabled"]:
         action = "object_section_enable"
         description = f"Reactivó la sección de {label}."
@@ -4386,7 +4438,7 @@ async def estadoobjetos(
         color = 0x22C55E
     else:
         action = "object_section_disable"
-        description = f"Desactivó la sección de {label}. Razón: {cleaned_reason}"
+        description = f"Desactivó la sección de {label}. Razón: {reason}"
         removed = result["removed"]
         refunds = result["refunds"]
         for row in removed:
@@ -4407,19 +4459,26 @@ async def estadoobjetos(
         modifier_summary = (
             f"\n**Activaciones canceladas:** {len(removed)}"
             f"\n**Unidades reembolsadas:** {len(refunds)}"
-            if seccion.value == "modifiers"
+            if section in {"modifiers", "all_objects"}
             else ""
+        )
+        admin_summary = (
+            "\n**Administradores:** pueden ignorar este mantenimiento."
+            if admins_bypass
+            else "\n**Administradores:** también quedan sujetos al mantenimiento."
         )
         audit_description = (
             f"**Administrador:** {interaction.user.mention}\n"
             f"**Sección:** {label.capitalize()}\n"
             "**Nuevo estado:** Inactiva\n"
-            f"**Razón:** {cleaned_reason}"
+            f"**Razón:** {reason}"
+            f"{admin_summary}"
             f"{modifier_summary}"
         )
         response = (
             f"Desactivé temporalmente la sección de **{label}**.\n"
-            f"**Razón:** {cleaned_reason}"
+            f"**Razón:** {reason}"
+            f"{admin_summary}"
             f"{modifier_summary}"
         )
         color = 0xEF4444
@@ -4437,7 +4496,164 @@ async def estadoobjetos(
         audit_description,
         color=color,
     )
-    await answer(interaction, response)
+    return response
+
+
+class ObjectSectionToggleConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        author_id: int,
+        section: str,
+        reason: str,
+        admins_bypass: bool,
+        source_interaction: discord.Interaction,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.section = section
+        self.reason = reason
+        self.admins_bypass = admins_bypass
+        self.source_interaction = source_interaction
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Solo el administrador que abrió esta confirmación puede responder.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        try:
+            await self.source_interaction.edit_original_response(
+                content="La confirmación expiró. No se cambió ningún estado.",
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            await interaction.edit_original_response(
+                content="Ocurrió un error al cambiar el mantenimiento.",
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="Confirmar cambio", style=discord.ButtonStyle.danger, emoji="⚠️")
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="Aplicando el cambio de mantenimiento...",
+            view=self,
+        )
+        response = await apply_object_section_toggle(
+            interaction,
+            self.section,
+            self.reason,
+            self.admins_bypass,
+        )
+        await interaction.edit_original_response(content=response, view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Cambio cancelado. No se modificó ningún estado.",
+            view=None,
+        )
+        self.stop()
+
+
+@bot.tree.command(
+    name="estadoobjetos",
+    description="Alterna el mantenimiento de objetos, tienda o comandos.",
+)
+@app_commands.describe(
+    seccion="Sección cuyo estado quieres alternar",
+    permitir_admins="Permite que administradores ignoren este mantenimiento",
+    razon="Motivo que verán los usuarios mientras esté desactivada",
+)
+@app_commands.choices(
+    seccion=[
+        app_commands.Choice(name="Insignias", value="badges"),
+        app_commands.Choice(name="Modificadores", value="modifiers"),
+        app_commands.Choice(name="Tickets", value="tickets"),
+        app_commands.Choice(name="Tienda", value="shop"),
+        app_commands.Choice(name="Todos los objetos y tienda", value="all_objects"),
+        app_commands.Choice(name="Todos los comandos", value="all_commands"),
+    ]
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def estadoobjetos(
+    interaction: discord.Interaction,
+    seccion: app_commands.Choice[str],
+    permitir_admins: bool,
+    razon: str | None = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    cleaned_reason = (razon or "Mantenimiento temporal.").strip()
+    if len(cleaned_reason) > 500:
+        await answer(
+            interaction,
+            "La razón puede tener hasta 500 caracteres.",
+            ephemeral=True,
+        )
+        return
+    current = await bot.db.get_object_section_setting(guild.id, seccion.value)
+    action_text = "reactivar" if not current["enabled"] else "desactivar"
+    if not current["enabled"]:
+        admin_text = "Al reactivarlo, la opción `permitir_admins` deja de aplicar."
+    elif permitir_admins:
+        admin_text = "Los administradores podrán ignorarlo en comandos públicos."
+    else:
+        admin_text = "También afectará a administradores cuando usen comandos públicos."
+    if current["enabled"] and seccion.value == "all_commands" and not permitir_admins:
+        admin_text = (
+            "También bloqueará los comandos administrativos; `/estadoobjetos` "
+            "seguirá disponible."
+        )
+    refund_text = (
+        "\n⚠️ Las activaciones de modificadores se cancelarán y sus unidades se reembolsarán."
+        if current["enabled"] and seccion.value in {"modifiers", "all_objects"}
+        else ""
+    )
+    view = ObjectSectionToggleConfirmView(
+        interaction.user.id,
+        seccion.value,
+        cleaned_reason,
+        permitir_admins,
+        interaction,
+    )
+    await interaction.response.send_message(
+        f"⚠️ Vas a **{action_text}** el mantenimiento de "
+        f"**{OBJECT_SECTION_LABELS[seccion.value]}**.\n"
+        f"**Razón:** {cleaned_reason}\n{admin_text}{refund_text}\n\n"
+        "¿Confirmas el cambio?",
+        view=view,
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
@@ -4499,13 +4715,6 @@ async def estadomodificador(
             interaction,
             f"{miembro.mention} no tiene un modificador activo. Debes elegir cuál activar.",
         )
-        return
-    disabled_message = await object_section_disabled_message(
-        guild.id,
-        "modifiers",
-    )
-    if disabled_message is not None:
-        await answer(interaction, disabled_message)
         return
     item = await find_modifier(interaction, modificador)
     if item is None:
@@ -4674,8 +4883,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
             value=(
                 "`/inventario [miembro]` · `/objetos` · `/mensajes`\n"
                 "`/darobjeto` · `/quitarobjeto` · `/borrarobjeto`\n"
-                "`/estadoobjetos sección [razón]` · `/estadomodificador`\n"
-                "`/reembolsarmodificador miembro`"
+                "`/estadoobjetos sección permitir_admins [razón]`\n"
+                "`/estadomodificador` · `/reembolsarmodificador miembro`"
             ),
             inline=False,
         )
@@ -4739,6 +4948,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
 async def command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ) -> None:
+    if isinstance(error, app_commands.CheckFailure) and interaction.response.is_done():
+        return
     if isinstance(error, app_commands.MissingPermissions):
         await answer(interaction, "Solo los administradores pueden usar este comando.")
         return
