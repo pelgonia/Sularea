@@ -31,6 +31,8 @@ MODIFIER_PROBABILITY = "10"
 MAX_MODIFIER_DURATION_MINUTES = 1440
 MAX_MODIFIER_COOLDOWN_SECONDS = 3600
 MAX_MODIFIER_PROBABILITY_PART = 1_000_000
+MAX_AUTOMATIC_MESSAGES = 50
+MAX_AUTOMATIC_INTERVAL_MINUTES = 10_080
 CACHE_TTL_SECONDS = 10
 DEFAULT_COIN_EMOJI = "🪙"
 DEFAULT_WHITELIST_EMOJI = "⭐"
@@ -412,6 +414,8 @@ class SulareaBot(commands.Bot):
             modifier_expiration_loop.start()
         if not state_cache_refresh_loop.is_running():
             state_cache_refresh_loop.start()
+        if not automatic_message_loop.is_running():
+            automatic_message_loop.start()
 
     async def get_log_settings_cached(self, guild_id: int) -> dict | None:
         now = time.monotonic()
@@ -493,6 +497,8 @@ class SulareaBot(commands.Bot):
             modifier_expiration_loop.cancel()
         if state_cache_refresh_loop.is_running():
             state_cache_refresh_loop.cancel()
+        if automatic_message_loop.is_running():
+            automatic_message_loop.cancel()
         if hasattr(self, "db"):
             await self.db.close()
         await super().close()
@@ -723,6 +729,36 @@ async def state_cache_refresh_loop() -> None:
 
 @state_cache_refresh_loop.before_loop
 async def before_state_cache_refresh_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=30)
+async def automatic_message_loop() -> None:
+    if not hasattr(bot, "db"):
+        return
+    try:
+        due_messages = await bot.db.claim_due_automatic_messages()
+    except (OSError, asyncpg.PostgresError):
+        traceback.print_exc()
+        return
+    for due in due_messages:
+        guild = bot.get_guild(due["guild_id"])
+        if guild is None:
+            continue
+        channel = guild.get_channel(due["channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        try:
+            await channel.send(
+                due["content"],
+                allowed_mentions=discord.AllowedMentions.all(),
+            )
+        except discord.HTTPException:
+            traceback.print_exc()
+
+
+@automatic_message_loop.before_loop
+async def before_automatic_message_loop() -> None:
     await bot.wait_until_ready()
 
 
@@ -1409,6 +1445,49 @@ def modifier_message_index(messages: list[str], selected: str) -> int | None:
             index
             for index, message in enumerate(messages)
             if normalize_name(message) == normalized
+        ),
+        None,
+    )
+
+
+async def automatic_message_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None or not hasattr(bot, "db"):
+        return []
+    action = getattr(interaction.namespace, "accion", None)
+    if action == "add":
+        return []
+    rows = await bot.db.list_automatic_messages(interaction.guild_id)
+    search = normalize_name(current)
+    choices = []
+    for index, row in enumerate(rows, start=1):
+        preview = " ".join(row["content"].split())
+        label = f"{index}. {preview}"
+        searchable = f"{label} #{row['id']}"
+        if search and search not in normalize_name(searchable):
+            continue
+        choices.append(
+            app_commands.Choice(
+                name=label[:100],
+                value=f"#{row['id']}",
+            )
+        )
+    return choices[:25]
+
+
+def selected_automatic_message(rows, selected: str):
+    cleaned = selected.strip()
+    if cleaned.startswith("#") and cleaned[1:].isdigit():
+        message_id = int(cleaned[1:])
+        return next((row for row in rows if row["id"] == message_id), None)
+    normalized = normalize_name(cleaned)
+    return next(
+        (
+            row
+            for row in rows
+            if normalize_name(row["content"]) == normalized
         ),
         None,
     )
@@ -3747,6 +3826,333 @@ async def configurarregistro(
         await answer(interaction, "Registro de movimientos desactivado.")
 
 
+@bot.tree.command(
+    name="configurarmensajeautomatico",
+    description="Configura el canal y frecuencia de los mensajes automáticos.",
+)
+@app_commands.describe(
+    activado="Activa o desactiva los mensajes automáticos",
+    canal="Canal de texto; déjalo vacío para conservar el actual",
+    minutos="Minutos entre mensajes; déjalo vacío para conservar el valor actual",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configurarmensajeautomatico(
+    interaction: discord.Interaction,
+    activado: bool,
+    canal: discord.TextChannel | None = None,
+    minutos: app_commands.Range[
+        int,
+        1,
+        MAX_AUTOMATIC_INTERVAL_MINUTES,
+    ] | None = None,
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    current = await bot.db.get_automatic_message_settings(interaction.guild_id)
+    if current is None and (canal is None or minutos is None):
+        await answer(
+            interaction,
+            "La primera vez debes seleccionar **canal** y **minutos**.",
+        )
+        return
+    channel_id = canal.id if canal is not None else current["channel_id"]
+    interval_minutes = (
+        minutos if minutos is not None else current["interval_minutes"]
+    )
+    selected_channel = guild.get_channel(channel_id)
+    if activado and not isinstance(selected_channel, discord.TextChannel):
+        await answer(
+            interaction,
+            "El canal configurado ya no existe. Selecciona otro canal de texto.",
+        )
+        return
+    if isinstance(selected_channel, discord.TextChannel):
+        bot_member = guild.me
+        permissions = selected_channel.permissions_for(bot_member)
+        if activado and (
+            not permissions.view_channel
+            or not permissions.send_messages
+        ):
+            await answer(
+                interaction,
+                "Necesito **Ver canal** y **Enviar mensajes** en el canal elegido.",
+            )
+            return
+
+    await interaction.response.defer()
+    settings = await bot.db.set_automatic_message_settings(
+        interaction.guild_id,
+        channel_id,
+        interval_minutes,
+        activado,
+        interaction.user.id,
+    )
+    message_count = (
+        current["message_count"]
+        if current is not None
+        else len(await bot.db.list_automatic_messages(interaction.guild_id))
+    )
+    state = "activó" if activado else "desactivó"
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "automatic_messages_config",
+        None,
+        (
+            f"{state.capitalize()} los mensajes automáticos en el canal "
+            f"{channel_id} cada {interval_minutes} minutos."
+        ),
+    )
+    await send_audit_log(
+        guild,
+        "Mensajes automáticos configurados",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Estado:** {'Activo' if activado else 'Inactivo'}\n"
+        f"**Canal:** <#{channel_id}>\n"
+        f"**Intervalo:** {interval_minutes} minutos\n"
+        f"**Mensajes configurados:** {message_count}",
+        color=0x22C55E if activado else 0x6B7280,
+    )
+    next_send = (
+        f"\n**Próximo envío:** <t:{int(settings['next_send_at'].timestamp())}:R>"
+        if activado and message_count > 0
+        else ""
+    )
+    warning = (
+        "\n⚠️ Todavía no hay mensajes. Añade uno con "
+        "`/editarmensajeautomatico`."
+        if activado and message_count == 0
+        else ""
+    )
+    await answer(
+        interaction,
+        f"Mensajes automáticos **{'activados' if activado else 'desactivados'}** "
+        f"en <#{channel_id}> cada **{interval_minutes} minutos**."
+        f"{next_send}{warning}",
+    )
+
+
+@bot.tree.command(
+    name="editarmensajeautomatico",
+    description="Añade, edita o quita un mensaje automático.",
+)
+@app_commands.describe(
+    accion="Operación que se realizará",
+    mensaje="Texto al añadir; mensaje existente al editar o quitar",
+    nuevo_mensaje="Texto de reemplazo cuando la acción sea Editar",
+)
+@app_commands.choices(
+    accion=[
+        app_commands.Choice(name="Añadir", value="add"),
+        app_commands.Choice(name="Editar", value="edit"),
+        app_commands.Choice(name="Quitar", value="remove"),
+    ],
+)
+@app_commands.autocomplete(mensaje=automatic_message_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def editarmensajeautomatico(
+    interaction: discord.Interaction,
+    accion: str,
+    mensaje: app_commands.Range[str, 1, 2000],
+    nuevo_mensaje: app_commands.Range[str, 1, 2000] | None = None,
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    if accion == "add":
+        if nuevo_mensaje is not None:
+            await answer(
+                interaction,
+                "Para añadir, escribe el contenido solamente en **mensaje**.",
+            )
+            return
+        content = mensaje.strip()
+        if not content:
+            await answer(interaction, "El mensaje no puede estar vacío.")
+            return
+        await interaction.response.defer()
+        result = await bot.db.add_automatic_message(
+            interaction.guild_id,
+            content,
+            interaction.user.id,
+            MAX_AUTOMATIC_MESSAGES,
+        )
+        if result["status"] == "limit":
+            await answer(
+                interaction,
+                f"Solo puedes configurar hasta **{MAX_AUTOMATIC_MESSAGES} mensajes**.",
+            )
+            return
+        if result["status"] == "duplicate":
+            await answer(interaction, "Ese mensaje ya está configurado.")
+            return
+        changed = result["message"]
+        action_label = "añadido"
+        movement_action = "automatic_message_add"
+        response = (
+            f"Añadí el mensaje automático **#{changed['id']}**. "
+            "Se enviará cuando llegue su turno en la rotación."
+        )
+    else:
+        rows = await bot.db.list_automatic_messages(interaction.guild_id)
+        selected = selected_automatic_message(rows, mensaje)
+        if selected is None:
+            await answer(
+                interaction,
+                "Ese mensaje automático no existe. Elígelo de la lista.",
+            )
+            return
+        if accion == "edit":
+            if nuevo_mensaje is None or not nuevo_mensaje.strip():
+                await answer(
+                    interaction,
+                    "Para editar debes escribir **nuevo_mensaje**.",
+                )
+                return
+            content = nuevo_mensaje.strip()
+            await interaction.response.defer()
+            result = await bot.db.edit_automatic_message(
+                interaction.guild_id,
+                selected["id"],
+                content,
+            )
+            if result["status"] == "duplicate":
+                await answer(interaction, "Ese texto ya pertenece a otro mensaje.")
+                return
+            if result["status"] == "not_found":
+                await answer(interaction, "Ese mensaje ya no existe.")
+                return
+            changed = result["message"]
+            action_label = "editado"
+            movement_action = "automatic_message_edit"
+            response = f"Actualicé el mensaje automático **#{changed['id']}**."
+        elif accion == "remove":
+            if nuevo_mensaje is not None:
+                await answer(
+                    interaction,
+                    "La opción **nuevo_mensaje** no se usa al quitar.",
+                )
+                return
+            await interaction.response.defer()
+            removed = await bot.db.remove_automatic_message(
+                interaction.guild_id,
+                selected["id"],
+            )
+            if removed is None:
+                await answer(interaction, "Ese mensaje ya no existe.")
+                return
+            changed = dict(removed)
+            action_label = "quitado"
+            movement_action = "automatic_message_remove"
+            response = f"Quité el mensaje automático **#{changed['id']}**."
+        else:
+            await answer(interaction, "La acción seleccionada no es válida.")
+            return
+
+    preview = " ".join(changed["content"].split())[:300]
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        movement_action,
+        None,
+        f"Mensaje automático {action_label} #{changed['id']}: {preview}",
+    )
+    await send_audit_log(
+        guild,
+        f"Mensaje automático {action_label}",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**ID:** {changed['id']}\n"
+        f"**Contenido:** {changed['content'][:1000]}",
+        color=0x3B82F6,
+    )
+    await answer(interaction, response)
+
+
+def automatic_message_pages(rows) -> list[str]:
+    if not rows:
+        return ["*No hay mensajes automáticos configurados.*"]
+    pages = []
+    current = ""
+    for index, row in enumerate(rows, start=1):
+        block = f"**{index}.** {row['content']}\n`ID: #{row['id']}`"
+        separator = "\n\n" if current else ""
+        if len(current) + len(separator) + len(block) > 3800:
+            pages.append(current)
+            current = block
+        else:
+            current += separator + block
+    if current:
+        pages.append(current)
+    return pages
+
+
+@bot.tree.command(
+    name="mensajesautomaticos",
+    description="Muestra la configuración y lista de mensajes automáticos.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def mensajesautomaticos(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    settings, rows = await asyncio.gather(
+        bot.db.get_automatic_message_settings(interaction.guild_id),
+        bot.db.list_automatic_messages(interaction.guild_id),
+    )
+    pages = automatic_message_pages(rows)
+    await interaction.response.defer()
+    for index, page in enumerate(pages, start=1):
+        embed = discord.Embed(
+            title=f"Mensajes automáticos · {index}/{len(pages)}",
+            description=page,
+            color=0x3B82F6,
+        )
+        if index == 1:
+            if settings is None:
+                embed.add_field(
+                    name="Configuración",
+                    value=(
+                        "Sin configurar. Usa `/configurarmensajeautomatico` "
+                        "para elegir canal e intervalo."
+                    ),
+                    inline=False,
+                )
+            else:
+                next_send = (
+                    f"<t:{int(settings['next_send_at'].timestamp())}:R>"
+                    if settings["enabled"] and rows
+                    else "En pausa"
+                )
+                embed.add_field(
+                    name="Configuración",
+                    value=(
+                        f"**Estado:** {'Activo' if settings['enabled'] else 'Inactivo'}\n"
+                        f"**Canal:** <#{settings['channel_id']}>\n"
+                        f"**Intervalo:** {settings['interval_minutes']} minutos\n"
+                        f"**Próximo envío:** {next_send}\n"
+                        f"**Mensajes:** {len(rows)}/{MAX_AUTOMATIC_MESSAGES}"
+                    ),
+                    inline=False,
+                )
+        embed.set_footer(text="Los mensajes se envían en rotación y en este orden.")
+        if guild.icon is not None:
+            embed.set_thumbnail(url=guild.icon.url)
+        await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="añadiradmin", description="Añade un miembro al equipo de tickets.")
 @app_commands.describe(miembro="Miembro que recibirá las alertas de tickets")
 @app_commands.guild_only()
@@ -3996,6 +4402,10 @@ async def estadisticas(interaction: discord.Interaction) -> None:
     embed.add_field(name="Compras realizadas", value=str(stats["purchases"]))
     embed.add_field(name="Eventos ganados", value=str(stats["event_wins"]))
     embed.add_field(name="Eventos activos", value=str(stats["active_events"]))
+    embed.add_field(
+        name="Mensajes automáticos",
+        value=str(stats["automatic_messages"]),
+    )
     embed.add_field(name="Modificadores activos", value=str(stats["active_modifiers"]))
     embed.add_field(name="Movimientos guardados", value=str(stats["movements"]))
     await answer(interaction, embed=embed)
@@ -6646,6 +7056,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/revisarbalance` · `/modificarbalance`\n"
                 "`/eventopregunta` · `/cancelarevento`\n"
                 "`/configurarregistro` · `/estadisticas` · `/exportardatos` · `/say`\n"
+                "`/configurarmensajeautomatico` · `/editarmensajeautomatico`\n"
+                "`/mensajesautomaticos`\n"
                 "`/configurarmoneda` · `/configuraremojiwhitelist`"
             ),
             inline=False,

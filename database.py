@@ -222,6 +222,36 @@ ADD COLUMN IF NOT EXISTS coin_emoji TEXT;
 ALTER TABLE guild_settings
 ADD COLUMN IF NOT EXISTS whitelist_emoji TEXT;
 
+CREATE TABLE IF NOT EXISTS automatic_message_settings (
+    guild_id BIGINT PRIMARY KEY,
+    channel_id BIGINT NOT NULL,
+    interval_minutes INTEGER NOT NULL
+        CHECK (interval_minutes BETWEEN 1 AND 10080),
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    next_send_at TIMESTAMPTZ NOT NULL,
+    next_message_index INTEGER NOT NULL DEFAULT 0
+        CHECK (next_message_index >= 0),
+    updated_by BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS automatic_message_settings_due_index
+ON automatic_message_settings (next_send_at)
+WHERE enabled = TRUE;
+
+CREATE TABLE IF NOT EXISTS automatic_messages (
+    id BIGSERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    content TEXT NOT NULL
+        CHECK (CHAR_LENGTH(content) BETWEEN 1 AND 2000),
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS automatic_messages_guild_index
+ON automatic_messages (guild_id, id);
+
 CREATE TABLE IF NOT EXISTS object_section_settings (
     guild_id BIGINT NOT NULL,
     section TEXT NOT NULL,
@@ -2949,6 +2979,277 @@ class Database:
             )
         )
 
+    async def get_automatic_message_settings(self, guild_id: int):
+        return await self._pool().fetchrow(
+            """
+            SELECT settings.guild_id, settings.channel_id,
+                   settings.interval_minutes, settings.enabled,
+                   settings.next_send_at, settings.next_message_index,
+                   settings.updated_by, settings.updated_at,
+                   (
+                       SELECT COUNT(*)
+                       FROM automatic_messages AS message
+                       WHERE message.guild_id = settings.guild_id
+                   ) AS message_count
+            FROM automatic_message_settings AS settings
+            WHERE settings.guild_id = $1
+            """,
+            guild_id,
+        )
+
+    async def set_automatic_message_settings(
+        self,
+        guild_id: int,
+        channel_id: int,
+        interval_minutes: int,
+        enabled: bool,
+        actor_id: int,
+    ):
+        return await self._pool().fetchrow(
+            """
+            INSERT INTO automatic_message_settings (
+                guild_id, channel_id, interval_minutes, enabled,
+                next_send_at, next_message_index, updated_by, updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4,
+                NOW() + ($3::INTEGER * INTERVAL '1 minute'),
+                0, $5, NOW()
+            )
+            ON CONFLICT (guild_id)
+            DO UPDATE SET
+                channel_id = EXCLUDED.channel_id,
+                interval_minutes = EXCLUDED.interval_minutes,
+                enabled = EXCLUDED.enabled,
+                next_send_at = EXCLUDED.next_send_at,
+                next_message_index = CASE
+                    WHEN automatic_message_settings.channel_id <> EXCLUDED.channel_id
+                    THEN 0
+                    ELSE automatic_message_settings.next_message_index
+                END,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = NOW()
+            RETURNING *
+            """,
+            guild_id,
+            channel_id,
+            interval_minutes,
+            enabled,
+            actor_id,
+        )
+
+    async def list_automatic_messages(self, guild_id: int):
+        return await self._pool().fetch(
+            """
+            SELECT id, content, created_by, created_at, updated_at
+            FROM automatic_messages
+            WHERE guild_id = $1
+            ORDER BY id
+            """,
+            guild_id,
+        )
+
+    async def add_automatic_message(
+        self,
+        guild_id: int,
+        content: str,
+        actor_id: int,
+        max_messages: int,
+    ) -> dict:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1::BIGINT)",
+                    guild_id,
+                )
+                count = await connection.fetchval(
+                    "SELECT COUNT(*) FROM automatic_messages WHERE guild_id = $1",
+                    guild_id,
+                )
+                if count >= max_messages:
+                    return {"status": "limit", "count": count}
+                duplicate = await connection.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM automatic_messages
+                        WHERE guild_id = $1
+                          AND LOWER(BTRIM(content)) = LOWER(BTRIM($2))
+                    )
+                    """,
+                    guild_id,
+                    content,
+                )
+                if duplicate:
+                    return {"status": "duplicate", "count": count}
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO automatic_messages (
+                        guild_id, content, created_by
+                    )
+                    VALUES ($1, $2, $3)
+                    RETURNING id, content, created_by, created_at, updated_at
+                    """,
+                    guild_id,
+                    content,
+                    actor_id,
+                )
+                if count == 0:
+                    await connection.execute(
+                        """
+                        UPDATE automatic_message_settings
+                        SET next_send_at = NOW() + (
+                                interval_minutes * INTERVAL '1 minute'
+                            ),
+                            next_message_index = 0
+                        WHERE guild_id = $1
+                        """,
+                        guild_id,
+                    )
+                return {"status": "added", "message": dict(row)}
+
+    async def edit_automatic_message(
+        self,
+        guild_id: int,
+        message_id: int,
+        content: str,
+    ) -> dict:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1::BIGINT)",
+                    guild_id,
+                )
+                duplicate = await connection.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM automatic_messages
+                        WHERE guild_id = $1
+                          AND id <> $2
+                          AND LOWER(BTRIM(content)) = LOWER(BTRIM($3))
+                    )
+                    """,
+                    guild_id,
+                    message_id,
+                    content,
+                )
+                if duplicate:
+                    return {"status": "duplicate"}
+                row = await connection.fetchrow(
+                    """
+                    UPDATE automatic_messages
+                    SET content = $3, updated_at = NOW()
+                    WHERE guild_id = $1 AND id = $2
+                    RETURNING id, content, created_by, created_at, updated_at
+                    """,
+                    guild_id,
+                    message_id,
+                    content,
+                )
+                if row is None:
+                    return {"status": "not_found"}
+                return {"status": "edited", "message": dict(row)}
+
+    async def remove_automatic_message(
+        self,
+        guild_id: int,
+        message_id: int,
+    ):
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1::BIGINT)",
+                    guild_id,
+                )
+                row = await connection.fetchrow(
+                    """
+                    DELETE FROM automatic_messages
+                    WHERE guild_id = $1 AND id = $2
+                    RETURNING id, content, created_by, created_at, updated_at
+                    """,
+                    guild_id,
+                    message_id,
+                )
+                remaining = await connection.fetchval(
+                    "SELECT COUNT(*) FROM automatic_messages WHERE guild_id = $1",
+                    guild_id,
+                )
+                if remaining == 0:
+                    await connection.execute(
+                        """
+                        UPDATE automatic_message_settings
+                        SET next_message_index = 0
+                        WHERE guild_id = $1
+                        """,
+                        guild_id,
+                    )
+                return row
+
+    async def claim_due_automatic_messages(self, limit: int = 25) -> list[dict]:
+        claimed = []
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                settings_rows = await connection.fetch(
+                    """
+                    SELECT settings.guild_id, settings.channel_id,
+                           settings.interval_minutes,
+                           settings.next_message_index
+                    FROM automatic_message_settings AS settings
+                    WHERE settings.enabled = TRUE
+                      AND settings.next_send_at <= NOW()
+                      AND EXISTS (
+                          SELECT 1
+                          FROM automatic_messages AS message
+                          WHERE message.guild_id = settings.guild_id
+                      )
+                    ORDER BY settings.next_send_at
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    limit,
+                )
+                for settings in settings_rows:
+                    messages = await connection.fetch(
+                        """
+                        SELECT id, content
+                        FROM automatic_messages
+                        WHERE guild_id = $1
+                        ORDER BY id
+                        """,
+                        settings["guild_id"],
+                    )
+                    if not messages:
+                        continue
+                    selected_index = (
+                        settings["next_message_index"] % len(messages)
+                    )
+                    selected = messages[selected_index]
+                    schedule = await connection.fetchrow(
+                        """
+                        UPDATE automatic_message_settings
+                        SET next_message_index = $2,
+                            next_send_at = NOW() + (
+                                interval_minutes * INTERVAL '1 minute'
+                            )
+                        WHERE guild_id = $1
+                        RETURNING next_send_at
+                        """,
+                        settings["guild_id"],
+                        (selected_index + 1) % len(messages),
+                    )
+                    claimed.append(
+                        {
+                            "guild_id": settings["guild_id"],
+                            "channel_id": settings["channel_id"],
+                            "interval_minutes": settings["interval_minutes"],
+                            "message_id": selected["id"],
+                            "content": selected["content"],
+                            "next_send_at": schedule["next_send_at"],
+                        }
+                    )
+        return claimed
+
     async def get_log_settings(self, guild_id: int):
         return await self._pool().fetchrow(
             """
@@ -3297,6 +3598,7 @@ class Database:
                 (SELECT COUNT(*) FROM tickets WHERE guild_id = $1) AS tickets,
                 (SELECT COUNT(*) FROM ticket_admins WHERE guild_id = $1) AS ticket_admins,
                 (SELECT COUNT(*) FROM whitelist_entries WHERE guild_id = $1) AS whitelist_entries,
+                (SELECT COUNT(*) FROM automatic_messages WHERE guild_id = $1) AS automatic_messages,
                 (SELECT COUNT(*) FROM movements WHERE guild_id = $1) AS movements,
                 (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action IN ('purchase', 'modifier_purchase', 'ticket_purchase')) AS purchases,
                 (
@@ -3392,6 +3694,10 @@ class Database:
             guild_id,
         )
         settings = await self.get_log_settings(guild_id)
+        automatic_message_settings = await self.get_automatic_message_settings(
+            guild_id
+        )
+        automatic_messages = await self.list_automatic_messages(guild_id)
         ticket_admins = await self.list_ticket_admins(guild_id)
         whitelist_entries = await self.list_whitelist_entries(guild_id)
         movements = await self._pool().fetch(
@@ -3437,6 +3743,14 @@ class Database:
                 dict(row) for row in object_section_settings
             ],
             "settings": dict(settings) if settings else None,
+            "automatic_message_settings": (
+                dict(automatic_message_settings)
+                if automatic_message_settings
+                else None
+            ),
+            "automatic_messages": [
+                dict(row) for row in automatic_messages
+            ],
             "ticket_admins": [dict(row) for row in ticket_admins],
             "whitelist_entries": [dict(row) for row in whitelist_entries],
             "movements": [dict(row) for row in movements],
