@@ -95,6 +95,38 @@ ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
 CREATE INDEX IF NOT EXISTS tickets_shop_index
 ON tickets (guild_id, purchasable, price);
 
+CREATE TABLE IF NOT EXISTS shop_categories (
+    guild_id BIGINT NOT NULL,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (guild_id, name_key)
+);
+
+WITH existing_categories AS (
+    SELECT guild_id, BTRIM(shop_section) AS name
+    FROM badges
+    WHERE shop_section IS NOT NULL AND BTRIM(shop_section) <> ''
+    UNION
+    SELECT guild_id, BTRIM(shop_section) AS name
+    FROM modifiers
+    WHERE shop_section IS NOT NULL AND BTRIM(shop_section) <> ''
+    UNION
+    SELECT guild_id, BTRIM(shop_section) AS name
+    FROM tickets
+    WHERE shop_section IS NOT NULL AND BTRIM(shop_section) <> ''
+),
+deduplicated_categories AS (
+    SELECT DISTINCT ON (guild_id, LOWER(name))
+           guild_id, name, LOWER(name) AS name_key
+    FROM existing_categories
+    ORDER BY guild_id, LOWER(name), name
+)
+INSERT INTO shop_categories (guild_id, name, name_key, description)
+SELECT guild_id, name, name_key, ''
+FROM deduplicated_categories
+ON CONFLICT (guild_id, name_key) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS modifier_inventory (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
@@ -567,6 +599,133 @@ class Database:
             """,
             guild_id,
         )
+
+    async def get_shop_category(self, guild_id: int, name_key: str):
+        return await self._pool().fetchrow(
+            """
+            SELECT name, name_key, description
+            FROM shop_categories
+            WHERE guild_id = $1 AND name_key = $2
+            """,
+            guild_id,
+            name_key,
+        )
+
+    async def list_shop_categories(self, guild_id: int):
+        return await self._pool().fetch(
+            """
+            SELECT name, name_key, description
+            FROM shop_categories
+            WHERE guild_id = $1
+            ORDER BY
+                CASE WHEN name_key = 'general' THEN 0 ELSE 1 END,
+                name
+            """,
+            guild_id,
+        )
+
+    async def create_shop_category(
+        self,
+        guild_id: int,
+        name: str,
+        name_key: str,
+        description: str,
+    ) -> None:
+        await self._pool().execute(
+            """
+            INSERT INTO shop_categories (
+                guild_id, name, name_key, description
+            )
+            VALUES ($1, $2, $3, $4)
+            """,
+            guild_id,
+            name,
+            name_key,
+            description,
+        )
+
+    async def update_shop_category(
+        self,
+        guild_id: int,
+        old_name_key: str,
+        name: str,
+        name_key: str,
+        description: str,
+    ) -> bool:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                current = await connection.fetchrow(
+                    """
+                    SELECT name
+                    FROM shop_categories
+                    WHERE guild_id = $1 AND name_key = $2
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    old_name_key,
+                )
+                if current is None:
+                    return False
+                await connection.execute(
+                    """
+                    UPDATE shop_categories
+                    SET name = $3, name_key = $4, description = $5
+                    WHERE guild_id = $1 AND name_key = $2
+                    """,
+                    guild_id,
+                    old_name_key,
+                    name,
+                    name_key,
+                    description,
+                )
+                for table in ("badges", "modifiers", "tickets"):
+                    await connection.execute(
+                        f"""
+                        UPDATE {table}
+                        SET shop_section = $3
+                        WHERE guild_id = $1 AND LOWER(shop_section) = LOWER($2)
+                        """,
+                        guild_id,
+                        current["name"],
+                        name,
+                    )
+                return True
+
+    async def delete_shop_category(
+        self,
+        guild_id: int,
+        name_key: str,
+    ) -> dict | None:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                category = await connection.fetchrow(
+                    """
+                    DELETE FROM shop_categories
+                    WHERE guild_id = $1 AND name_key = $2
+                    RETURNING name, description
+                    """,
+                    guild_id,
+                    name_key,
+                )
+                if category is None:
+                    return None
+                affected = 0
+                for table in ("badges", "modifiers", "tickets"):
+                    result = await connection.execute(
+                        f"""
+                        UPDATE {table}
+                        SET shop_section = NULL
+                        WHERE guild_id = $1 AND LOWER(shop_section) = LOWER($2)
+                        """,
+                        guild_id,
+                        category["name"],
+                    )
+                    affected += int(result.rsplit(" ", 1)[-1])
+                return {
+                    "name": category["name"],
+                    "description": category["description"],
+                    "affected_items": affected,
+                }
 
     async def create_modifier(
         self,
@@ -1593,7 +1752,7 @@ class Database:
 
                 removed = []
                 refunds = []
-                if section in {"modifiers", "all_objects"} and not enabled:
+                if section in {"modifiers", "all_objects", "all_commands"} and not enabled:
                     removed = await connection.fetch(
                         """
                         WITH removed AS (
@@ -1605,6 +1764,7 @@ class Database:
                                removed.owner_user_id,
                                removed.modifier_id,
                                modifier.name,
+                               removed.expires_at > NOW() AS was_active,
                                (
                                    removed.owner_user_id IS NOT NULL
                                    AND removed.expires_at > NOW()
@@ -1850,6 +2010,7 @@ class Database:
             """,
             guild_id,
         )
+        shop_categories = await self.list_shop_categories(guild_id)
         modifier_inventory = await self._pool().fetch(
             """
             SELECT user_id, modifier_id, quantity
@@ -1909,6 +2070,7 @@ class Database:
             "badges": [dict(row) for row in badges],
             "modifiers": [dict(row) for row in modifiers],
             "tickets": [dict(row) for row in tickets],
+            "shop_categories": [dict(row) for row in shop_categories],
             "modifier_inventory": [dict(row) for row in modifier_inventory],
             "ticket_inventory": [dict(row) for row in ticket_inventory],
             "active_modifiers": [dict(row) for row in active_modifiers],

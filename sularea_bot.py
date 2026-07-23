@@ -844,6 +844,16 @@ async def find_ticket(interaction: discord.Interaction, name: str):
     return await bot.db.get_ticket(interaction.guild_id, normalize_name(name))
 
 
+async def find_shop_category(interaction: discord.Interaction, name: str):
+    if interaction.guild_id is None:
+        return None
+    cleaned = name.removeprefix("categoria:").strip()
+    return await bot.db.get_shop_category(
+        interaction.guild_id,
+        normalize_name(cleaned),
+    )
+
+
 def disabled_object_section_text(section: str, reason: str | None) -> str:
     detail = (reason or "Mantenimiento temporal.").strip()
     return f"{OBJECT_SECTION_DISABLED_MESSAGES[section]}\n**Razón:** {detail}"
@@ -1125,6 +1135,7 @@ async def editable_object_autocomplete(
     badges = await bot.db.list_badges(interaction.guild_id)
     modifiers = await bot.db.list_modifiers(interaction.guild_id)
     tickets = await bot.db.list_tickets(interaction.guild_id)
+    categories = await bot.db.list_shop_categories(interaction.guild_id)
     search = normalize_name(current)
     choices = [
         app_commands.Choice(
@@ -1150,7 +1161,26 @@ async def editable_object_autocomplete(
         for row in tickets
         if search in row["name_key"]
     )
+    choices.extend(
+        app_commands.Choice(
+            name=f"Categoría · {row['name']}"[:100],
+            value=f"categoria:{row['name']}"[:100],
+        )
+        for row in categories
+        if search in row["name_key"]
+    )
     return choices[:25]
+
+
+async def deletable_object_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    choices = await editable_object_autocomplete(interaction, current)
+    return [
+        choice
+        for choice in choices
+        if not str(choice.value).startswith("categoria:")
+    ][:25]
 
 
 async def shop_autocomplete(
@@ -1178,12 +1208,13 @@ async def shop_section_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     if interaction.guild_id is None or not hasattr(bot, "db"):
         return []
-    rows = await bot.db.list_shop_items(interaction.guild_id)
+    rows = await bot.db.list_shop_categories(interaction.guild_id)
     search = normalize_name(current)
-    sections: dict[str, str] = {}
-    for row in rows:
-        section = shop_section_name(row["shop_section"])
-        sections.setdefault(normalize_name(section), section)
+    sections = {
+        row["name_key"]: row["name"]
+        for row in rows
+    }
+    sections.setdefault(normalize_name(DEFAULT_SHOP_SECTION), DEFAULT_SHOP_SECTION)
     return [
         app_commands.Choice(name=section[:100], value=section[:100])
         for key, section in sorted(sections.items(), key=lambda item: item[0])
@@ -1191,31 +1222,47 @@ async def shop_section_autocomplete(
     ][:25]
 
 
-async def shop_section_is_available(
+async def category_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None or not hasattr(bot, "db"):
+        return []
+    rows = await bot.db.list_shop_categories(interaction.guild_id)
+    search = normalize_name(current)
+    return [
+        app_commands.Choice(name=row["name"][:100], value=row["name"][:100])
+        for row in rows
+        if search in row["name_key"]
+    ][:25]
+
+
+async def resolve_shop_section(
     guild_id: int,
     section_name: str,
-    *,
-    excluding_item: tuple[str, str] | None = None,
-) -> bool:
-    rows = await bot.db.list_shop_items(guild_id)
-    sections = {
-        normalize_name(shop_section_name(row["shop_section"]))
-        for row in rows
-        if excluding_item is None
-        or (row["item_type"], row["name_key"]) != excluding_item
+) -> str | None:
+    if normalize_name(section_name) == normalize_name(DEFAULT_SHOP_SECTION):
+        return DEFAULT_SHOP_SECTION
+    category = await bot.db.get_shop_category(
+        guild_id,
+        normalize_name(section_name),
+    )
+    return category["name"] if category is not None else None
+
+
+def group_shop_badges(
+    rows: list,
+    categories: list,
+) -> list[tuple[str, str, list]]:
+    grouped: dict[str, tuple[str, str, list]] = {
+        row["name_key"]: (row["name"], row["description"], [])
+        for row in categories
     }
-    sections.add(normalize_name(section_name))
-    return len(sections) <= MAX_SHOP_SECTIONS
-
-
-def group_shop_badges(rows: list) -> list[tuple[str, list]]:
-    grouped: dict[str, tuple[str, list]] = {}
     for row in rows:
         section_name = shop_section_name(row["shop_section"])
         section_key = normalize_name(section_name)
         if section_key not in grouped:
-            grouped[section_key] = (section_name, [])
-        grouped[section_key][1].append(row)
+            grouped[section_key] = (section_name, "", [])
+        grouped[section_key][2].append(row)
     return sorted(
         grouped.values(),
         key=lambda section: (
@@ -1227,10 +1274,10 @@ def group_shop_badges(rows: list) -> list[tuple[str, list]]:
 
 def make_shop_embed(
     guild: discord.Guild,
-    sections: list[tuple[str, list]],
+    sections: list[tuple[str, str, list]],
     selected_index: int,
 ) -> discord.Embed:
-    section_name, rows = sections[selected_index]
+    section_name, section_description, rows = sections[selected_index]
     item_lines = []
     for row in rows:
         prefix = f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**"
@@ -1251,17 +1298,22 @@ def make_shop_embed(
                 f"{money(row['price'], guild.id)}\n"
                 f"  {row['description']}"
             )
-    items = "\n".join(item_lines)
+    items = "\n".join(item_lines) if item_lines else "*No hay objetos en esta categoría.*"
+    description = (
+        f"__**{section_name}**__\n{section_description}\n\n{items}"
+        if section_description
+        else f"__**{section_name}**__\n\n{items}"
+    )
     embed = discord.Embed(
         title="Mercado de Sularea",
-        description=f"__**{section_name}**__\n\n{items}"[:4000],
+        description=description[:4000],
         color=0xF59E0B,
     )
     if guild.icon is not None:
         embed.set_thumbnail(url=guild.icon.url)
     embed.set_footer(
         text=(
-            f"Apartado {selected_index + 1} de {len(sections)} · "
+            f"Categoría {selected_index + 1} de {len(sections)} · "
             "Usa el menú para cambiar y /comprar para obtener un objeto."
         )
     )
@@ -1276,15 +1328,20 @@ class ShopSectionSelect(discord.ui.Select):
                 label=section_name[:100],
                 value=str(index),
                 description=(
-                    f"{len(rows)} "
-                    f"{'objeto disponible' if len(rows) == 1 else 'objetos disponibles'}"
+                    section_description
+                    or (
+                        f"{len(rows)} "
+                        f"{'objeto disponible' if len(rows) == 1 else 'objetos disponibles'}"
+                    )
                 )[:100],
                 default=index == 0,
             )
-            for index, (section_name, rows) in enumerate(shop_view.sections)
+            for index, (section_name, section_description, rows) in enumerate(
+                shop_view.sections
+            )
         ]
         super().__init__(
-            placeholder=f"Apartado: {shop_view.sections[0][0]}"[:150],
+            placeholder=f"Categoría: {shop_view.sections[0][0]}"[:150],
             min_values=1,
             max_values=1,
             options=options,
@@ -1296,7 +1353,7 @@ class ShopSectionSelect(discord.ui.Select):
         self.shop_view.selected_index = selected_index
         for option in self.options:
             option.default = option.value == str(selected_index)
-        self.placeholder = f"Apartado: {self.shop_view.sections[selected_index][0]}"[:150]
+        self.placeholder = f"Categoría: {self.shop_view.sections[selected_index][0]}"[:150]
         await interaction.response.edit_message(
             embed=make_shop_embed(
                 self.shop_view.guild,
@@ -1311,7 +1368,7 @@ class ShopView(discord.ui.View):
     def __init__(
         self,
         guild: discord.Guild,
-        sections: list[tuple[str, list]],
+        sections: list[tuple[str, str, list]],
         author_id: int,
     ) -> None:
         super().__init__(timeout=300)
@@ -1366,7 +1423,7 @@ class ShopView(discord.ui.View):
         item: discord.ui.Item,
     ) -> None:
         traceback.print_exception(type(error), error, error.__traceback__)
-        await answer(interaction, "No pude cambiar el apartado de la tienda.", ephemeral=True)
+        await answer(interaction, "No pude cambiar la categoría de la tienda.", ephemeral=True)
 
 
 class InactiveTicketPurchaseConfirmView(discord.ui.View):
@@ -2471,7 +2528,7 @@ async def objetos(interaction: discord.Interaction) -> None:
         for row in badges:
             sale = (
                 f"Sí — {money(row['price'], guild.id)} · "
-                f"Apartado: **{shop_section_name(row['shop_section'])}**"
+                f"Categoría: **{shop_section_name(row['shop_section'])}**"
                 if row["purchasable"]
                 else "No"
             )
@@ -2487,7 +2544,7 @@ async def objetos(interaction: discord.Interaction) -> None:
         for row in modifiers:
             sale = (
                 f"Sí — {money(row['price'], guild.id)} · "
-                f"Apartado: **{shop_section_name(row['shop_section'])}**"
+                f"Categoría: **{shop_section_name(row['shop_section'])}**"
                 if row["purchasable"]
                 else "No"
             )
@@ -2505,7 +2562,7 @@ async def objetos(interaction: discord.Interaction) -> None:
         for row in tickets:
             sale = (
                 f"Sí — {money(row['price'], guild.id)} · "
-                f"Apartado: **{shop_section_name(row['shop_section'])}**"
+                f"Categoría: **{shop_section_name(row['shop_section'])}**"
                 if row["purchasable"]
                 else "No"
             )
@@ -2598,7 +2655,7 @@ async def mensajes(interaction: discord.Interaction) -> None:
         await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="tienda", description="Abre el Mercado de Sularea por apartados.")
+@bot.tree.command(name="tienda", description="Abre el Mercado de Sularea por categorías.")
 @app_commands.guild_only()
 async def tienda(interaction: discord.Interaction) -> None:
     assert interaction.guild_id is not None and interaction.guild is not None
@@ -2609,8 +2666,11 @@ async def tienda(interaction: discord.Interaction) -> None:
     if disabled_message is not None:
         await answer(interaction, disabled_message)
         return
-    rows = await bot.db.list_shop_items(interaction.guild_id)
-    if not rows:
+    rows, categories = await asyncio.gather(
+        bot.db.list_shop_items(interaction.guild_id),
+        bot.db.list_shop_categories(interaction.guild_id),
+    )
+    if not rows and not categories:
         embed = discord.Embed(title="Mercado de Sularea", color=0xF59E0B)
         if interaction.guild.icon is not None:
             embed.set_thumbnail(url=interaction.guild.icon.url)
@@ -2618,7 +2678,7 @@ async def tienda(interaction: discord.Interaction) -> None:
         await answer(interaction, embed=embed)
         return
 
-    sections = group_shop_badges(list(rows))
+    sections = group_shop_badges(list(rows), list(categories))
     view = ShopView(interaction.guild, sections, interaction.user.id)
     await interaction.response.send_message(
         embed=make_shop_embed(interaction.guild, sections, 0),
@@ -3214,7 +3274,7 @@ async def modificarbalance(
     objeto="Insignia, modificador o ticket que recibirá",
     cantidad="Cantidad; para insignias debe ser 1",
 )
-@app_commands.autocomplete(objeto=editable_object_autocomplete)
+@app_commands.autocomplete(objeto=deletable_object_autocomplete)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -3338,24 +3398,87 @@ async def darobjeto(
     await answer(interaction, f"Entregaste **{badge['name']}** a {miembro.mention}.")
 
 
-@bot.tree.command(name="quitarobjeto", description="Retira un objeto a un miembro.")
+@bot.tree.command(
+    name="quitarobjeto",
+    description="Retira un objeto a un miembro o elimina una categoría.",
+)
 @app_commands.describe(
-    miembro="Miembro que perderá el objeto",
+    miembro="Miembro que perderá el objeto; no se usa para categorías",
     objeto="Elige primero al miembro; solo aparecen los objetos que posee",
+    categoria="Categoría que se eliminará; sus objetos pasarán a General",
     cantidad="Cantidad; para insignias debe ser 1",
 )
-@app_commands.autocomplete(objeto=removable_object_autocomplete)
+@app_commands.autocomplete(
+    objeto=removable_object_autocomplete,
+    categoria=category_autocomplete,
+)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def quitarobjeto(
     interaction: discord.Interaction,
-    miembro: discord.Member,
-    objeto: str,
+    miembro: discord.Member | None = None,
+    objeto: str | None = None,
+    categoria: str | None = None,
     cantidad: app_commands.Range[int, 1, 1000] = 1,
 ) -> None:
     guild = interaction.guild
     if guild is None:
+        return
+    if categoria is not None:
+        if miembro is not None or objeto is not None:
+            await answer(
+                interaction,
+                "Para eliminar una categoría, deja vacíos **miembro** y **objeto**.",
+            )
+            return
+        category = await find_shop_category(interaction, categoria)
+        if category is None:
+            await answer(
+                interaction,
+                "Esa categoría no existe. **General** solo puede quitarse si fue "
+                "configurada expresamente.",
+            )
+            return
+        await interaction.response.defer()
+        deleted = await bot.db.delete_shop_category(
+            guild.id,
+            category["name_key"],
+        )
+        if deleted is None:
+            await answer(interaction, "Esa categoría ya no existe.")
+            return
+        affected = deleted["affected_items"]
+        await bot.db.record_movement(
+            guild.id,
+            None,
+            interaction.user.id,
+            "shop_category_config_delete",
+            None,
+            f"Eliminó la categoría {deleted['name']}; {affected} objetos pasaron a General.",
+        )
+        await send_audit_log(
+            guild,
+            "Categoría eliminada",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Categoría:** {deleted['name']}\n"
+            f"**Objetos enviados a General:** {affected}",
+            color=0xEF4444,
+        )
+        await answer(
+            interaction,
+            f"Eliminé la categoría **{deleted['name']}**. "
+            f"**{affected}** objeto{'s' if affected != 1 else ''} "
+            f"{'pasaron' if affected != 1 else 'pasó'} a **General**.",
+        )
+        return
+
+    if miembro is None or objeto is None:
+        await answer(
+            interaction,
+            "Para retirar un objeto indica **miembro** y **objeto**; para eliminar "
+            "una categoría usa la opción **categoria**.",
+        )
         return
     badge = await find_badge(interaction, objeto)
     modifier = None if badge is not None else await find_modifier(interaction, objeto)
@@ -3462,6 +3585,83 @@ async def quitarobjeto(
     )
 
 
+@bot.tree.command(
+    name="configurarcategoria",
+    description="Crea una categoría para organizar la tienda.",
+)
+@app_commands.describe(
+    nombre="Nombre de la nueva categoría",
+    descripcion="Descripción que aparecerá en la tienda",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configurarcategoria(
+    interaction: discord.Interaction,
+    nombre: str,
+    descripcion: str,
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    display_name = nombre.strip()
+    final_description = descripcion.strip()
+    if not display_name or len(display_name) > 100:
+        await answer(interaction, "El nombre debe tener entre 1 y 100 caracteres.")
+        return
+    if not final_description or len(final_description) > 1000:
+        await answer(
+            interaction,
+            "La descripción debe tener entre 1 y 1.000 caracteres.",
+        )
+        return
+    name_key = normalize_name(display_name)
+    if await bot.db.get_shop_category(interaction.guild_id, name_key):
+        await answer(interaction, "Ya existe una categoría con ese nombre.")
+        return
+    categories = await bot.db.list_shop_categories(interaction.guild_id)
+    projected_keys = {row["name_key"] for row in categories}
+    projected_keys.update({normalize_name(DEFAULT_SHOP_SECTION), name_key})
+    if len(projected_keys) > MAX_SHOP_SECTIONS:
+        await answer(
+            interaction,
+            f"La tienda admite un máximo de {MAX_SHOP_SECTIONS} categorías "
+            "contando **General**.",
+        )
+        return
+    try:
+        await bot.db.create_shop_category(
+            interaction.guild_id,
+            display_name,
+            name_key,
+            final_description,
+        )
+    except asyncpg.UniqueViolationError:
+        await answer(interaction, "Ya existe una categoría con ese nombre.")
+        return
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "shop_category_config_create",
+        None,
+        f"Configuró la categoría {display_name}.",
+    )
+    await send_audit_log(
+        guild,
+        "Categoría configurada",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Nombre:** {display_name}\n"
+        f"**Descripción:** {final_description}",
+        color=0xF59E0B,
+    )
+    await answer(
+        interaction,
+        f"Configuré la categoría **{display_name}** correctamente.",
+    )
+
+
 @bot.tree.command(name="configurarinsignia", description="Configura una insignia y su rol de color.")
 @app_commands.describe(
     rol_insignia="Rol que representa la propiedad de la insignia",
@@ -3470,7 +3670,7 @@ async def quitarobjeto(
     permitir_whitelist="Permite usarla a miembros y roles de la whitelist",
     precio="Precio; usa 0 si será gratuita",
     nombre="Nombre para los comandos; por defecto usa el nombre del rol",
-    apartado="Apartado de la tienda; por defecto será General",
+    apartado="Categoría existente de la tienda; por defecto será General",
     emoji="Emoji opcional: Unicode, :nombre: o ID del servidor/bot",
 )
 @app_commands.autocomplete(apartado=shop_section_autocomplete)
@@ -3509,10 +3709,19 @@ async def configurarinsignia(
         return
     if not comprable:
         precio = 0
-    final_section = shop_section_name(apartado) if comprable else None
-    if final_section is not None and len(final_section) > 100:
-        await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
-        return
+    final_section = None
+    if comprable:
+        requested_section = shop_section_name(apartado)
+        final_section = await resolve_shop_section(
+            interaction.guild_id,
+            requested_section,
+        )
+        if final_section is None:
+            await answer(
+                interaction,
+                "Esa categoría no existe. Créala primero con `/configurarcategoria`.",
+            )
+            return
     emoji_value = edited_badge_emoji(emoji)
     final_emoji, emoji_error = await resolve_configured_emoji(
         interaction.guild,
@@ -3523,15 +3732,6 @@ async def configurarinsignia(
         return
     if final_emoji is not None and (len(final_emoji) > 100 or "\n" in final_emoji):
         await answer(interaction, "El emoji no es válido o es demasiado largo.")
-        return
-    if final_section is not None and not await shop_section_is_available(
-        interaction.guild_id,
-        final_section,
-    ):
-        await answer(
-            interaction,
-            f"La tienda admite un máximo de {MAX_SHOP_SECTIONS} apartados.",
-        )
         return
     await interaction.response.defer()
     try:
@@ -3562,7 +3762,7 @@ async def configurarinsignia(
             f"**Comprable:** {'Sí' if comprable else 'No'}\n"
             f"**Acceso por whitelist:** {'Sí' if permitir_whitelist else 'No'}\n"
             f"**Precio:** {money(precio, interaction.guild_id)}\n"
-            f"**Apartado:** {final_section or 'No aplica'}\n"
+            f"**Categoría:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}",
         )
     await answer(interaction, f"Configuré la insignia **{display_name}** correctamente.")
@@ -3580,7 +3780,7 @@ async def configurarinsignia(
     cooldown="Segundos mínimos entre mensajes generados",
     duracion="Minutos que permanecerá activo",
     precio="Precio; usa 0 si no será comprable",
-    apartado="Apartado de la tienda; por defecto será General",
+    apartado="Categoría existente de la tienda; por defecto será General",
     emoji="Emoji opcional: Unicode, :nombre: o ID del servidor/bot",
 )
 @app_commands.autocomplete(apartado=shop_section_autocomplete)
@@ -3625,10 +3825,19 @@ async def configurarmodificador(
     probability_numerator, probability_denominator = parsed_probability
     if not comprable:
         precio = 0
-    final_section = shop_section_name(apartado) if comprable else None
-    if final_section is not None and len(final_section) > 100:
-        await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
-        return
+    final_section = None
+    if comprable:
+        requested_section = shop_section_name(apartado)
+        final_section = await resolve_shop_section(
+            interaction.guild_id,
+            requested_section,
+        )
+        if final_section is None:
+            await answer(
+                interaction,
+                "Esa categoría no existe. Créala primero con `/configurarcategoria`.",
+            )
+            return
     emoji_value = edited_badge_emoji(emoji)
     final_emoji, emoji_error = await resolve_configured_emoji(guild, emoji_value)
     if emoji_error is not None:
@@ -3636,15 +3845,6 @@ async def configurarmodificador(
         return
     if final_emoji is not None and (len(final_emoji) > 100 or "\n" in final_emoji):
         await answer(interaction, "El emoji no es válido o es demasiado largo.")
-        return
-    if final_section is not None and not await shop_section_is_available(
-        interaction.guild_id,
-        final_section,
-    ):
-        await answer(
-            interaction,
-            f"La tienda admite un máximo de {MAX_SHOP_SECTIONS} apartados.",
-        )
         return
     await interaction.response.defer()
     try:
@@ -3680,7 +3880,7 @@ async def configurarmodificador(
         f"**Nombre:** {display_name}\n"
         f"**Comprable:** {'Sí' if comprable else 'No'}\n"
         f"**Precio:** {money(precio, interaction.guild_id)}\n"
-        f"**Apartado:** {final_section or 'No aplica'}\n"
+        f"**Categoría:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}\n"
         f"**Mensajes:** {len(parsed_messages)}\n"
         f"**Probabilidad:** {modifier_probability_label(probability_numerator, probability_denominator)}\n"
@@ -3870,7 +4070,7 @@ async def editarmensajes(
     descripcion="Explica para qué sirve el ticket",
     activo="Indica si el ticket se puede usar actualmente",
     precio="Precio; usa 0 si no será comprable",
-    apartado="Apartado de la tienda; por defecto será General",
+    apartado="Categoría existente de la tienda; por defecto será General",
     emoji="Emoji opcional: Unicode, :nombre: o ID del servidor/bot",
 )
 @app_commands.autocomplete(apartado=shop_section_autocomplete)
@@ -3908,10 +4108,19 @@ async def configurarticket(
         return
     if not comprable:
         precio = 0
-    final_section = shop_section_name(apartado) if comprable else None
-    if final_section is not None and len(final_section) > 100:
-        await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
-        return
+    final_section = None
+    if comprable:
+        requested_section = shop_section_name(apartado)
+        final_section = await resolve_shop_section(
+            interaction.guild_id,
+            requested_section,
+        )
+        if final_section is None:
+            await answer(
+                interaction,
+                "Esa categoría no existe. Créala primero con `/configurarcategoria`.",
+            )
+            return
     emoji_value = edited_badge_emoji(emoji)
     final_emoji, emoji_error = await resolve_configured_emoji(guild, emoji_value)
     if emoji_error is not None:
@@ -3919,15 +4128,6 @@ async def configurarticket(
         return
     if final_emoji is not None and (len(final_emoji) > 100 or "\n" in final_emoji):
         await answer(interaction, "El emoji no es válido o es demasiado largo.")
-        return
-    if final_section is not None and not await shop_section_is_available(
-        interaction.guild_id,
-        final_section,
-    ):
-        await answer(
-            interaction,
-            f"La tienda admite un máximo de {MAX_SHOP_SECTIONS} apartados.",
-        )
         return
     await interaction.response.defer()
     try:
@@ -3960,7 +4160,7 @@ async def configurarticket(
         f"**Nombre:** {display_name}\n"
         f"**Comprable:** {'Sí' if comprable else 'No'}\n"
         f"**Precio:** {money(precio, interaction.guild_id)}\n"
-        f"**Apartado:** {final_section or 'No aplica'}\n"
+        f"**Categoría:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}\n"
         f"**Estado:** {'Activo' if activo else 'Inactivo'}\n"
         f"**Descripción:** {final_description}",
@@ -3973,18 +4173,21 @@ async def configurarticket(
     )
 
 
-@bot.tree.command(name="editar", description="Edita la configuración de cualquier objeto.")
+@bot.tree.command(
+    name="editar",
+    description="Edita la configuración de un objeto o una categoría.",
+)
 @app_commands.describe(
-    objeto="Nombre actual del objeto",
+    objeto="Objeto o categoría que quieres editar",
     nuevo_nombre="Nuevo nombre (opcional)",
     rol_insignia="Nuevo rol de insignia; no aplica a consumibles",
     rol_color="Nuevo rol de color; no aplica a consumibles",
     comprable="Cambiar si aparece en la tienda",
     permitir_whitelist="Permitir o impedir el acceso por whitelist a esta insignia",
     precio="Nuevo precio",
-    apartado="Nuevo apartado de la tienda",
+    apartado="Nueva categoría existente de la tienda",
     emoji="Emoji, :nombre: o ID; escribe quitar para eliminarlo",
-    descripcion="Para tickets: nueva descripción",
+    descripcion="Para tickets o categorías: nueva descripción",
     activo="Para tickets: permitir o impedir su uso",
     probabilidad="Para modificadores: porcentaje (25) o fracción (1/4)",
     cooldown="Para modificadores: segundos entre intentos",
@@ -4027,8 +4230,99 @@ async def editar(
         if current_badge is not None or current_modifier is not None
         else await find_ticket(interaction, objeto)
     )
+    current_category = (
+        None
+        if current_badge is not None
+        or current_modifier is not None
+        or current_ticket is not None
+        else await find_shop_category(interaction, objeto)
+    )
+    if current_category is not None:
+        category_only_options = (
+            rol_insignia,
+            rol_color,
+            comprable,
+            permitir_whitelist,
+            precio,
+            apartado,
+            emoji,
+            activo,
+            probabilidad,
+            cooldown,
+            duracion,
+        )
+        if any(value is not None for value in category_only_options):
+            await answer(
+                interaction,
+                "Las categorías solo permiten cambiar **nuevo_nombre** y "
+                "**descripcion**.",
+            )
+            return
+        if nuevo_nombre is None and descripcion is None:
+            await answer(
+                interaction,
+                "Indica **nuevo_nombre**, **descripcion** o ambos.",
+            )
+            return
+        final_name = (
+            nuevo_nombre.strip()
+            if nuevo_nombre is not None
+            else current_category["name"]
+        )
+        final_description = (
+            descripcion.strip()
+            if descripcion is not None
+            else current_category["description"]
+        )
+        if not final_name or len(final_name) > 100:
+            await answer(
+                interaction,
+                "El nombre debe tener entre 1 y 100 caracteres.",
+            )
+            return
+        if not final_description or len(final_description) > 1000:
+            await answer(
+                interaction,
+                "La descripción debe tener entre 1 y 1.000 caracteres.",
+            )
+            return
+        await interaction.response.defer()
+        try:
+            updated = await bot.db.update_shop_category(
+                interaction.guild_id,
+                current_category["name_key"],
+                final_name,
+                normalize_name(final_name),
+                final_description,
+            )
+        except asyncpg.UniqueViolationError:
+            await answer(interaction, "Ya existe una categoría con ese nombre.")
+            return
+        if not updated:
+            await answer(interaction, "No pude encontrar esa categoría.")
+            return
+        await bot.db.record_movement(
+            interaction.guild_id,
+            None,
+            interaction.user.id,
+            "shop_category_config_edit",
+            None,
+            f"Editó la categoría {current_category['name']} como {final_name}.",
+        )
+        await send_audit_log(
+            guild,
+            "Categoría editada",
+            f"**Administrador:** {interaction.user.mention}\n"
+            f"**Nombre anterior:** {current_category['name']}\n"
+            f"**Nombre actual:** {final_name}\n"
+            f"**Descripción:** {final_description}",
+            color=0xF59E0B,
+        )
+        await answer(interaction, f"Actualicé la categoría **{final_name}**.")
+        return
+
     if current_badge is None and current_modifier is None and current_ticket is None:
-        await answer(interaction, "Ese objeto no existe.")
+        await answer(interaction, "Ese objeto o categoría no existe.")
         return
 
     current = current_badge or current_modifier or current_ticket
@@ -4047,14 +4341,21 @@ async def editar(
         return
     if not final_purchasable:
         final_price = 0
-    final_section = (
-        shop_section_name(apartado if apartado is not None else current["shop_section"])
-        if final_purchasable
-        else None
-    )
-    if final_section is not None and len(final_section) > 100:
-        await answer(interaction, "El apartado debe tener entre 1 y 100 caracteres.")
-        return
+    final_section = None
+    if final_purchasable:
+        requested_section = shop_section_name(
+            apartado if apartado is not None else current["shop_section"]
+        )
+        final_section = await resolve_shop_section(
+            interaction.guild_id,
+            requested_section,
+        )
+        if final_section is None:
+            await answer(
+                interaction,
+                "Esa categoría no existe. Créala primero con `/configurarcategoria`.",
+            )
+            return
     emoji_value = edited_badge_emoji(emoji, current["emoji"])
     final_emoji, emoji_error = await resolve_configured_emoji(guild, emoji_value)
     if emoji_error is not None:
@@ -4062,22 +4363,6 @@ async def editar(
         return
     if final_emoji is not None and (len(final_emoji) > 100 or "\n" in final_emoji):
         await answer(interaction, "El emoji no es válido o es demasiado largo.")
-        return
-
-    item_type = (
-        "badge"
-        if current_badge is not None
-        else "modifier" if current_modifier is not None else "ticket"
-    )
-    if final_section is not None and not await shop_section_is_available(
-        interaction.guild_id,
-        final_section,
-        excluding_item=(item_type, current["name_key"]),
-    ):
-        await answer(
-            interaction,
-            f"La tienda admite un máximo de {MAX_SHOP_SECTIONS} apartados.",
-        )
         return
 
     if current_modifier is not None:
@@ -4172,7 +4457,7 @@ async def editar(
             f"**Nombre actual:** {final_name}\n"
             f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
             f"**Precio:** {money(final_price, interaction.guild_id)}\n"
-            f"**Apartado:** {final_section or 'No aplica'}\n"
+            f"**Categoría:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}\n"
             f"**Mensajes:** {len(final_messages)}\n"
             f"**Probabilidad:** "
@@ -4252,7 +4537,7 @@ async def editar(
             f"**Nombre actual:** {final_name}\n"
             f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
             f"**Precio:** {money(final_price, interaction.guild_id)}\n"
-            f"**Apartado:** {final_section or 'No aplica'}\n"
+            f"**Categoría:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}\n"
             f"**Estado:** {'Activo' if final_active else 'Inactivo'}\n"
             f"**Descripción:** {final_description}",
@@ -4337,7 +4622,7 @@ async def editar(
         f"**Comprable:** {'Sí' if final_purchasable else 'No'}\n"
         f"**Acceso por whitelist:** {'Sí' if final_whitelist_enabled else 'No'}\n"
         f"**Precio:** {money(final_price, interaction.guild_id)}\n"
-        f"**Apartado:** {final_section or 'No aplica'}\n"
+        f"**Categoría:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}",
     )
     await answer(interaction, f"Actualicé la insignia **{final_name}**.")
@@ -4345,7 +4630,7 @@ async def editar(
 
 @bot.tree.command(name="borrarobjeto", description="Borra un objeto configurado.")
 @app_commands.describe(objeto="Insignia, modificador o ticket que se borrará")
-@app_commands.autocomplete(objeto=editable_object_autocomplete)
+@app_commands.autocomplete(objeto=deletable_object_autocomplete)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -4456,10 +4741,59 @@ async def apply_object_section_toggle(
                 f"Recibió 1 unidad de {row['name']} porque se desactivaron "
                 "temporalmente los modificadores.",
             )
+        refund_details = []
+        refunds_by_owner: dict[int, dict[str, int]] = {}
+        for row in refunds:
+            owner_refunds = refunds_by_owner.setdefault(row["owner_user_id"], {})
+            owner_refunds[row["name"]] = owner_refunds.get(row["name"], 0) + 1
+        for owner_id, refunded_items in refunds_by_owner.items():
+            item_summary = ", ".join(
+                f"{quantity} × {name}"
+                for name, quantity in refunded_items.items()
+            )
+            total = sum(refunded_items.values())
+            refund_details.append(
+                f"• <@{owner_id}> recibió **{total} "
+                f"{'unidad' if total == 1 else 'unidades'}**: {item_summary}."
+            )
+        for row in removed:
+            if row["refundable"]:
+                continue
+            target = guild.get_member(row["target_user_id"])
+            target_name = (
+                discord.utils.escape_mentions(
+                    discord.utils.escape_markdown(target.display_name)
+                )
+                if target is not None
+                else f"Usuario {row['target_user_id']}"
+            )
+            if not row.get("was_active", False):
+                no_refund_reason = "el modificador ya había vencido"
+            else:
+                no_refund_reason = (
+                    "fue una activación administrativa y no consumió una unidad"
+                )
+            refund_details.append(
+                f"• Sin reembolso por **{row['name']}** de **{target_name}**: "
+                f"{no_refund_reason}."
+            )
+        if not refund_details and section in {
+            "modifiers",
+            "all_objects",
+            "all_commands",
+        }:
+            refund_details.append(
+                "• No había modificadores activos; no se realizó ningún reembolso."
+            )
         modifier_summary = (
             f"\n**Activaciones canceladas:** {len(removed)}"
             f"\n**Unidades reembolsadas:** {len(refunds)}"
-            if section in {"modifiers", "all_objects"}
+            if section in {"modifiers", "all_objects", "all_commands"}
+            else ""
+        )
+        refund_detail_text = (
+            "\n\n**Detalle de reembolsos:**\n" + "\n".join(refund_details)
+            if refund_details
             else ""
         )
         admin_summary = (
@@ -4480,6 +4814,7 @@ async def apply_object_section_toggle(
             f"**Razón:** {reason}"
             f"{admin_summary}"
             f"{modifier_summary}"
+            f"{refund_detail_text}"
         )
         color = 0xEF4444
     await bot.db.record_movement(
@@ -4497,6 +4832,26 @@ async def apply_object_section_toggle(
         color=color,
     )
     return response
+
+
+def split_maintenance_notice(content: str, limit: int = 1900) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for line in content.splitlines():
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current = line
+    if current:
+        chunks.append(current)
+    return chunks or [content[:limit]]
 
 
 class ObjectSectionToggleConfirmView(discord.ui.View):
@@ -4566,7 +4921,30 @@ class ObjectSectionToggleConfirmView(discord.ui.View):
             self.reason,
             self.admins_bypass,
         )
-        await interaction.edit_original_response(content=response, view=None)
+        published = False
+        if interaction.channel is not None and hasattr(interaction.channel, "send"):
+            try:
+                for chunk in split_maintenance_notice(response):
+                    await interaction.channel.send(
+                        f"📢 {chunk}",
+                        allowed_mentions=discord.AllowedMentions(
+                            everyone=False,
+                            users=True,
+                            roles=False,
+                            replied_user=False,
+                        ),
+                    )
+                published = True
+            except discord.HTTPException:
+                pass
+        if published:
+            private_result = "Cambio aplicado. El aviso se publicó en este canal."
+        else:
+            private_result = (
+                "El cambio sí se aplicó, pero no pude publicar el aviso en el canal. "
+                "Revisa mis permisos para enviar mensajes."
+            )
+        await interaction.edit_original_response(content=private_result, view=None)
         self.stop()
 
     @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, emoji="✖️")
@@ -4636,7 +5014,8 @@ async def estadoobjetos(
         )
     refund_text = (
         "\n⚠️ Las activaciones de modificadores se cancelarán y sus unidades se reembolsarán."
-        if current["enabled"] and seccion.value in {"modifiers", "all_objects"}
+        if current["enabled"]
+        and seccion.value in {"modifiers", "all_objects", "all_commands"}
         else ""
     )
     view = ObjectSectionToggleConfirmView(
@@ -4891,7 +5270,8 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
         embed.add_field(
             name="Configuración de objetos",
             value=(
-                "`/configurarinsignia` · `/configurarmodificador` · `/configurarticket`\n"
+                "`/configurarcategoria` · `/configurarinsignia`\n"
+                "`/configurarmodificador` · `/configurarticket`\n"
                 "`/editar` · `/editarmensajes`\n"
                 "`/añadiradmin` · `/quitaradmin` · `/admins`\n"
                 "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`"
@@ -4935,7 +5315,7 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/balance` — Consultar tus monedas.\n"
                 "`/historial` — Ver tus últimos 10 movimientos.\n"
                 "`/ranking` — Ver los balances más altos.\n"
-                "`/tienda` — Abrir el mercado por apartados.\n"
+                "`/tienda` — Abrir el mercado por categorías.\n"
                 "`/comprar objeto` — Comprar por nombre; un ticket inactivo pide "
                 "confirmación privada."
             ),
