@@ -220,27 +220,28 @@ def answer_hash(value: str) -> str:
 
 def question_reward_text(
     guild: discord.Guild,
-    reward_type: str,
     reward: int,
-    reward_quantity: int = 1,
-    reward_name: str | None = None,
-    reward_emoji: str | None = None,
+    reward_objects: list[dict],
 ) -> str:
-    if reward_type == "coins":
-        return money(reward, guild.id)
-    shown_name = reward_name or "Objeto no disponible"
-    emoji = badge_emoji(reward_emoji, guild)
-    type_label = {
-        "badge": "insignia",
-        "modifier": "modificador",
-        "ticket": "ticket",
-    }.get(reward_type, "objeto")
-    quantity = (
-        ""
-        if reward_type == "badge"
-        else f" × **{reward_quantity}**"
-    )
-    return f"{emoji}**{shown_name}**{quantity} ({type_label})"
+    rewards = []
+    if reward > 0:
+        rewards.append(money(reward, guild.id))
+    for reward_object in reward_objects:
+        item_type = reward_object["item_type"]
+        shown_name = reward_object.get("name") or "Objeto no disponible"
+        emoji = badge_emoji(reward_object.get("emoji"), guild)
+        type_label = {
+            "badge": "insignia",
+            "modifier": "modificador",
+            "ticket": "ticket",
+        }.get(item_type, "objeto")
+        quantity = (
+            ""
+            if item_type == "badge"
+            else f" × **{reward_object['quantity']}**"
+        )
+        rewards.append(f"{emoji}**{shown_name}**{quantity} ({type_label})")
+    return "\n".join(rewards)
 
 
 def question_event_reward_text(
@@ -249,11 +250,17 @@ def question_event_reward_text(
 ) -> str:
     return question_reward_text(
         guild,
-        event["reward_type"],
         event["reward"],
-        event["reward_quantity"],
-        event["reward_name"],
-        event["reward_emoji"],
+        event["reward_objects"],
+    )
+
+
+def question_event_movement_amount(event) -> int:
+    if event["reward"] > 0:
+        return event["reward"]
+    return sum(
+        reward_object["quantity"]
+        for reward_object in event["reward_objects"]
     )
 
 
@@ -561,6 +568,7 @@ def make_question_embed(
     *,
     expires_at: datetime | None = None,
     final_status: str | None = None,
+    correct_answer: str | None = None,
 ) -> discord.Embed:
     embed = discord.Embed(
         title="❓ Evento de pregunta",
@@ -570,6 +578,15 @@ def make_question_embed(
     embed.add_field(name="Recompensa", value=reward_text)
     if final_status is not None:
         embed.add_field(name="Finalizado", value=final_status)
+        embed.add_field(
+            name="Respuesta correcta",
+            value=(
+                correct_answer[:1024]
+                if correct_answer
+                else "No disponible para este evento anterior."
+            ),
+            inline=False,
+        )
         embed.set_footer(text="Este evento ya terminó.")
     elif expires_at is not None:
         embed.add_field(
@@ -604,6 +621,7 @@ async def finalize_question_embed(
                 event["question"],
                 question_event_reward_text(guild, event),
                 final_status=status,
+                correct_answer=event["answer_text"],
             )
         )
     except discord.HTTPException:
@@ -625,11 +643,7 @@ async def event_expiration_loop() -> None:
             event["channel_id"],
             event["message_id"],
         )
-        movement_amount = (
-            event["reward"]
-            if event["reward_type"] == "coins"
-            else event["reward_quantity"]
-        )
+        movement_amount = question_event_movement_amount(event)
         await bot.db.record_movement(
             event["guild_id"],
             None,
@@ -652,7 +666,9 @@ async def event_expiration_loop() -> None:
         if channel is not None and hasattr(channel, "send"):
             try:
                 await channel.send(
-                    f"⌛ El evento **{event['question']}** caducó sin ganador."
+                    f"⌛ El evento **{event['question']}** caducó sin ganador.\n"
+                    f"**Respuesta correcta:** {event['answer_text'] or 'No disponible'}",
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
             except discord.HTTPException:
                 traceback.print_exc()
@@ -660,6 +676,7 @@ async def event_expiration_loop() -> None:
             guild,
             "Evento de pregunta caducado",
             f"**Pregunta:** {event['question']}\n"
+            f"**Respuesta correcta:** {event['answer_text'] or 'No disponible'}\n"
             f"**Recompensa:** {question_event_reward_text(guild, event)}\n"
             "Terminó sin ganador.",
             color=0x6B7280,
@@ -1552,8 +1569,8 @@ def make_shop_embed(
             )
         elif row["item_type"] == "modifier":
             item_lines.append(
-                f"{prefix} (modificador {modifier_scope_label(row['effect_scope']).lower()} "
-                "consumible · "
+                f"{prefix} (Consumible "
+                f"{modifier_scope_label(row['effect_scope']).lower()} · "
                 f"{row['duration_minutes']} min) — "
                 f"{money(row['price'], guild.id)}"
             )
@@ -2003,14 +2020,24 @@ async def process_question_reply(message: discord.Message) -> None:
             except (discord.HTTPException, discord.NotFound):
                 return
 
-        expected_badge_role_id = None
-        added_badge_role: discord.Role | None = None
-        badge_was_owned = False
-        if event["reward_type"] == "badge":
-            badge = await bot.db.get_badge_by_id(
-                message.guild.id,
-                event["reward_object_id"],
+        badge_rewards = [
+            reward_object
+            for reward_object in event["reward_objects"]
+            if reward_object["item_type"] == "badge"
+        ]
+        badge_configs = await asyncio.gather(
+            *(
+                bot.db.get_badge_by_id(
+                    message.guild.id,
+                    reward_object["item_id"],
+                )
+                for reward_object in badge_rewards
             )
+        )
+        expected_badge_role_ids: dict[int, int] = {}
+        badge_roles_to_add: list[discord.Role] = []
+        owned_badge_count = 0
+        for reward_object, badge in zip(badge_rewards, badge_configs):
             role = (
                 message.guild.get_role(badge["badge_role_id"])
                 if badge is not None
@@ -2018,35 +2045,48 @@ async def process_question_reply(message: discord.Message) -> None:
             )
             if role is None:
                 await message.reply(
-                    "La respuesta es correcta, pero el rol de la insignia del premio "
+                    "La respuesta es correcta, pero el rol de una insignia del premio "
                     "ya no existe. El evento sigue activo; avisa a un administrador.",
                     mention_author=False,
                 )
                 return
-            expected_badge_role_id = role.id
-            badge_was_owned = role in winner.roles
-            if not badge_was_owned and not role_can_be_managed(role):
+            expected_badge_role_ids[reward_object["item_id"]] = role.id
+            if role in winner.roles:
+                owned_badge_count += 1
+            elif not role_can_be_managed(role):
                 await message.reply(
-                    "La respuesta es correcta, pero el bot no puede asignar la "
+                    "La respuesta es correcta, pero el bot no puede asignar una "
                     "insignia del premio. El evento sigue activo; avisa a un "
                     "administrador.",
                     mention_author=False,
                 )
                 return
-            if not badge_was_owned:
-                try:
-                    await winner.add_roles(
-                        role,
-                        reason=f"Premio del evento: {event['question']}",
-                    )
-                except discord.HTTPException:
-                    await message.reply(
-                        "La respuesta es correcta, pero no pude entregar la insignia. "
-                        "El evento sigue activo; avisa a un administrador.",
-                        mention_author=False,
-                    )
-                    return
-                added_badge_role = role
+            else:
+                badge_roles_to_add.append(role)
+
+        added_badge_roles: list[discord.Role] = []
+        for role in badge_roles_to_add:
+            try:
+                await winner.add_roles(
+                    role,
+                    reason=f"Premio del evento: {event['question']}",
+                )
+                added_badge_roles.append(role)
+            except discord.HTTPException:
+                for added_role in added_badge_roles:
+                    try:
+                        await winner.remove_roles(
+                            added_role,
+                            reason="No se pudieron entregar todos los premios del evento",
+                        )
+                    except discord.HTTPException:
+                        traceback.print_exc()
+                await message.reply(
+                    "La respuesta es correcta, pero no pude entregar todas las "
+                    "insignias. El evento sigue activo; avisa a un administrador.",
+                    mention_author=False,
+                )
+                return
 
         try:
             result = await bot.db.claim_question_event(
@@ -2055,10 +2095,10 @@ async def process_question_reply(message: discord.Message) -> None:
                 event["answer_hash"],
                 event["message_id"],
                 winner.id,
-                expected_badge_role_id,
+                expected_badge_role_ids,
             )
         except Exception:
-            if added_badge_role is not None:
+            for added_badge_role in added_badge_roles:
                 try:
                     await winner.remove_roles(
                         added_badge_role,
@@ -2069,7 +2109,7 @@ async def process_question_reply(message: discord.Message) -> None:
             raise
 
         if result is None or result.get("status") != "claimed":
-            if added_badge_role is not None:
+            for added_badge_role in added_badge_roles:
                 try:
                     await winner.remove_roles(
                         added_badge_role,
@@ -2095,24 +2135,28 @@ async def process_question_reply(message: discord.Message) -> None:
             f"✅ Ganado por {message.author.mention}.",
         )
         reward_text = question_event_reward_text(message.guild, result)
-        if result["reward_type"] == "coins":
-            result_detail = (
-                f" Su nuevo balance es "
-                f"**{money(result['new_balance'], message.guild.id)}**!"
+        result_details = []
+        if result["new_balance"] is not None:
+            result_details.append(
+                "Su nuevo balance es "
+                f"**{money(result['new_balance'], message.guild.id)}**."
             )
-        elif result["reward_type"] in {"modifier", "ticket"}:
-            result_detail = (
-                f" Ahora tiene **{result['new_quantity']}** unidades en su inventario."
+        if result["new_quantities"]:
+            result_details.append(
+                "Los modificadores o tickets ya están en su inventario."
             )
-        else:
-            result_detail = (
-                " Ya tenía esa insignia, así que conserva una sola."
-                if badge_was_owned
-                else " La insignia ya fue añadida a sus roles."
+        if added_badge_roles:
+            result_details.append(
+                "Las insignias nuevas ya fueron añadidas a sus roles."
             )
+        if owned_badge_count:
+            result_details.append(
+                "Las insignias que ya tenía se conservaron sin duplicarse."
+            )
+        result_detail = " ".join(result_details)
         await message.channel.send(
-            f"🎉 {message.author.mention} respondió correctamente y ganó "
-            f"{reward_text}.{result_detail}",
+            f"🎉 {message.author.mention} respondió correctamente y ganó:\n"
+            f"{reward_text}\n{result_detail}",
             allowed_mentions=discord.AllowedMentions(
                 everyone=False,
                 users=True,
@@ -2124,6 +2168,7 @@ async def process_question_reply(message: discord.Message) -> None:
             "Evento de pregunta ganado",
             f"**Ganador:** {message.author.mention}\n"
             f"**Pregunta:** {result['question']}\n"
+            f"**Respuesta correcta:** {result['answer_text']}\n"
             f"**Recompensa:** {reward_text}\n"
             f"**Canal:** {message.channel.mention}",
             color=0x22C55E,
@@ -2206,17 +2251,25 @@ async def say(interaction: discord.Interaction, mensaje: str) -> None:
 
 @bot.tree.command(
     name="eventopregunta",
-    description="Crea una pregunta con monedas o un objeto como recompensa.",
+    description="Crea una pregunta con monedas y hasta tres objetos de recompensa.",
 )
 @app_commands.describe(
     pregunta="Pregunta o texto que se publicará",
-    respuesta="Respuesta correcta (no se mostrará)",
+    respuesta="Respuesta correcta; se mostrará cuando termine el evento",
     minutos="Minutos antes de que el evento caduque",
-    recompensa="Monedas para el ganador; no se usa si eliges un objeto",
-    objeto="Insignia, modificador o ticket que recibirá el ganador",
-    cantidad="Unidades del objeto; las insignias siempre usan 1",
+    recompensa="Monedas para el ganador; se pueden combinar con objetos",
+    objeto="Primer objeto opcional",
+    cantidad="Unidades del primer objeto; las insignias siempre usan 1",
+    objeto2="Segundo objeto opcional",
+    cantidad2="Unidades del segundo objeto; las insignias siempre usan 1",
+    objeto3="Tercer objeto opcional",
+    cantidad3="Unidades del tercer objeto; las insignias siempre usan 1",
 )
-@app_commands.autocomplete(objeto=deletable_object_autocomplete)
+@app_commands.autocomplete(
+    objeto=deletable_object_autocomplete,
+    objeto2=deletable_object_autocomplete,
+    objeto3=deletable_object_autocomplete,
+)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -2228,89 +2281,131 @@ async def eventopregunta(
     recompensa: app_commands.Range[int, 1, MAX_MONEY] | None = None,
     objeto: str | None = None,
     cantidad: app_commands.Range[int, 1, 1000] = 1,
+    objeto2: str | None = None,
+    cantidad2: app_commands.Range[int, 1, 1000] = 1,
+    objeto3: str | None = None,
+    cantidad3: app_commands.Range[int, 1, 1000] = 1,
 ) -> None:
     assert interaction.guild_id is not None and interaction.channel_id is not None
     guild = interaction.guild
     if guild is None:
         return
-    if not " ".join(respuesta.split()):
+    clean_answer = " ".join(respuesta.split())
+    if not clean_answer:
         await answer(interaction, "La respuesta no puede estar vacía.", ephemeral=True)
         return
-    if (recompensa is None) == (objeto is None):
+    object_slots = [
+        (objeto.strip() if objeto and objeto.strip() else None, cantidad),
+        (objeto2.strip() if objeto2 and objeto2.strip() else None, cantidad2),
+        (objeto3.strip() if objeto3 and objeto3.strip() else None, cantidad3),
+    ]
+    if recompensa is None and not any(name for name, _ in object_slots):
         await answer(
             interaction,
-            "Elige exactamente una recompensa: **monedas** en `recompensa` o "
-            "un `objeto`.",
+            "Añade al menos una recompensa: monedas, un objeto o ambos.",
             ephemeral=True,
         )
         return
+    if object_slots[1][0] and not object_slots[0][0]:
+        await answer(
+            interaction,
+            "Para usar `objeto2`, primero completa `objeto`.",
+            ephemeral=True,
+        )
+        return
+    if object_slots[2][0] and not object_slots[1][0]:
+        await answer(
+            interaction,
+            "Para usar `objeto3`, primero completa `objeto2`.",
+            ephemeral=True,
+        )
+        return
+    for position, (object_name, quantity) in enumerate(object_slots, start=1):
+        if object_name is None and quantity != 1:
+            await answer(
+                interaction,
+                f"`cantidad{'' if position == 1 else position}` solo se usa si "
+                f"también eliges `objeto{'' if position == 1 else position}`.",
+                ephemeral=True,
+            )
+            return
 
     await interaction.response.defer(ephemeral=True)
-    reward_type = "coins"
     reward_amount = recompensa or 0
-    reward_object_id = None
-    reward_name = None
-    reward_emoji = None
-    if objeto is None:
-        if cantidad != 1:
-            await answer(
-                interaction,
-                "La opción `cantidad` solo se usa con recompensas de objetos.",
-                ephemeral=True,
+    selected_slots = [
+        (name, quantity)
+        for name, quantity in object_slots
+        if name is not None
+    ]
+    configured_objects = await asyncio.gather(
+        *(
+            bot.db.get_configured_object(
+                interaction.guild_id,
+                normalize_name(name),
             )
-            return
-    else:
-        badge = await find_badge(interaction, objeto)
-        modifier = (
-            None if badge is not None else await find_modifier(interaction, objeto)
+            for name, _ in selected_slots
         )
-        ticket = (
-            None
-            if badge is not None or modifier is not None
-            else await find_ticket(interaction, objeto)
-        )
-        configured_object = badge or modifier or ticket
+    )
+    reward_objects = []
+    seen_objects: set[tuple[str, int]] = set()
+    for (requested_name, quantity), configured_object in zip(
+        selected_slots,
+        configured_objects,
+    ):
         if configured_object is None:
-            await answer(interaction, "Ese objeto no existe.", ephemeral=True)
-            return
-        reward_type = (
-            "badge"
-            if badge is not None
-            else "modifier" if modifier is not None else "ticket"
-        )
-        if reward_type == "badge" and cantidad != 1:
             await answer(
                 interaction,
-                "Las insignias son únicas; usa **cantidad: 1**.",
+                f"El objeto **{requested_name}** no existe.",
                 ephemeral=True,
             )
             return
-        if badge is not None:
-            badge_role = guild.get_role(badge["badge_role_id"])
-            if badge_role is None or not role_can_be_managed(badge_role):
+        item_type = configured_object["item_type"]
+        object_key = (item_type, configured_object["id"])
+        if object_key in seen_objects:
+            await answer(
+                interaction,
+                f"El objeto **{configured_object['name']}** está repetido.",
+                ephemeral=True,
+            )
+            return
+        seen_objects.add(object_key)
+        if item_type == "badge":
+            if quantity != 1:
                 await answer(
                     interaction,
-                    "No puedo usar esa insignia como premio. Comprueba que su rol "
-                    "exista y esté debajo del rol del bot.",
+                    f"La insignia **{configured_object['name']}** es única; "
+                    "usa cantidad **1**.",
                     ephemeral=True,
                 )
                 return
-        reward_object_id = configured_object["id"]
-        reward_name = configured_object["name"]
-        reward_emoji = configured_object["emoji"]
-        reward_amount = 0
+            badge_role = guild.get_role(configured_object["badge_role_id"])
+            if badge_role is None or not role_can_be_managed(badge_role):
+                await answer(
+                    interaction,
+                    f"No puedo usar la insignia **{configured_object['name']}** "
+                    "como premio. Comprueba que su rol exista y esté debajo del "
+                    "rol del bot.",
+                    ephemeral=True,
+                )
+                return
+        reward_objects.append(
+            {
+                "item_type": item_type,
+                "item_id": configured_object["id"],
+                "quantity": quantity,
+                "name": configured_object["name"],
+                "emoji": configured_object["emoji"],
+            }
+        )
 
     expires_at = await bot.db.create_question_event(
         interaction.guild_id,
         interaction.channel_id,
         pregunta.strip(),
-        answer_hash(respuesta),
+        answer_hash(clean_answer),
+        clean_answer,
         reward_amount,
-        reward_type,
-        reward_object_id,
-        cantidad,
-        reward_name,
-        reward_emoji,
+        reward_objects,
         minutos,
         interaction.user.id,
     )
@@ -2325,11 +2420,8 @@ async def eventopregunta(
 
     reward_text = question_reward_text(
         guild,
-        reward_type,
         reward_amount,
-        cantidad,
-        reward_name,
-        reward_emoji,
+        reward_objects,
     )
     embed = make_question_embed(
         guild,
@@ -2358,6 +2450,10 @@ async def eventopregunta(
     )
     if not saved:
         await event_message.delete()
+        await bot.db.cancel_question_event(
+            interaction.guild_id,
+            interaction.channel_id,
+        )
         await interaction.edit_original_response(
             content="No pude guardar el mensaje del evento. Intenta nuevamente."
         )
@@ -2368,20 +2464,24 @@ async def eventopregunta(
             "channel_id": interaction.channel_id,
             "message_id": event_message.id,
             "question": pregunta.strip(),
-            "answer_hash": answer_hash(respuesta),
+            "answer_hash": answer_hash(clean_answer),
+            "answer_text": clean_answer,
             "reward": reward_amount,
-            "reward_type": reward_type,
-            "reward_object_id": reward_object_id,
-            "reward_quantity": cantidad,
-            "reward_name": reward_name,
-            "reward_emoji": reward_emoji,
+            "reward_objects": [
+                {"position": position, **reward_object}
+                for position, reward_object in enumerate(reward_objects, start=1)
+            ],
             "expires_at": expires_at,
             "created_by": interaction.user.id,
         }
     )
     await interaction.delete_original_response()
 
-    movement_amount = reward_amount if reward_type == "coins" else cantidad
+    movement_amount = (
+        reward_amount
+        if reward_amount > 0
+        else sum(reward_object["quantity"] for reward_object in reward_objects)
+    )
     await bot.db.record_movement(
         interaction.guild_id,
         None,
@@ -2431,12 +2531,13 @@ async def cancelarevento(interaction: discord.Interaction) -> None:
             },
             "🚫 Cancelado por un administrador.",
         )
-    await answer(interaction, f"Cancelé el evento **{event['question']}**.")
-    movement_amount = (
-        event["reward"]
-        if event["reward_type"] == "coins"
-        else event["reward_quantity"]
+    await answer(
+        interaction,
+        f"Cancelé el evento **{event['question']}**.\n"
+        "**Respuesta correcta:** "
+        f"{discord.utils.escape_mentions(event['answer_text'] or 'No disponible')}",
     )
+    movement_amount = question_event_movement_amount(event)
     await bot.db.record_movement(
         interaction.guild_id,
         None,
@@ -2452,6 +2553,7 @@ async def cancelarevento(interaction: discord.Interaction) -> None:
             "Evento de pregunta cancelado",
             f"**Administrador:** {interaction.user.mention}\n"
             f"**Pregunta:** {event['question']}\n"
+            f"**Respuesta correcta:** {event['answer_text'] or 'No disponible'}\n"
             f"**Recompensa:** {reward_text}\n"
             f"**Canal:** <#{interaction.channel_id}>",
             color=0xEF4444,
@@ -6339,9 +6441,10 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
         embed.add_field(
             name="Premios de eventos",
             value=(
-                "`/eventopregunta` exige elegir **monedas** o un **objeto**. "
-                "La cantidad puede ser mayor para modificadores y tickets; "
-                "las insignias siempre entregan una."
+                "`/eventopregunta` permite combinar **monedas** con hasta "
+                "**tres objetos distintos**. La cantidad puede ser mayor para "
+                "modificadores y tickets; las insignias siempre entregan una. "
+                "Al finalizar se revela la respuesta correcta."
             ),
             inline=False,
         )

@@ -286,7 +286,9 @@ CREATE TABLE IF NOT EXISTS active_question_events (
     message_id BIGINT,
     question TEXT NOT NULL,
     answer_hash TEXT NOT NULL,
+    answer_text TEXT,
     reward BIGINT NOT NULL DEFAULT 0,
+    reward_object_count SMALLINT NOT NULL DEFAULT 0,
     reward_type TEXT NOT NULL DEFAULT 'coins',
     reward_object_id BIGINT,
     reward_quantity INTEGER NOT NULL DEFAULT 1,
@@ -317,36 +319,98 @@ ALTER TABLE active_question_events
 ADD COLUMN IF NOT EXISTS reward_emoji TEXT;
 
 ALTER TABLE active_question_events
-ALTER COLUMN reward SET DEFAULT 0;
+ADD COLUMN IF NOT EXISTS answer_text TEXT;
+
+ALTER TABLE active_question_events
+ADD COLUMN IF NOT EXISTS reward_object_count SMALLINT NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS active_question_event_rewards (
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    position SMALLINT NOT NULL CHECK (position BETWEEN 1 AND 3),
+    item_type TEXT NOT NULL CHECK (item_type IN ('badge', 'modifier', 'ticket')),
+    item_id BIGINT NOT NULL,
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    name TEXT NOT NULL,
+    emoji TEXT,
+    PRIMARY KEY (guild_id, channel_id, position),
+    UNIQUE (guild_id, channel_id, item_type, item_id),
+    FOREIGN KEY (guild_id, channel_id)
+        REFERENCES active_question_events (guild_id, channel_id)
+        ON DELETE CASCADE
+);
+
+INSERT INTO active_question_event_rewards (
+    guild_id, channel_id, position, item_type, item_id, quantity, name, emoji
+)
+SELECT guild_id, channel_id, 1, reward_type, reward_object_id,
+       reward_quantity, reward_name, reward_emoji
+FROM active_question_events
+WHERE reward_type IN ('badge', 'modifier', 'ticket')
+  AND reward_object_id IS NOT NULL
+  AND reward_name IS NOT NULL
+ON CONFLICT (guild_id, channel_id, position) DO NOTHING;
 
 ALTER TABLE active_question_events
 DROP CONSTRAINT IF EXISTS active_question_events_reward_check;
 
+UPDATE active_question_events
+SET reward_object_count = CASE
+        WHEN reward_type IN ('badge', 'modifier', 'ticket')
+             AND reward_object_id IS NOT NULL
+        THEN GREATEST(reward_object_count, 1)
+        ELSE reward_object_count
+    END,
+    reward_type = 'coins',
+    reward_object_id = NULL,
+    reward_quantity = 1,
+    reward_name = NULL,
+    reward_emoji = NULL
+WHERE reward_type <> 'coins' OR reward_object_id IS NOT NULL;
+
+ALTER TABLE active_question_events
+ALTER COLUMN reward SET DEFAULT 0;
+
 ALTER TABLE active_question_events
 ADD CONSTRAINT active_question_events_reward_check
 CHECK (
-    (
-        reward_type = 'coins'
-        AND reward > 0
-        AND reward_object_id IS NULL
-        AND reward_quantity = 1
-    )
-    OR
-    (
-        reward_type IN ('badge', 'modifier', 'ticket')
-        AND reward = 0
-        AND reward_object_id IS NOT NULL
-        AND reward_quantity > 0
-        AND reward_name IS NOT NULL
-    )
+    reward >= 0
+    AND reward_object_count BETWEEN 0 AND 3
+    AND (reward > 0 OR reward_object_count > 0)
+    AND reward_type = 'coins'
+    AND reward_object_id IS NULL
+    AND reward_quantity = 1
+    AND reward_name IS NULL
+    AND reward_emoji IS NULL
 );
 
 CREATE INDEX IF NOT EXISTS active_question_events_expiration_index
 ON active_question_events (expires_at);
 
-CREATE INDEX IF NOT EXISTS active_question_events_reward_object_index
-ON active_question_events (guild_id, reward_type, reward_object_id);
+DROP INDEX IF EXISTS active_question_events_reward_object_index;
+
+CREATE INDEX IF NOT EXISTS active_question_event_rewards_object_index
+ON active_question_event_rewards (guild_id, item_type, item_id);
 """
+
+
+def _question_events_with_rewards(event_rows, reward_rows) -> list[dict]:
+    rewards_by_event: dict[tuple[int, int], list[dict]] = {}
+    for row in reward_rows:
+        reward = dict(row)
+        key = (reward.pop("guild_id"), reward.pop("channel_id"))
+        rewards_by_event.setdefault(key, []).append(reward)
+
+    events = []
+    for row in event_rows:
+        event = dict(row)
+        key = (event["guild_id"], event["channel_id"])
+        event["reward_objects"] = sorted(
+            rewards_by_event.get(key, []),
+            key=lambda reward: reward["position"],
+        )
+        events.append(event)
+    return events
 
 
 class Database:
@@ -767,6 +831,32 @@ class Database:
             search,
             include_categories,
             limit,
+        )
+
+    async def get_configured_object(self, guild_id: int, name_key: str):
+        return await self._pool().fetchrow(
+            """
+            SELECT item_type, id, name, name_key, emoji, badge_role_id
+            FROM (
+                SELECT 'badge'::TEXT AS item_type, id, name, name_key, emoji,
+                       badge_role_id
+                FROM badges
+                WHERE guild_id = $1 AND name_key = $2
+                UNION ALL
+                SELECT 'modifier'::TEXT AS item_type, id, name, name_key, emoji,
+                       NULL::BIGINT AS badge_role_id
+                FROM modifiers
+                WHERE guild_id = $1 AND name_key = $2
+                UNION ALL
+                SELECT 'ticket'::TEXT AS item_type, id, name, name_key, emoji,
+                       NULL::BIGINT AS badge_role_id
+                FROM tickets
+                WHERE guild_id = $1 AND name_key = $2
+            ) AS configured
+            LIMIT 1
+            """,
+            guild_id,
+            name_key,
         )
 
     async def search_shop_items(
@@ -1316,21 +1406,70 @@ class Database:
                 if item is None:
                     return None
 
-                cancelled_events = await connection.fetch(
+                cancelled_event_rows = await connection.fetch(
                     """
-                    DELETE FROM active_question_events
-                    WHERE guild_id = $1
-                      AND reward_type = $2
-                      AND reward_object_id = $3
-                    RETURNING guild_id, channel_id, message_id, question,
-                              reward, reward_type, reward_object_id,
-                              reward_quantity, reward_name, reward_emoji,
-                              created_by
+                    SELECT event.guild_id, event.channel_id, event.message_id,
+                           event.question, event.answer_text, event.reward,
+                           event.expires_at, event.created_by
+                    FROM active_question_events AS event
+                    WHERE event.guild_id = $1
+                      AND EXISTS (
+                          SELECT 1
+                          FROM active_question_event_rewards AS reward
+                          WHERE reward.guild_id = event.guild_id
+                            AND reward.channel_id = event.channel_id
+                            AND reward.item_type = $2
+                            AND reward.item_id = $3
+                      )
+                    FOR UPDATE
                     """,
                     guild_id,
                     item_type,
                     item["id"],
                 )
+                cancelled_reward_rows = []
+                if cancelled_event_rows:
+                    cancelled_reward_rows = await connection.fetch(
+                        """
+                        SELECT reward.guild_id, reward.channel_id, reward.position,
+                               reward.item_type, reward.item_id, reward.quantity,
+                               reward.name, reward.emoji
+                        FROM active_question_event_rewards AS reward
+                        JOIN active_question_events AS event
+                          ON event.guild_id = reward.guild_id
+                         AND event.channel_id = reward.channel_id
+                        WHERE event.guild_id = $1
+                          AND EXISTS (
+                              SELECT 1
+                              FROM active_question_event_rewards AS selected
+                              WHERE selected.guild_id = event.guild_id
+                                AND selected.channel_id = event.channel_id
+                                AND selected.item_type = $2
+                                AND selected.item_id = $3
+                          )
+                        ORDER BY reward.guild_id, reward.channel_id, reward.position
+                        """,
+                        guild_id,
+                        item_type,
+                        item["id"],
+                    )
+                    await connection.execute(
+                        """
+                        DELETE FROM active_question_events AS event
+                        WHERE event.guild_id = $1
+                          AND EXISTS (
+                              SELECT 1
+                              FROM active_question_event_rewards AS reward
+                              WHERE reward.guild_id = event.guild_id
+                                AND reward.channel_id = event.channel_id
+                                AND reward.item_type = $2
+                                AND reward.item_id = $3
+                          )
+                        """,
+                        guild_id,
+                        item_type,
+                        item["id"],
+                    )
                 quantities: dict[int, int] = {}
                 active_user_ids: list[int] = []
                 active_channel_ids: list[int] = []
@@ -1495,9 +1634,10 @@ class Database:
                     "direct_admin_activations": direct_admin_activations,
                     "active_user_ids": active_user_ids,
                     "active_channel_ids": active_channel_ids,
-                    "cancelled_events": [
-                        dict(row) for row in cancelled_events
-                    ],
+                    "cancelled_events": _question_events_with_rewards(
+                        cancelled_event_rows,
+                        cancelled_reward_rows,
+                    ),
                     "refunds": refunds,
                     "total_requested": sum(
                         row["requested"] for row in refunds
@@ -3155,12 +3295,20 @@ class Database:
         )
         active_events = await self._pool().fetch(
             """
-            SELECT channel_id, message_id, question, reward, reward_type,
-                   reward_object_id, reward_quantity, reward_name, reward_emoji,
-                   expires_at, created_by, created_at
+            SELECT channel_id, message_id, question, answer_text, reward,
+                   reward_object_count, expires_at, created_by, created_at
             FROM active_question_events
             WHERE guild_id = $1
             ORDER BY created_at
+            """,
+            guild_id,
+        )
+        active_event_rewards = await self._pool().fetch(
+            """
+            SELECT channel_id, position, item_type, item_id, quantity, name, emoji
+            FROM active_question_event_rewards
+            WHERE guild_id = $1
+            ORDER BY channel_id, position
             """,
             guild_id,
         )
@@ -3185,6 +3333,9 @@ class Database:
             "whitelist_entries": [dict(row) for row in whitelist_entries],
             "movements": [dict(row) for row in movements],
             "active_question_events": [dict(row) for row in active_events],
+            "active_question_event_rewards": [
+                dict(row) for row in active_event_rewards
+            ],
         }
 
     async def create_question_event(
@@ -3193,15 +3344,17 @@ class Database:
         channel_id: int,
         question: str,
         answer_hash: str,
+        answer_text: str,
         reward: int,
-        reward_type: str,
-        reward_object_id: int | None,
-        reward_quantity: int,
-        reward_name: str | None,
-        reward_emoji: str | None,
+        reward_objects: list[dict],
         duration_minutes: int,
         created_by: int,
     ):
+        if len(reward_objects) > 3:
+            raise ValueError("Un evento admite un máximo de tres objetos.")
+        if reward <= 0 and not reward_objects:
+            raise ValueError("El evento debe tener al menos una recompensa.")
+
         async with self._pool().acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
@@ -3215,13 +3368,12 @@ class Database:
                 row = await connection.fetchrow(
                     """
                     INSERT INTO active_question_events (
-                        guild_id, channel_id, question, answer_hash,
-                        reward, reward_type, reward_object_id, reward_quantity,
-                        reward_name, reward_emoji, expires_at, created_by
+                        guild_id, channel_id, question, answer_hash, answer_text,
+                        reward, reward_object_count, expires_at, created_by
                     )
                     VALUES (
-                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                        NOW() + ($11::INTEGER * INTERVAL '1 minute'), $12
+                        $1, $2, $3, $4, $5, $6, $7,
+                        NOW() + ($8::INTEGER * INTERVAL '1 minute'), $9
                     )
                     ON CONFLICT (guild_id, channel_id) DO NOTHING
                     RETURNING expires_at
@@ -3230,16 +3382,41 @@ class Database:
                     channel_id,
                     question,
                     answer_hash,
+                    answer_text,
                     reward,
-                    reward_type,
-                    reward_object_id,
-                    reward_quantity,
-                    reward_name,
-                    reward_emoji,
+                    len(reward_objects),
                     duration_minutes,
                     created_by,
                 )
-                return row["expires_at"] if row is not None else None
+                if row is None:
+                    return None
+                if reward_objects:
+                    await connection.executemany(
+                        """
+                        INSERT INTO active_question_event_rewards (
+                            guild_id, channel_id, position, item_type, item_id,
+                            quantity, name, emoji
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        """,
+                        [
+                            (
+                                guild_id,
+                                channel_id,
+                                position,
+                                reward_object["item_type"],
+                                reward_object["item_id"],
+                                reward_object["quantity"],
+                                reward_object["name"],
+                                reward_object.get("emoji"),
+                            )
+                            for position, reward_object in enumerate(
+                                reward_objects,
+                                start=1,
+                            )
+                        ],
+                    )
+                return row["expires_at"]
 
     async def set_question_event_message(
         self,
@@ -3260,6 +3437,211 @@ class Database:
         return result == "UPDATE 1"
 
     async def claim_question_event(
+        self,
+        guild_id: int,
+        channel_id: int,
+        answer_hash: str,
+        message_id: int,
+        winner_id: int,
+        expected_badge_role_ids: dict[int, int] | None = None,
+    ) -> dict | None:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                event = await connection.fetchrow(
+                    """
+                    SELECT guild_id, channel_id, question, answer_text, reward,
+                           created_by, message_id
+                    FROM active_question_events
+                    WHERE guild_id = $1
+                      AND channel_id = $2
+                      AND answer_hash = $3
+                      AND message_id = $4
+                      AND expires_at > NOW()
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    channel_id,
+                    answer_hash,
+                    message_id,
+                )
+                if event is None:
+                    return None
+
+                reward_rows = await connection.fetch(
+                    """
+                    SELECT position, item_type, item_id, quantity, name, emoji
+                    FROM active_question_event_rewards
+                    WHERE guild_id = $1 AND channel_id = $2
+                    ORDER BY position
+                    """,
+                    guild_id,
+                    channel_id,
+                )
+                reward_objects = [dict(row) for row in reward_rows]
+                configured_by_key: dict[tuple[str, int], dict] = {}
+                if reward_objects:
+                    configured_rows = await connection.fetch(
+                        """
+                        SELECT configured.item_type, configured.id,
+                               configured.badge_role_id
+                        FROM (
+                            SELECT 'badge'::TEXT AS item_type, id, badge_role_id
+                            FROM badges WHERE guild_id = $1
+                            UNION ALL
+                            SELECT 'modifier'::TEXT AS item_type, id,
+                                   NULL::BIGINT AS badge_role_id
+                            FROM modifiers WHERE guild_id = $1
+                            UNION ALL
+                            SELECT 'ticket'::TEXT AS item_type, id,
+                                   NULL::BIGINT AS badge_role_id
+                            FROM tickets WHERE guild_id = $1
+                        ) AS configured
+                        JOIN UNNEST($2::TEXT[], $3::BIGINT[])
+                             AS wanted(item_type, item_id)
+                          ON wanted.item_type = configured.item_type
+                         AND wanted.item_id = configured.id
+                        """,
+                        guild_id,
+                        [row["item_type"] for row in reward_objects],
+                        [row["item_id"] for row in reward_objects],
+                    )
+                    configured_by_key = {
+                        (row["item_type"], row["id"]): dict(row)
+                        for row in configured_rows
+                    }
+                    for reward_object in reward_objects:
+                        key = (
+                            reward_object["item_type"],
+                            reward_object["item_id"],
+                        )
+                        configured = configured_by_key.get(key)
+                        if configured is None:
+                            return {
+                                "status": "reward_unavailable",
+                                **dict(event),
+                                "reward_objects": reward_objects,
+                            }
+                        if reward_object["item_type"] == "badge":
+                            expected_role_id = (expected_badge_role_ids or {}).get(
+                                reward_object["item_id"]
+                            )
+                            if (
+                                expected_role_id is None
+                                or configured["badge_role_id"] != expected_role_id
+                            ):
+                                return {
+                                    "status": "reward_unavailable",
+                                    **dict(event),
+                                    "reward_objects": reward_objects,
+                                }
+
+                new_balance = None
+                if event["reward"] > 0:
+                    new_balance = await connection.fetchval(
+                        """
+                        INSERT INTO balances (guild_id, user_id, balance)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (guild_id, user_id)
+                        DO UPDATE SET balance = balances.balance + EXCLUDED.balance
+                        RETURNING balance
+                        """,
+                        guild_id,
+                        winner_id,
+                        event["reward"],
+                    )
+
+                new_quantities = []
+                for reward_object in reward_objects:
+                    item_type = reward_object["item_type"]
+                    if item_type == "badge":
+                        continue
+                    inventory_table = (
+                        "modifier_inventory"
+                        if item_type == "modifier"
+                        else "ticket_inventory"
+                    )
+                    item_column = (
+                        "modifier_id" if item_type == "modifier" else "ticket_id"
+                    )
+                    new_quantity = await connection.fetchval(
+                        f"""
+                        INSERT INTO {inventory_table} (
+                            guild_id, user_id, {item_column}, quantity
+                        )
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (guild_id, user_id, {item_column})
+                        DO UPDATE SET quantity = (
+                            {inventory_table}.quantity + EXCLUDED.quantity
+                        )
+                        RETURNING quantity
+                        """,
+                        guild_id,
+                        winner_id,
+                        reward_object["item_id"],
+                        reward_object["quantity"],
+                    )
+                    new_quantities.append(
+                        {
+                            "item_type": item_type,
+                            "item_id": reward_object["item_id"],
+                            "new_quantity": new_quantity,
+                        }
+                    )
+
+                await connection.execute(
+                    """
+                    DELETE FROM active_question_events
+                    WHERE guild_id = $1 AND channel_id = $2
+                    """,
+                    guild_id,
+                    channel_id,
+                )
+
+                description_parts = []
+                if event["reward"] > 0:
+                    formatted_reward = f"{event['reward']:,}".replace(",", ".")
+                    coin_emoji = await connection.fetchval(
+                        "SELECT coin_emoji FROM guild_settings WHERE guild_id = $1",
+                        guild_id,
+                    ) or "🪙"
+                    description_parts.append(f"{coin_emoji} {formatted_reward}")
+                description_parts.extend(
+                    (
+                        f"{reward_object['quantity']} unidad(es) de "
+                        f"{reward_object['name']}"
+                    )
+                    for reward_object in reward_objects
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO movements (
+                        guild_id, user_id, actor_id, action, amount, description
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    guild_id,
+                    winner_id,
+                    event["created_by"],
+                    "event_object_reward" if reward_objects else "event_reward",
+                    (
+                        event["reward"]
+                        if event["reward"] > 0
+                        else sum(row["quantity"] for row in reward_objects)
+                    ),
+                    (
+                        "Ganó un evento de pregunta y recibió "
+                        f"{', '.join(description_parts)}: {event['question']}"
+                    ),
+                )
+                return {
+                    "status": "claimed",
+                    **dict(event),
+                    "reward_objects": reward_objects,
+                    "new_balance": new_balance,
+                    "new_quantities": new_quantities,
+                }
+
+    async def _claim_question_event_legacy(
         self,
         guild_id: int,
         channel_id: int,
@@ -3458,36 +3840,109 @@ class Database:
                 }
 
     async def cancel_question_event(self, guild_id: int, channel_id: int):
-        return await self._pool().fetchrow(
-            """
-            DELETE FROM active_question_events
-            WHERE guild_id = $1 AND channel_id = $2
-            RETURNING question, reward, reward_type, reward_object_id,
-                      reward_quantity, reward_name, reward_emoji,
-                      created_by, message_id
-            """,
-            guild_id,
-            channel_id,
-        )
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                event = await connection.fetchrow(
+                    """
+                    SELECT guild_id, channel_id, message_id, question, answer_text,
+                           reward, expires_at, created_by
+                    FROM active_question_events
+                    WHERE guild_id = $1 AND channel_id = $2
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    channel_id,
+                )
+                if event is None:
+                    return None
+                reward_rows = await connection.fetch(
+                    """
+                    SELECT guild_id, channel_id, position, item_type, item_id,
+                           quantity, name, emoji
+                    FROM active_question_event_rewards
+                    WHERE guild_id = $1 AND channel_id = $2
+                    ORDER BY position
+                    """,
+                    guild_id,
+                    channel_id,
+                )
+                await connection.execute(
+                    """
+                    DELETE FROM active_question_events
+                    WHERE guild_id = $1 AND channel_id = $2
+                    """,
+                    guild_id,
+                    channel_id,
+                )
+                return _question_events_with_rewards([event], reward_rows)[0]
 
     async def pop_expired_question_events(self):
-        return await self._pool().fetch(
-            """
-            DELETE FROM active_question_events
-            WHERE expires_at <= NOW()
-            RETURNING guild_id, channel_id, message_id, question, reward,
-                      reward_type, reward_object_id, reward_quantity,
-                      reward_name, reward_emoji, created_by
-            """
-        )
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                events = await connection.fetch(
+                    """
+                    SELECT guild_id, channel_id, message_id, question, answer_text,
+                           reward, expires_at, created_by
+                    FROM active_question_events
+                    WHERE expires_at <= NOW()
+                    FOR UPDATE SKIP LOCKED
+                    """
+                )
+                if not events:
+                    return []
+                guild_ids = [row["guild_id"] for row in events]
+                channel_ids = [row["channel_id"] for row in events]
+                reward_rows = await connection.fetch(
+                    """
+                    SELECT reward.guild_id, reward.channel_id, reward.position,
+                           reward.item_type, reward.item_id, reward.quantity,
+                           reward.name, reward.emoji
+                    FROM active_question_event_rewards AS reward
+                    JOIN UNNEST($1::BIGINT[], $2::BIGINT[])
+                         AS selected(guild_id, channel_id)
+                      ON selected.guild_id = reward.guild_id
+                     AND selected.channel_id = reward.channel_id
+                    ORDER BY reward.guild_id, reward.channel_id, reward.position
+                    """,
+                    guild_ids,
+                    channel_ids,
+                )
+                await connection.execute(
+                    """
+                    DELETE FROM active_question_events AS event
+                    USING UNNEST($1::BIGINT[], $2::BIGINT[])
+                          AS selected(guild_id, channel_id)
+                    WHERE event.guild_id = selected.guild_id
+                      AND event.channel_id = selected.channel_id
+                    """,
+                    guild_ids,
+                    channel_ids,
+                )
+                return _question_events_with_rewards(events, reward_rows)
 
     async def list_active_question_events(self):
-        return await self._pool().fetch(
-            """
-            SELECT guild_id, channel_id, message_id, question, answer_hash,
-                   reward, reward_type, reward_object_id, reward_quantity,
-                   reward_name, reward_emoji, expires_at, created_by
-            FROM active_question_events
-            WHERE expires_at > NOW() AND message_id IS NOT NULL
-            """
-        )
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                events = await connection.fetch(
+                    """
+                    SELECT guild_id, channel_id, message_id, question, answer_hash,
+                           answer_text, reward, expires_at, created_by
+                    FROM active_question_events
+                    WHERE expires_at > NOW() AND message_id IS NOT NULL
+                    """
+                )
+                reward_rows = await connection.fetch(
+                    """
+                    SELECT reward.guild_id, reward.channel_id, reward.position,
+                           reward.item_type, reward.item_id, reward.quantity,
+                           reward.name, reward.emoji
+                    FROM active_question_event_rewards AS reward
+                    JOIN active_question_events AS event
+                      ON event.guild_id = reward.guild_id
+                     AND event.channel_id = reward.channel_id
+                    WHERE event.expires_at > NOW()
+                      AND event.message_id IS NOT NULL
+                    ORDER BY reward.guild_id, reward.channel_id, reward.position
+                    """
+                )
+                return _question_events_with_rewards(events, reward_rows)
