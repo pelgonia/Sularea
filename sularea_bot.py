@@ -306,6 +306,32 @@ def format_multiplier(multiplier_percent: int) -> str:
     return f"{whole}.{decimals:02d}×"
 
 
+def parse_whitelist_multiplier(
+    value: str,
+) -> tuple[int | None, str | None]:
+    cleaned = value.strip().casefold().replace(" ", "").replace(",", ".")
+    if cleaned.endswith(("x", "×")):
+        cleaned = cleaned[:-1]
+    is_percentage = cleaned.endswith("%")
+    if is_percentage:
+        cleaned = cleaned[:-1]
+    if not cleaned:
+        return None, "Escribe un multiplicador, por ejemplo `1.5` o `1,5`."
+    try:
+        multiplier = Fraction(cleaned)
+    except (ValueError, ZeroDivisionError):
+        return (
+            None,
+            "Usa un valor como `1.5`, `1,5`, `1.5x`, `3/2` o `150%`.",
+        )
+    if is_percentage:
+        multiplier /= 100
+    if multiplier < 1 or multiplier > 10:
+        return None, "El multiplicador debe estar entre **1×** y **10×**."
+    multiplier_percent = int(multiplier * 100 + Fraction(1, 2))
+    return multiplier_percent, None
+
+
 def whitelist_marker(guild_id: int | None = None) -> str:
     if guild_id is None:
         return DEFAULT_WHITELIST_EMOJI
@@ -3974,20 +4000,29 @@ async def configurardescuentowhitelist(
     description="Configura el multiplicador de monedas de eventos para la whitelist.",
 )
 @app_commands.describe(
-    multiplicador="Multiplicador entre 1 y 10; por ejemplo 1.5 o 2",
+    multiplicador="Acepta 1.5, 1,5, 1.5x, 3/2 o 150%",
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def configurarmultiplicadorwhitelist(
     interaction: discord.Interaction,
-    multiplicador: app_commands.Range[float, 1.0, 10.0],
+    multiplicador: app_commands.Range[str, 1, 20],
 ) -> None:
     assert interaction.guild_id is not None
     guild = interaction.guild
     if guild is None:
         return
-    multiplier_percent = max(100, min(1000, round(multiplicador * 100)))
+    multiplier_percent, multiplier_error = parse_whitelist_multiplier(
+        multiplicador
+    )
+    if multiplier_error is not None or multiplier_percent is None:
+        await answer(
+            interaction,
+            multiplier_error or "Ese multiplicador no es válido.",
+            ephemeral=True,
+        )
+        return
     multiplier_label = format_multiplier(multiplier_percent)
     await bot.db.set_whitelist_event_multiplier(
         interaction.guild_id,
