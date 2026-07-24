@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS modifiers (
     price BIGINT NOT NULL DEFAULT 0 CHECK (price >= 0),
     shop_section TEXT,
     emoji TEXT,
-    messages TEXT[] NOT NULL CHECK (CARDINALITY(messages) > 0),
+    messages TEXT[] NOT NULL,
+    message_source_modifier_id BIGINT,
     trigger_numerator INTEGER NOT NULL DEFAULT 1 CHECK (trigger_numerator >= 0),
     trigger_denominator INTEGER NOT NULL DEFAULT 10 CHECK (trigger_denominator >= 1),
     cooldown_seconds INTEGER NOT NULL DEFAULT 10 CHECK (cooldown_seconds >= 0),
@@ -100,8 +101,70 @@ ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 5;
 ALTER TABLE modifiers
 ADD COLUMN IF NOT EXISTS effect_scope TEXT NOT NULL DEFAULT 'individual';
 
+ALTER TABLE modifiers
+ADD COLUMN IF NOT EXISTS message_source_modifier_id BIGINT;
+
+ALTER TABLE modifiers
+DROP CONSTRAINT IF EXISTS modifiers_messages_check;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'modifiers_message_source_modifier_id_fkey'
+          AND conrelid = 'modifiers'::REGCLASS
+    ) THEN
+        ALTER TABLE modifiers
+        ADD CONSTRAINT modifiers_message_source_modifier_id_fkey
+        FOREIGN KEY (message_source_modifier_id)
+        REFERENCES modifiers(id)
+        ON DELETE SET NULL;
+    END IF;
+END
+$$;
+
+DROP VIEW IF EXISTS modifier_effective_messages;
+
+CREATE OR REPLACE FUNCTION resolve_modifier_messages(root_modifier_id BIGINT)
+RETURNS TEXT[]
+LANGUAGE SQL
+STABLE
+AS $function$
+    WITH RECURSIVE message_chain AS (
+        SELECT
+            modifier.id,
+            modifier.message_source_modifier_id,
+            modifier.messages,
+            ARRAY[modifier.id]::BIGINT[] AS visited_ids
+        FROM modifiers AS modifier
+        WHERE modifier.id = root_modifier_id
+
+        UNION ALL
+
+        SELECT
+            source.id,
+            source.message_source_modifier_id,
+            source.messages,
+            chain.visited_ids || source.id
+        FROM message_chain AS chain
+        JOIN modifiers AS source
+          ON source.id = chain.message_source_modifier_id
+        WHERE NOT source.id = ANY(chain.visited_ids)
+          AND CARDINALITY(chain.visited_ids) < 50
+    )
+    SELECT messages
+    FROM message_chain
+    ORDER BY CARDINALITY(visited_ids) DESC
+    LIMIT 1
+$function$;
+
 CREATE INDEX IF NOT EXISTS modifiers_shop_index
 ON modifiers (guild_id, purchasable, price);
+
+CREATE INDEX IF NOT EXISTS modifiers_message_source_index
+ON modifiers (message_source_modifier_id)
+WHERE message_source_modifier_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS tickets (
     id BIGSERIAL PRIMARY KEY,
@@ -812,7 +875,15 @@ class Database:
 
     async def get_modifier(self, guild_id: int, name_key: str):
         return await self._pool().fetchrow(
-            "SELECT * FROM modifiers WHERE guild_id = $1 AND name_key = $2",
+            """
+            SELECT modifier.*,
+                   resolve_modifier_messages(modifier.id) AS effective_messages,
+                   source.name AS message_source_name
+            FROM modifiers AS modifier
+            LEFT JOIN modifiers AS source
+              ON source.id = modifier.message_source_modifier_id
+            WHERE modifier.guild_id = $1 AND modifier.name_key = $2
+            """,
             guild_id,
             name_key,
         )
@@ -821,14 +892,30 @@ class Database:
         if purchasable_only:
             return await self._pool().fetch(
                 """
-                SELECT * FROM modifiers
-                WHERE guild_id = $1 AND purchasable = TRUE
-                ORDER BY COALESCE(shop_section, 'General'), price, name
+                SELECT modifier.*,
+                       resolve_modifier_messages(modifier.id) AS effective_messages,
+                       source.name AS message_source_name
+                FROM modifiers AS modifier
+                LEFT JOIN modifiers AS source
+                  ON source.id = modifier.message_source_modifier_id
+                WHERE modifier.guild_id = $1
+                  AND modifier.purchasable = TRUE
+                ORDER BY COALESCE(modifier.shop_section, 'General'),
+                         modifier.price, modifier.name
                 """,
                 guild_id,
             )
         return await self._pool().fetch(
-            "SELECT * FROM modifiers WHERE guild_id = $1 ORDER BY name",
+            """
+            SELECT modifier.*,
+                   resolve_modifier_messages(modifier.id) AS effective_messages,
+                   source.name AS message_source_name
+            FROM modifiers AS modifier
+            LEFT JOIN modifiers AS source
+              ON source.id = modifier.message_source_modifier_id
+            WHERE modifier.guild_id = $1
+            ORDER BY modifier.name
+            """,
             guild_id,
         )
 
@@ -1039,12 +1126,14 @@ class Database:
                             guild_id, name, name_key, purchasable, price,
                             shop_section, emoji, messages, trigger_numerator,
                             trigger_denominator, cooldown_seconds,
-                            duration_minutes, effect_scope
+                            duration_minutes, effect_scope,
+                            message_source_modifier_id
                         )
                         SELECT guild_id, $3, $4, purchasable, price,
                                shop_section, emoji, messages, trigger_numerator,
                                trigger_denominator, cooldown_seconds,
-                               duration_minutes, effect_scope
+                               duration_minutes, effect_scope,
+                               message_source_modifier_id
                         FROM modifiers
                         WHERE guild_id = $1 AND name_key = $2
                         RETURNING *
@@ -1419,17 +1508,19 @@ class Database:
         cooldown_seconds: int,
         duration_minutes: int,
         effect_scope: str,
+        message_source_modifier_id: int | None,
     ) -> None:
         await self._pool().execute(
             """
             INSERT INTO modifiers (
                 guild_id, name, name_key, purchasable, price,
                 shop_section, emoji, messages, trigger_numerator, trigger_denominator,
-                cooldown_seconds, duration_minutes, effect_scope
+                cooldown_seconds, duration_minutes, effect_scope,
+                message_source_modifier_id
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8::TEXT[],
-                $9, $10, $11, $12, $13
+                $9, $10, $11, $12, $13, $14
             )
             """,
             guild_id,
@@ -1445,6 +1536,7 @@ class Database:
             cooldown_seconds,
             duration_minutes,
             effect_scope,
+            message_source_modifier_id,
         )
 
     async def update_modifier(
@@ -1463,6 +1555,7 @@ class Database:
         cooldown_seconds: int,
         duration_minutes: int,
         effect_scope: str,
+        message_source_modifier_id: int | None,
     ) -> bool:
         result = await self._pool().execute(
             """
@@ -1478,7 +1571,8 @@ class Database:
                 trigger_denominator = $11,
                 cooldown_seconds = $12,
                 duration_minutes = $13,
-                effect_scope = $14
+                effect_scope = $14,
+                message_source_modifier_id = $15
             WHERE guild_id = $1 AND name_key = $2
             """,
             guild_id,
@@ -1495,8 +1589,47 @@ class Database:
             cooldown_seconds,
             duration_minutes,
             effect_scope,
+            message_source_modifier_id,
         )
         return result == "UPDATE 1"
+
+    async def modifier_link_would_cycle(
+        self,
+        guild_id: int,
+        modifier_id: int,
+        source_modifier_id: int,
+    ) -> bool:
+        return bool(
+            await self._pool().fetchval(
+                """
+                WITH RECURSIVE source_chain AS (
+                    SELECT id, message_source_modifier_id,
+                           ARRAY[id]::BIGINT[] AS visited_ids
+                    FROM modifiers
+                    WHERE guild_id = $1 AND id = $3
+
+                    UNION ALL
+
+                    SELECT source.id, source.message_source_modifier_id,
+                           chain.visited_ids || source.id
+                    FROM source_chain AS chain
+                    JOIN modifiers AS source
+                      ON source.id = chain.message_source_modifier_id
+                     AND source.guild_id = $1
+                    WHERE NOT source.id = ANY(chain.visited_ids)
+                      AND CARDINALITY(chain.visited_ids) < 50
+                )
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM source_chain
+                    WHERE id = $2
+                )
+                """,
+                guild_id,
+                modifier_id,
+                source_modifier_id,
+            )
+        )
 
     async def delete_modifier(self, guild_id: int, name_key: str):
         return await self._pool().fetchrow(
@@ -2771,7 +2904,11 @@ class Database:
             channel_triggered AS (
                 UPDATE active_channel_modifiers AS active
                 SET last_trigger_at = NOW()
-                FROM modifiers AS modifier, channel_state
+                FROM channel_state,
+                     modifiers AS modifier
+                     JOIN LATERAL (
+                         SELECT resolve_modifier_messages(modifier.id) AS messages
+                     ) AS effective ON TRUE
                 WHERE channel_state.is_active
                   AND active.guild_id = $1
                   AND active.channel_id = $2
@@ -2787,6 +2924,7 @@ class Database:
                       )
                   )
                   AND modifier.id = active.modifier_id
+                  AND CARDINALITY(effective.messages) > 0
                   AND active.expires_at > NOW()
                   AND (
                       active.last_trigger_at IS NULL
@@ -2798,7 +2936,7 @@ class Database:
                       modifier.trigger_numerator::DOUBLE PRECISION
                       / modifier.trigger_denominator
                   )
-                RETURNING modifier.name, modifier.messages
+                RETURNING modifier.name, effective.messages
             ),
             individual_state AS (
                 SELECT (
@@ -2816,7 +2954,11 @@ class Database:
             individual_triggered AS (
                 UPDATE active_modifiers AS active
                 SET last_trigger_at = NOW()
-                FROM modifiers AS modifier, channel_state
+                FROM channel_state,
+                     modifiers AS modifier
+                     JOIN LATERAL (
+                         SELECT resolve_modifier_messages(modifier.id) AS messages
+                     ) AS effective ON TRUE
                 WHERE NOT channel_state.is_active
                   AND active.guild_id = $1
                   AND active.user_id = $3
@@ -2832,6 +2974,7 @@ class Database:
                       )
                   )
                   AND modifier.id = active.modifier_id
+                  AND CARDINALITY(effective.messages) > 0
                   AND active.expires_at > NOW()
                   AND (
                       active.last_trigger_at IS NULL
@@ -2843,7 +2986,7 @@ class Database:
                       modifier.trigger_numerator::DOUBLE PRECISION
                       / modifier.trigger_denominator
                   )
-                RETURNING modifier.name, modifier.messages
+                RETURNING modifier.name, effective.messages
             )
             SELECT
                 channel_state.is_active AS channel_active,
@@ -2881,6 +3024,9 @@ class Database:
             UPDATE active_modifiers AS active
             SET last_trigger_at = NOW()
             FROM modifiers AS modifier
+            JOIN LATERAL (
+                SELECT resolve_modifier_messages(modifier.id) AS messages
+            ) AS effective ON TRUE
             WHERE active.guild_id = $1
               AND active.user_id = $2
               AND (
@@ -2895,6 +3041,7 @@ class Database:
                   )
               )
               AND modifier.id = active.modifier_id
+              AND CARDINALITY(effective.messages) > 0
               AND active.expires_at > NOW()
               AND (
                   active.last_trigger_at IS NULL
@@ -2906,7 +3053,7 @@ class Database:
                   modifier.trigger_numerator::DOUBLE PRECISION
                   / modifier.trigger_denominator
               )
-            RETURNING modifier.name, modifier.messages
+            RETURNING modifier.name, effective.messages
             """,
             guild_id,
             user_id,
@@ -2932,6 +3079,9 @@ class Database:
                 UPDATE active_channel_modifiers AS active
                 SET last_trigger_at = NOW()
                 FROM modifiers AS modifier
+                JOIN LATERAL (
+                    SELECT resolve_modifier_messages(modifier.id) AS messages
+                ) AS effective ON TRUE
                 WHERE active.guild_id = $1
                   AND active.channel_id = $2
                   AND (
@@ -2946,6 +3096,7 @@ class Database:
                       )
                   )
                   AND modifier.id = active.modifier_id
+                  AND CARDINALITY(effective.messages) > 0
                   AND active.expires_at > NOW()
                   AND (
                       active.last_trigger_at IS NULL
@@ -2957,7 +3108,7 @@ class Database:
                       modifier.trigger_numerator::DOUBLE PRECISION
                       / modifier.trigger_denominator
                   )
-                RETURNING modifier.name, modifier.messages
+                RETURNING modifier.name, effective.messages
             )
             SELECT channel_state.is_active, triggered.name, triggered.messages
             FROM channel_state
@@ -4253,7 +4404,8 @@ class Database:
             SELECT id, name, name_key, purchasable, price,
                    shop_section, emoji, messages, trigger_numerator,
                    trigger_denominator,
-                   cooldown_seconds, duration_minutes, effect_scope
+                   cooldown_seconds, duration_minutes, effect_scope,
+                   message_source_modifier_id
             FROM modifiers WHERE guild_id = $1 ORDER BY name
             """,
             guild_id,

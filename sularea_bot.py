@@ -1457,6 +1457,23 @@ async def modifier_autocomplete(
     ]
 
 
+async def modifier_link_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    choices = await modifier_autocomplete(interaction, current)
+    normalized = normalize_name(current)
+    if not normalized or "quitar".startswith(normalized):
+        choices.insert(
+            0,
+            app_commands.Choice(
+                name="Quitar vínculo y conservar los mensajes actuales",
+                value="quitar",
+            ),
+        )
+    return choices[:25]
+
+
 async def modifier_message_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
@@ -1470,11 +1487,11 @@ async def modifier_message_autocomplete(
         interaction.guild_id,
         normalize_name(modifier_name),
     )
-    if modifier is None:
+    if modifier is None or modifier["message_source_modifier_id"] is not None:
         return []
     search = normalize_name(current)
     choices = []
-    for index, message in enumerate(modifier["messages"]):
+    for index, message in enumerate(modifier["effective_messages"]):
         preview = " ".join(message.split())
         label = f"{index + 1}. {preview}"
         if search and search not in normalize_name(label):
@@ -3580,8 +3597,13 @@ async def objetos(interaction: discord.Interaction) -> None:
                 f"• {badge_emoji(row['emoji'], guild)}**{row['name']}**\n"
                 f"  Modificador {modifier_scope_label(row['effect_scope'])} consumible · "
                 f"Comprable: {sale} · "
-                f"Mensajes configurados: **{len(row['messages'])}**\n"
-                f"  Probabilidad: **{modifier_probability_label(row['trigger_numerator'], row['trigger_denominator'])}** · "
+                f"Mensajes configurados: **{len(row['effective_messages'])}**"
+                + (
+                    f" · Vinculados a: **{row['message_source_name']}**\n"
+                    if row["message_source_name"] is not None
+                    else "\n"
+                )
+                + f"  Probabilidad: **{modifier_probability_label(row['trigger_numerator'], row['trigger_denominator'])}** · "
                 f"Cooldown: **{row['cooldown_seconds']} s** · "
                 f"Duración: **{row['duration_minutes']} min**"
             )
@@ -3636,7 +3658,12 @@ def modifier_message_pages(modifiers: list, guild: discord.Guild) -> list[str]:
             f"__**{badge_emoji(modifier['emoji'], guild)}"
             f"{modifier['name']} (continuación)**__"
         )
-        messages = modifier["messages"]
+        messages = modifier["effective_messages"]
+        if modifier["message_source_name"] is not None:
+            header += (
+                f"\n*Usa siempre los mensajes de "
+                f"**{modifier['message_source_name']}**.*"
+            )
         if not messages:
             append_block(f"{header}\n*Sin mensajes configurados.*", "")
             continue
@@ -6028,8 +6055,8 @@ async def configurarinsignia(
     nombre="Nombre del modificador",
     comprable="Indica si aparecerá en la tienda",
     tipo="Individual para un miembro o Canal para todos los que escriban allí",
-    mensajes="Mensajes separados por |; omite si copiarás otro modificador",
-    copiar_mensajes_de="Modificador existente cuyos mensajes se copiarán",
+    mensajes="Mensajes separados por |; omite si vincularás otro modificador",
+    copiar_mensajes_de="Fuente cuyos mensajes se usarán siempre en tiempo real",
     probabilidad="Porcentaje (25) o fracción (1/4)",
     cooldown="Segundos mínimos entre mensajes generados",
     duracion="Minutos que permanecerá activo",
@@ -6079,7 +6106,9 @@ async def configurarmodificador(
     if await bot.db.get_ticket(interaction.guild_id, name_key):
         await answer(interaction, "Ya existe un ticket con ese nombre.")
         return
-    copied_messages_source = None
+    linked_messages_source = None
+    message_source_modifier_id = None
+    effective_message_count = 0
     if mensajes is not None and copiar_mensajes_de is not None:
         await answer(
             interaction,
@@ -6091,16 +6120,19 @@ async def configurarmodificador(
         if source_modifier is None:
             await answer(
                 interaction,
-                "El modificador del que quieres copiar mensajes no existe.",
+                "El modificador cuyos mensajes quieres vincular no existe.",
             )
             return
-        parsed_messages = list(source_modifier["messages"])
-        copied_messages_source = source_modifier["name"]
+        parsed_messages = []
+        message_source_modifier_id = source_modifier["id"]
+        linked_messages_source = source_modifier["name"]
+        effective_message_count = len(source_modifier["effective_messages"])
     elif mensajes is not None:
         parsed_messages, messages_error = parse_modifier_messages(mensajes)
         if messages_error is not None or parsed_messages is None:
             await answer(interaction, messages_error or "Los mensajes no son válidos.")
             return
+        effective_message_count = len(parsed_messages)
     else:
         await answer(
             interaction,
@@ -6152,6 +6184,7 @@ async def configurarmodificador(
             cooldown,
             duracion,
             tipo.value,
+            message_source_modifier_id,
         )
     except asyncpg.UniqueViolationError:
         await answer(interaction, "Ya existe un modificador con ese nombre.")
@@ -6174,10 +6207,10 @@ async def configurarmodificador(
         f"**Precio:** {money(precio, interaction.guild_id)}\n"
         f"**Categoría:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}\n"
-        f"**Mensajes:** {len(parsed_messages)}\n"
+        f"**Mensajes efectivos:** {effective_message_count}\n"
         + (
-            f"**Mensajes copiados de:** {copied_messages_source}\n"
-            if copied_messages_source is not None
+            f"**Mensajes vinculados a:** {linked_messages_source}\n"
+            if linked_messages_source is not None
             else ""
         )
         + f"**Probabilidad:** {modifier_probability_label(probability_numerator, probability_denominator)}\n"
@@ -6189,7 +6222,12 @@ async def configurarmodificador(
         interaction,
         f"Configuré el modificador **{display_name}** con "
         f"tipo **{modifier_scope_label(tipo.value)}**, "
-        f"**{len(parsed_messages)} mensajes**, probabilidad "
+        + (
+            f"mensajes vinculados a **{linked_messages_source}**, "
+            if linked_messages_source is not None
+            else f"**{len(parsed_messages)} mensajes**, "
+        )
+        + "probabilidad "
         f"**{modifier_probability_label(probability_numerator, probability_denominator)}**, "
         f"cooldown de **{cooldown} segundos** y duración de **{duracion} minutos**.",
     )
@@ -6234,7 +6272,16 @@ async def editarmensajes(
     if current is None:
         await answer(interaction, "Ese modificador no existe.")
         return
-    messages = list(current["messages"])
+    if current["message_source_modifier_id"] is not None:
+        await answer(
+            interaction,
+            f"**{current['name']}** usa siempre los mensajes de "
+            f"**{current['message_source_name']}**. Edita ese modificador o "
+            "quita el vínculo con `/editar` usando "
+            "`copiar_mensajes_de: quitar`.",
+        )
+        return
+    messages = list(current["effective_messages"])
     old_message: str | None = None
     added_or_updated_message: str | None = None
 
@@ -6327,6 +6374,7 @@ async def editarmensajes(
         current["cooldown_seconds"],
         current["duration_minutes"],
         current["effect_scope"],
+        None,
     )
     if not updated:
         await answer(interaction, "Ese modificador ya no existe.")
@@ -6492,7 +6540,9 @@ async def configurarticket(
     probabilidad="Para modificadores: porcentaje (25) o fracción (1/4)",
     cooldown="Para modificadores: segundos entre intentos",
     duracion="Para modificadores: minutos que permanece activo",
-    copiar_mensajes_de="Para modificadores: copia los mensajes de otro existente",
+    copiar_mensajes_de=(
+        "Para modificadores: vincula otro; escribe quitar para volver a mensajes propios"
+    ),
 )
 @app_commands.choices(
     tipo_modificador=[
@@ -6503,7 +6553,7 @@ async def configurarticket(
 @app_commands.autocomplete(
     objeto=editable_object_autocomplete,
     apartado=shop_section_autocomplete,
-    copiar_mensajes_de=modifier_autocomplete,
+    copiar_mensajes_de=modifier_link_autocomplete,
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -6704,22 +6754,47 @@ async def editar(
         if await bot.db.get_ticket(interaction.guild_id, final_name_key):
             await answer(interaction, "Ya existe un ticket con ese nombre.")
             return
-        copied_messages_source = None
+        final_message_source_id = current_modifier["message_source_modifier_id"]
+        final_message_source_name = current_modifier["message_source_name"]
+        final_messages = list(current_modifier["messages"])
+        final_effective_count = len(current_modifier["effective_messages"])
         if copiar_mensajes_de is not None:
-            source_modifier = await find_modifier(
-                interaction,
-                copiar_mensajes_de,
-            )
-            if source_modifier is None:
-                await answer(
+            unlink_requested = normalize_name(copiar_mensajes_de) in {
+                "quitar",
+                "ninguno",
+                "propios",
+            }
+            if unlink_requested:
+                final_messages = list(current_modifier["effective_messages"])
+                final_message_source_id = None
+                final_message_source_name = None
+                final_effective_count = len(final_messages)
+            else:
+                source_modifier = await find_modifier(
                     interaction,
-                    "El modificador del que quieres copiar mensajes no existe.",
+                    copiar_mensajes_de,
                 )
-                return
-            final_messages = list(source_modifier["messages"])
-            copied_messages_source = source_modifier["name"]
-        else:
-            final_messages = list(current_modifier["messages"])
+                if source_modifier is None:
+                    await answer(
+                        interaction,
+                        "El modificador cuyos mensajes quieres vincular no existe.",
+                    )
+                    return
+                if await bot.db.modifier_link_would_cycle(
+                    interaction.guild_id,
+                    current_modifier["id"],
+                    source_modifier["id"],
+                ):
+                    await answer(
+                        interaction,
+                        "Ese vínculo crearía un ciclo entre modificadores. "
+                        "Selecciona otro modificador.",
+                    )
+                    return
+                final_messages = []
+                final_message_source_id = source_modifier["id"]
+                final_message_source_name = source_modifier["name"]
+                final_effective_count = len(source_modifier["effective_messages"])
         if probabilidad is not None:
             parsed_probability, probability_error = parse_modifier_probability(probabilidad)
             if probability_error is not None or parsed_probability is None:
@@ -6772,6 +6847,7 @@ async def editar(
                 final_cooldown,
                 final_duration,
                 final_scope,
+                final_message_source_id,
             )
         except asyncpg.UniqueViolationError:
             await answer(interaction, "Ya existe un modificador con ese nombre.")
@@ -6798,10 +6874,10 @@ async def editar(
             f"**Precio:** {money(final_price, interaction.guild_id)}\n"
             f"**Categoría:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}\n"
-            f"**Mensajes:** {len(final_messages)}\n"
+            f"**Mensajes efectivos:** {final_effective_count}\n"
             + (
-                f"**Mensajes copiados de:** {copied_messages_source}\n"
-                if copied_messages_source is not None
+                f"**Mensajes vinculados a:** {final_message_source_name}\n"
+                if final_message_source_name is not None
                 else ""
             )
             + f"**Probabilidad:** "
@@ -8248,7 +8324,9 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/estadomodificador` alterna el efecto del miembro o canal elegido; "
                 "si no hay uno activo, exige seleccionar un modificador compatible. "
                 "El de Canal tiene prioridad sobre los Individuales dentro de ese "
-                "canal. La probabilidad acepta `25` o `1/4`."
+                "canal. La probabilidad acepta `25` o `1/4`. "
+                "`copiar_mensajes_de` crea un vínculo permanente: los cambios del "
+                "original se reflejan automáticamente."
             ),
             inline=False,
         )
