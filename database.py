@@ -246,6 +246,29 @@ ALTER TABLE guild_settings
 ADD CONSTRAINT guild_settings_whitelist_event_multiplier_check
 CHECK (whitelist_event_multiplier_percent BETWEEN 100 AND 1000);
 
+CREATE TABLE IF NOT EXISTS daily_reward_settings (
+    guild_id BIGINT PRIMARY KEY,
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    coin_amount BIGINT NOT NULL CHECK (coin_amount > 0),
+    shop_section TEXT NOT NULL,
+    updated_by BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS daily_reward_claims (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    last_claim_at TIMESTAMPTZ NOT NULL,
+    next_claim_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (guild_id, user_id),
+    FOREIGN KEY (guild_id)
+        REFERENCES daily_reward_settings (guild_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS daily_reward_claims_next_index
+ON daily_reward_claims (guild_id, next_claim_at);
+
 CREATE TABLE IF NOT EXISTS automatic_message_settings (
     guild_id BIGINT PRIMARY KEY,
     channel_id BIGINT NOT NULL,
@@ -1324,6 +1347,16 @@ class Database:
                         current["name"],
                         name,
                     )
+                await connection.execute(
+                    """
+                    UPDATE daily_reward_settings
+                    SET shop_section = $3
+                    WHERE guild_id = $1 AND LOWER(shop_section) = LOWER($2)
+                    """,
+                    guild_id,
+                    current["name"],
+                    name,
+                )
                 return True
 
     async def delete_shop_category(
@@ -1356,6 +1389,15 @@ class Database:
                         category["name"],
                     )
                     affected += int(result.rsplit(" ", 1)[-1])
+                await connection.execute(
+                    """
+                    UPDATE daily_reward_settings
+                    SET shop_section = 'General'
+                    WHERE guild_id = $1 AND LOWER(shop_section) = LOWER($2)
+                    """,
+                    guild_id,
+                    category["name"],
+                )
                 return {
                     "name": category["name"],
                     "description": category["description"],
@@ -3446,6 +3488,383 @@ class Database:
             multiplier_percent,
         )
 
+    async def get_daily_reward_settings(self, guild_id: int):
+        return await self._pool().fetchrow(
+            """
+            SELECT guild_id, enabled, coin_amount, shop_section,
+                   updated_by, updated_at
+            FROM daily_reward_settings
+            WHERE guild_id = $1
+            """,
+            guild_id,
+        )
+
+    async def get_daily_reward_status(self, guild_id: int, user_id: int):
+        return await self._pool().fetchrow(
+            """
+            SELECT settings.enabled, settings.coin_amount,
+                   settings.shop_section, claim.last_claim_at,
+                   claim.next_claim_at, NOW() AS current_time
+            FROM daily_reward_settings AS settings
+            LEFT JOIN daily_reward_claims AS claim
+              ON claim.guild_id = settings.guild_id
+             AND claim.user_id = $2
+            WHERE settings.guild_id = $1
+            """,
+            guild_id,
+            user_id,
+        )
+
+    async def set_daily_reward_settings(
+        self,
+        guild_id: int,
+        enabled: bool,
+        coin_amount: int,
+        shop_section: str,
+        actor_id: int,
+    ):
+        return await self._pool().fetchrow(
+            """
+            INSERT INTO daily_reward_settings (
+                guild_id, enabled, coin_amount, shop_section,
+                updated_by, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, NOW())
+            ON CONFLICT (guild_id)
+            DO UPDATE SET
+                enabled = EXCLUDED.enabled,
+                coin_amount = EXCLUDED.coin_amount,
+                shop_section = EXCLUDED.shop_section,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = NOW()
+            RETURNING *
+            """,
+            guild_id,
+            enabled,
+            coin_amount,
+            shop_section,
+            actor_id,
+        )
+
+    async def list_daily_reward_items(
+        self,
+        guild_id: int,
+        shop_section: str,
+    ):
+        return await self._pool().fetch(
+            """
+            SELECT *
+            FROM (
+                SELECT 'badge'::TEXT AS item_type, id, name, emoji,
+                       badge_role_id, color_role_id
+                FROM badges
+                WHERE guild_id = $1
+                  AND LOWER(
+                      COALESCE(NULLIF(BTRIM(shop_section), ''), 'General')
+                  ) = LOWER($2)
+                UNION ALL
+                SELECT 'modifier'::TEXT, id, name, emoji,
+                       NULL::BIGINT, NULL::BIGINT
+                FROM modifiers
+                WHERE guild_id = $1
+                  AND LOWER(
+                      COALESCE(NULLIF(BTRIM(shop_section), ''), 'General')
+                  ) = LOWER($2)
+                UNION ALL
+                SELECT 'ticket'::TEXT, id, name, emoji,
+                       NULL::BIGINT, NULL::BIGINT
+                FROM tickets
+                WHERE guild_id = $1
+                  AND LOWER(
+                      COALESCE(NULLIF(BTRIM(shop_section), ''), 'General')
+                  ) = LOWER($2)
+            ) AS available
+            ORDER BY item_type, name
+            """,
+            guild_id,
+            shop_section,
+        )
+
+    async def claim_daily_reward(
+        self,
+        guild_id: int,
+        user_id: int,
+        role_ids: list[int],
+        item_type: str,
+        item_id: int,
+    ) -> dict:
+        advisory_key = (guild_id ^ (user_id << 1)) & ((1 << 63) - 1)
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1::BIGINT)",
+                    advisory_key,
+                )
+                settings = await connection.fetchrow(
+                    """
+                    SELECT enabled, coin_amount, shop_section
+                    FROM daily_reward_settings
+                    WHERE guild_id = $1
+                    FOR SHARE
+                    """,
+                    guild_id,
+                )
+                if settings is None:
+                    return {"status": "not_configured"}
+                if not settings["enabled"]:
+                    return {"status": "disabled"}
+
+                current_time = await connection.fetchval("SELECT NOW()")
+                previous_claim = await connection.fetchrow(
+                    """
+                    SELECT next_claim_at
+                    FROM daily_reward_claims
+                    WHERE guild_id = $1 AND user_id = $2
+                    """,
+                    guild_id,
+                    user_id,
+                )
+                if (
+                    previous_claim is not None
+                    and previous_claim["next_claim_at"] > current_time
+                ):
+                    return {
+                        "status": "cooldown",
+                        "next_claim_at": previous_claim["next_claim_at"],
+                    }
+
+                item = await connection.fetchrow(
+                    """
+                    SELECT *
+                    FROM (
+                        SELECT 'badge'::TEXT AS item_type, id, name, emoji,
+                               badge_role_id
+                        FROM badges
+                        WHERE guild_id = $1
+                          AND LOWER(
+                              COALESCE(
+                                  NULLIF(BTRIM(shop_section), ''),
+                                  'General'
+                              )
+                          ) = LOWER($4)
+                        UNION ALL
+                        SELECT 'modifier'::TEXT, id, name, emoji, NULL::BIGINT
+                        FROM modifiers
+                        WHERE guild_id = $1
+                          AND LOWER(
+                              COALESCE(
+                                  NULLIF(BTRIM(shop_section), ''),
+                                  'General'
+                              )
+                          ) = LOWER($4)
+                        UNION ALL
+                        SELECT 'ticket'::TEXT, id, name, emoji, NULL::BIGINT
+                        FROM tickets
+                        WHERE guild_id = $1
+                          AND LOWER(
+                              COALESCE(
+                                  NULLIF(BTRIM(shop_section), ''),
+                                  'General'
+                              )
+                          ) = LOWER($4)
+                    ) AS configured
+                    WHERE item_type = $2 AND id = $3
+                    """,
+                    guild_id,
+                    item_type,
+                    item_id,
+                    settings["shop_section"],
+                )
+                if item is None:
+                    return {"status": "item_unavailable"}
+
+                whitelist_source = await connection.fetchrow(
+                    """
+                    SELECT target_type, target_id
+                    FROM whitelist_entries
+                    WHERE guild_id = $1
+                      AND (
+                          (target_type = 'member' AND target_id = $2)
+                          OR (
+                              target_type = 'role'
+                              AND target_id = ANY($3::BIGINT[])
+                          )
+                      )
+                    ORDER BY
+                        CASE WHEN target_type = 'role' THEN 0 ELSE 1 END,
+                        target_id
+                    LIMIT 1
+                    """,
+                    guild_id,
+                    user_id,
+                    role_ids,
+                )
+                multiplier_percent = 100
+                if whitelist_source is not None:
+                    multiplier_percent = int(
+                        await connection.fetchval(
+                            """
+                            SELECT whitelist_event_multiplier_percent
+                            FROM guild_settings
+                            WHERE guild_id = $1
+                            """,
+                            guild_id,
+                        )
+                        or 100
+                    )
+                awarded_coins = multiplied_coin_reward(
+                    settings["coin_amount"],
+                    multiplier_percent,
+                )
+                new_balance = await connection.fetchval(
+                    """
+                    INSERT INTO balances (guild_id, user_id, balance)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (guild_id, user_id)
+                    DO UPDATE SET balance = balances.balance + EXCLUDED.balance
+                    RETURNING balance
+                    """,
+                    guild_id,
+                    user_id,
+                    awarded_coins,
+                )
+
+                new_quantity = None
+                if item_type in {"modifier", "ticket"}:
+                    inventory_table = (
+                        "modifier_inventory"
+                        if item_type == "modifier"
+                        else "ticket_inventory"
+                    )
+                    item_column = (
+                        "modifier_id"
+                        if item_type == "modifier"
+                        else "ticket_id"
+                    )
+                    new_quantity = await connection.fetchval(
+                        f"""
+                        INSERT INTO {inventory_table} (
+                            guild_id, user_id, {item_column}, quantity
+                        )
+                        VALUES ($1, $2, $3, 1)
+                        ON CONFLICT (guild_id, user_id, {item_column})
+                        DO UPDATE SET quantity = {inventory_table}.quantity + 1
+                        RETURNING quantity
+                        """,
+                        guild_id,
+                        user_id,
+                        item_id,
+                    )
+
+                claim_times = await connection.fetchrow(
+                    """
+                    INSERT INTO daily_reward_claims (
+                        guild_id, user_id, last_claim_at, next_claim_at
+                    )
+                    VALUES ($1, $2, NOW(), NOW() + INTERVAL '24 hours')
+                    ON CONFLICT (guild_id, user_id)
+                    DO UPDATE SET
+                        last_claim_at = EXCLUDED.last_claim_at,
+                        next_claim_at = EXCLUDED.next_claim_at
+                    RETURNING last_claim_at, next_claim_at
+                    """,
+                    guild_id,
+                    user_id,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO movements (
+                        guild_id, user_id, actor_id, action, amount, description
+                    )
+                    VALUES ($1, $2, $2, 'daily_reward', $3, $4)
+                    """,
+                    guild_id,
+                    user_id,
+                    awarded_coins,
+                    (
+                        f"Reclamó su recompensa diaria: {awarded_coins} monedas "
+                        f"y 1 unidad de {item['name']}."
+                    ),
+                )
+                return {
+                    "status": "claimed",
+                    "base_coins": settings["coin_amount"],
+                    "awarded_coins": awarded_coins,
+                    "new_balance": new_balance,
+                    "item_type": item["item_type"],
+                    "item_id": item["id"],
+                    "item_name": item["name"],
+                    "item_emoji": item["emoji"],
+                    "badge_role_id": item["badge_role_id"],
+                    "new_quantity": new_quantity,
+                    "last_claim_at": claim_times["last_claim_at"],
+                    "next_claim_at": claim_times["next_claim_at"],
+                    "whitelist_multiplier_percent": multiplier_percent,
+                    "whitelist_source_type": (
+                        whitelist_source["target_type"]
+                        if whitelist_source is not None
+                        else None
+                    ),
+                    "whitelist_source_id": (
+                        whitelist_source["target_id"]
+                        if whitelist_source is not None
+                        else None
+                    ),
+                }
+
+    async def wipe_category_inventory(
+        self,
+        guild_id: int,
+        user_id: int,
+        shop_section: str,
+    ) -> dict:
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                modifiers = await connection.fetch(
+                    """
+                    DELETE FROM modifier_inventory AS inventory
+                    USING modifiers AS modifier
+                    WHERE inventory.guild_id = $1
+                      AND inventory.user_id = $2
+                      AND modifier.id = inventory.modifier_id
+                      AND modifier.guild_id = $1
+                      AND LOWER(
+                          COALESCE(
+                              NULLIF(BTRIM(modifier.shop_section), ''),
+                              'General'
+                          )
+                      ) = LOWER($3)
+                    RETURNING modifier.name, inventory.quantity
+                    """,
+                    guild_id,
+                    user_id,
+                    shop_section,
+                )
+                tickets = await connection.fetch(
+                    """
+                    DELETE FROM ticket_inventory AS inventory
+                    USING tickets AS ticket
+                    WHERE inventory.guild_id = $1
+                      AND inventory.user_id = $2
+                      AND ticket.id = inventory.ticket_id
+                      AND ticket.guild_id = $1
+                      AND LOWER(
+                          COALESCE(
+                              NULLIF(BTRIM(ticket.shop_section), ''),
+                              'General'
+                          )
+                      ) = LOWER($3)
+                    RETURNING ticket.name, inventory.quantity
+                    """,
+                    guild_id,
+                    user_id,
+                    shop_section,
+                )
+                return {
+                    "modifiers": [dict(row) for row in modifiers],
+                    "tickets": [dict(row) for row in tickets],
+                }
+
     async def list_object_section_settings(self, guild_id: int):
         return await self._pool().fetch(
             """
@@ -3796,6 +4215,7 @@ class Database:
                 (SELECT COUNT(*) FROM ticket_admins WHERE guild_id = $1) AS ticket_admins,
                 (SELECT COUNT(*) FROM whitelist_entries WHERE guild_id = $1) AS whitelist_entries,
                 (SELECT COUNT(*) FROM automatic_messages WHERE guild_id = $1) AS automatic_messages,
+                (SELECT COUNT(*) FROM daily_reward_claims WHERE guild_id = $1) AS daily_claimants,
                 (SELECT COUNT(*) FROM movements WHERE guild_id = $1) AS movements,
                 (SELECT COUNT(*) FROM movements WHERE guild_id = $1 AND action IN ('purchase', 'modifier_purchase', 'ticket_purchase')) AS purchases,
                 (
@@ -3895,6 +4315,16 @@ class Database:
             guild_id
         )
         automatic_messages = await self.list_automatic_messages(guild_id)
+        daily_reward_settings = await self.get_daily_reward_settings(guild_id)
+        daily_reward_claims = await self._pool().fetch(
+            """
+            SELECT user_id, last_claim_at, next_claim_at
+            FROM daily_reward_claims
+            WHERE guild_id = $1
+            ORDER BY user_id
+            """,
+            guild_id,
+        )
         ticket_admins = await self.list_ticket_admins(guild_id)
         whitelist_entries = await self.list_whitelist_entries(guild_id)
         movements = await self._pool().fetch(
@@ -3947,6 +4377,14 @@ class Database:
             ),
             "automatic_messages": [
                 dict(row) for row in automatic_messages
+            ],
+            "daily_reward_settings": (
+                dict(daily_reward_settings)
+                if daily_reward_settings
+                else None
+            ),
+            "daily_reward_claims": [
+                dict(row) for row in daily_reward_claims
             ],
             "ticket_admins": [dict(row) for row in ticket_admins],
             "whitelist_entries": [dict(row) for row in whitelist_entries],

@@ -3752,7 +3752,215 @@ async def balance(interaction: discord.Interaction) -> None:
     await answer(
         interaction,
         f"Tu balance es **{money(value, interaction.guild_id)}**. Puedes conseguir dinero "
-        "participando en los eventos de Sularea.",
+        "participando en los eventos de Sularea y usando `/diaria`.",
+    )
+
+
+@bot.tree.command(
+    name="diaria",
+    description="Reclama monedas y un objeto aleatorio una vez cada 24 horas.",
+)
+@app_commands.guild_only()
+async def diaria(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    member = guild_member(interaction)
+    if guild is None or member is None:
+        return
+
+    status = await bot.db.get_daily_reward_status(guild.id, member.id)
+    if status is None:
+        await answer(
+            interaction,
+            "La recompensa diaria todavía no ha sido configurada.",
+        )
+        return
+    if not status["enabled"]:
+        await answer(
+            interaction,
+            "La recompensa diaria está desactivada temporalmente.",
+        )
+        return
+    if (
+        status["next_claim_at"] is not None
+        and status["next_claim_at"] > status["current_time"]
+    ):
+        next_timestamp = int(status["next_claim_at"].timestamp())
+        await answer(
+            interaction,
+            "Ya reclamaste tu recompensa diaria. Podrás volver a usarla "
+            f"<t:{next_timestamp}:R>, el <t:{next_timestamp}:F>.",
+        )
+        return
+
+    await interaction.response.defer()
+    configured_items = await bot.db.list_daily_reward_items(
+        guild.id,
+        status["shop_section"],
+    )
+    eligible_items = []
+    for item in configured_items:
+        if item["item_type"] != "badge":
+            eligible_items.append(item)
+            continue
+        role = guild.get_role(item["badge_role_id"])
+        if (
+            role is not None
+            and role not in member.roles
+            and role_can_be_managed(role)
+        ):
+            eligible_items.append(item)
+    if not eligible_items:
+        await answer(
+            interaction,
+            "No hay objetos disponibles para ti en la categoría diaria "
+            f"**{status['shop_section']}**. Avisa a un administrador.",
+        )
+        return
+
+    selected = random.choice(eligible_items)
+    selected_badge_role = (
+        guild.get_role(selected["badge_role_id"])
+        if selected["item_type"] == "badge"
+        else None
+    )
+    role_added = False
+    async with purchase_lock(guild.id, member.id):
+        if selected_badge_role is not None:
+            if selected_badge_role in member.roles:
+                await answer(
+                    interaction,
+                    "Ese premio dejó de estar disponible para ti. Intenta nuevamente.",
+                )
+                return
+            try:
+                await member.add_roles(
+                    selected_badge_role,
+                    reason="Recompensa diaria de Sularea",
+                )
+                role_added = True
+            except discord.HTTPException:
+                await answer(
+                    interaction,
+                    "No pude entregar la insignia elegida. Revisa la jerarquía "
+                    "de roles del bot.",
+                )
+                return
+        try:
+            result = await bot.db.claim_daily_reward(
+                guild.id,
+                member.id,
+                [role.id for role in member.roles if role != selected_badge_role],
+                selected["item_type"],
+                selected["id"],
+            )
+        except Exception:
+            if role_added and selected_badge_role is not None:
+                try:
+                    await member.remove_roles(
+                        selected_badge_role,
+                        reason="No se pudo confirmar la recompensa diaria",
+                    )
+                except discord.HTTPException:
+                    traceback.print_exc()
+            raise
+
+        if result["status"] != "claimed":
+            if role_added and selected_badge_role is not None:
+                try:
+                    await member.remove_roles(
+                        selected_badge_role,
+                        reason="La recompensa diaria no pudo reclamarse",
+                    )
+                except discord.HTTPException:
+                    traceback.print_exc()
+            if result["status"] == "cooldown":
+                next_timestamp = int(result["next_claim_at"].timestamp())
+                await answer(
+                    interaction,
+                    "Ya reclamaste tu recompensa diaria. Podrás volver a usarla "
+                    f"<t:{next_timestamp}:R>, el <t:{next_timestamp}:F>.",
+                )
+            elif result["status"] == "disabled":
+                await answer(
+                    interaction,
+                    "La recompensa diaria fue desactivada mientras la reclamabas.",
+                )
+            elif result["status"] == "not_configured":
+                await answer(
+                    interaction,
+                    "La recompensa diaria ya no está configurada.",
+                )
+            else:
+                await answer(
+                    interaction,
+                    "El objeto elegido dejó de estar disponible. Intenta nuevamente.",
+                )
+            return
+
+    next_timestamp = int(result["next_claim_at"].timestamp())
+    item_type_label = {
+        "badge": "Insignia",
+        "modifier": "Modificador",
+        "ticket": "Ticket",
+    }[result["item_type"]]
+    item_emoji = badge_emoji(result["item_emoji"], guild)
+    embed = discord.Embed(
+        title="🎁 Recompensa diaria",
+        description=f"{member.mention} reclamó su recompensa diaria.",
+        color=0x22C55E,
+        timestamp=result["last_claim_at"],
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(
+        name="Monedas",
+        value=f"**{money(result['awarded_coins'], guild.id)}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="Objeto aleatorio",
+        value=(
+            f"{item_emoji}**{result['item_name']}**\n"
+            f"{item_type_label} · 1 unidad"
+        ),
+        inline=True,
+    )
+    if result["awarded_coins"] > result["base_coins"]:
+        multiplier_label = format_multiplier(
+            result["whitelist_multiplier_percent"]
+        )
+        if result["whitelist_source_type"] == "role":
+            source_role = guild.get_role(result["whitelist_source_id"])
+            source_text = (
+                f"por tener el rol {source_role.mention} en la whitelist"
+                if source_role is not None
+                else "por tener un rol de la whitelist"
+            )
+        else:
+            source_text = "por estar añadido directamente a la whitelist"
+        embed.add_field(
+            name=f"{whitelist_marker(guild.id)} Bono de whitelist",
+            value=(
+                f"Recibiste **{money(result['awarded_coins'], guild.id)}** en lugar "
+                f"de **{money(result['base_coins'], guild.id)}** con el multiplicador "
+                f"**{multiplier_label}** {source_text}."
+            ),
+            inline=False,
+        )
+    embed.add_field(
+        name="Próxima recompensa",
+        value=f"<t:{next_timestamp}:F>\n(<t:{next_timestamp}:R>)",
+        inline=False,
+    )
+    await answer(interaction, embed=embed)
+    await send_audit_log(
+        guild,
+        "Recompensa diaria reclamada",
+        f"**Miembro:** {member.mention}\n"
+        f"**Monedas:** {money(result['awarded_coins'], guild.id)}\n"
+        f"**Objeto:** {result['item_name']} ({item_type_label})\n"
+        f"**Próxima recompensa:** <t:{next_timestamp}:F>",
+        color=0x22C55E,
     )
 
 
@@ -3794,6 +4002,8 @@ async def historial(interaction: discord.Interaction) -> None:
         "ticket_use": "📣",
         "ticket_grant": "🎁",
         "ticket_remove": "➖",
+        "daily_reward": "🎁",
+        "category_inventory_wipe": "🧹",
     }
     embed.description = "\n".join(
         f"{icons.get(row['action'], '•')} {row['description']} "
@@ -4053,6 +4263,105 @@ async def configurarmultiplicadorwhitelist(
             if multiplier_percent > 100
             else "El multiplicador de eventos quedó en **1×**, sin bono adicional."
         ),
+    )
+
+
+@bot.tree.command(
+    name="configurardiaria",
+    description="Configura las monedas y categoría de la recompensa diaria.",
+)
+@app_commands.describe(
+    activada="Activa o desactiva la recompensa diaria",
+    monedas="Cantidad base de monedas antes del multiplicador de whitelist",
+    categoria="Categoría de la que se elegirá un objeto al azar",
+)
+@app_commands.autocomplete(categoria=shop_section_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def configurardiaria(
+    interaction: discord.Interaction,
+    activada: bool,
+    monedas: app_commands.Range[int, 1, MAX_MONEY] | None = None,
+    categoria: str | None = None,
+) -> None:
+    assert interaction.guild_id is not None
+    guild = interaction.guild
+    if guild is None:
+        return
+    await interaction.response.defer()
+    current = await bot.db.get_daily_reward_settings(interaction.guild_id)
+    if current is None and (monedas is None or categoria is None):
+        await answer(
+            interaction,
+            "La primera configuración necesita indicar **monedas** y **categoría**.",
+        )
+        return
+    final_coins = (
+        monedas
+        if monedas is not None
+        else current["coin_amount"]
+    )
+    requested_section = (
+        categoria
+        if categoria is not None
+        else current["shop_section"]
+    )
+    final_section = await resolve_shop_section(
+        interaction.guild_id,
+        shop_section_name(requested_section),
+    )
+    if final_section is None:
+        await answer(
+            interaction,
+            "Esa categoría no existe. Créala primero con `/configurarcategoria`.",
+        )
+        return
+    configured_items = await bot.db.list_daily_reward_items(
+        interaction.guild_id,
+        final_section,
+    )
+    if activada and not configured_items:
+        await answer(
+            interaction,
+            f"La categoría **{final_section}** no contiene objetos configurados.",
+        )
+        return
+    await bot.db.set_daily_reward_settings(
+        interaction.guild_id,
+        activada,
+        final_coins,
+        final_section,
+        interaction.user.id,
+    )
+    await bot.db.record_movement(
+        interaction.guild_id,
+        None,
+        interaction.user.id,
+        "daily_reward_config",
+        None,
+        (
+            f"Configuró la recompensa diaria: {final_coins} monedas, "
+            f"categoría {final_section}, "
+            f"{'activa' if activada else 'inactiva'}."
+        ),
+    )
+    await send_audit_log(
+        guild,
+        "Recompensa diaria configurada",
+        f"**Administrador:** {interaction.user.mention}\n"
+        f"**Estado:** {'Activa' if activada else 'Inactiva'}\n"
+        f"**Monedas base:** {money(final_coins, guild.id)}\n"
+        f"**Categoría:** {final_section}\n"
+        f"**Objetos posibles:** {len(configured_items)}\n"
+        "**Frecuencia:** cada 24 horas",
+        color=0x22C55E if activada else 0x6B7280,
+    )
+    await answer(
+        interaction,
+        f"La recompensa diaria quedó **{'activada' if activada else 'desactivada'}** "
+        f"con **{money(final_coins, guild.id)}** y un objeto aleatorio de "
+        f"**{final_section}** cada 24 horas.",
     )
 
 
@@ -4703,6 +5012,7 @@ async def configuracion(interaction: discord.Interaction) -> None:
         categories,
         ticket_admins,
         whitelist_entries,
+        daily_settings,
     ) = await asyncio.gather(
         bot.db.get_log_settings(interaction.guild_id),
         bot.db.get_automatic_message_settings(interaction.guild_id),
@@ -4711,6 +5021,7 @@ async def configuracion(interaction: discord.Interaction) -> None:
         bot.db.list_shop_categories(interaction.guild_id),
         bot.db.list_ticket_admins(interaction.guild_id),
         bot.db.list_whitelist_entries(interaction.guild_id),
+        bot.db.get_daily_reward_settings(interaction.guild_id),
     )
 
     coin_emoji = (
@@ -4795,6 +5106,21 @@ async def configuracion(interaction: discord.Interaction) -> None:
         value=f"**Administradores configurados:** {len(ticket_admins)}",
         inline=True,
     )
+    if daily_settings is None:
+        daily_value = "Sin configurar."
+    else:
+        daily_value = (
+            f"**Estado:** {'Activa' if daily_settings['enabled'] else 'Inactiva'}\n"
+            f"**Monedas base:** {money(daily_settings['coin_amount'], guild.id)}\n"
+            f"**Categoría:** {daily_settings['shop_section']}\n"
+            f"**Frecuencia:** 24 horas\n"
+            f"**Personas que la han usado:** {statistics['daily_claimants']}"
+        )
+    embed.add_field(
+        name="Recompensa diaria",
+        value=daily_value,
+        inline=True,
+    )
 
     maintenance_by_section = {
         row["section"]: row for row in maintenance_rows
@@ -4850,6 +5176,10 @@ async def estadisticas(interaction: discord.Interaction) -> None:
     embed.add_field(name="Entradas whitelist", value=str(stats["whitelist_entries"]))
     embed.add_field(name="Compras realizadas", value=str(stats["purchases"]))
     embed.add_field(name="Eventos ganados", value=str(stats["event_wins"]))
+    embed.add_field(
+        name="Usuarios con recompensa diaria",
+        value=str(stats["daily_claimants"]),
+    )
     embed.add_field(name="Eventos activos", value=str(stats["active_events"]))
     embed.add_field(
         name="Mensajes automáticos",
@@ -5187,6 +5517,326 @@ async def quitarobjeto(
     )
 
 
+async def category_inventory_summary(
+    guild: discord.Guild,
+    member: discord.Member,
+    category_name: str,
+) -> dict:
+    configured_items, modifiers, tickets = await asyncio.gather(
+        bot.db.list_daily_reward_items(guild.id, category_name),
+        bot.db.list_modifier_inventory(guild.id, member.id),
+        bot.db.list_ticket_inventory(guild.id, member.id),
+    )
+    badge_role_ids = {
+        row["badge_role_id"]
+        for row in configured_items
+        if row["item_type"] == "badge"
+    }
+    modifier_ids = {
+        row["id"]
+        for row in configured_items
+        if row["item_type"] == "modifier"
+    }
+    ticket_ids = {
+        row["id"]
+        for row in configured_items
+        if row["item_type"] == "ticket"
+    }
+    owned_role_ids = {role.id for role in member.roles}
+    owned_badges = [
+        row
+        for row in configured_items
+        if row["item_type"] == "badge"
+        and row["badge_role_id"] in badge_role_ids
+        and row["badge_role_id"] in owned_role_ids
+    ]
+    owned_modifiers = [
+        row for row in modifiers if row["id"] in modifier_ids
+    ]
+    owned_tickets = [
+        row for row in tickets if row["id"] in ticket_ids
+    ]
+    return {
+        "badges": owned_badges,
+        "modifiers": owned_modifiers,
+        "tickets": owned_tickets,
+        "total_units": (
+            len(owned_badges)
+            + sum(row["quantity"] for row in owned_modifiers)
+            + sum(row["quantity"] for row in owned_tickets)
+        ),
+    }
+
+
+async def apply_category_wipe(
+    guild: discord.Guild,
+    member: discord.Member,
+    category_name: str,
+    actor: discord.Member | discord.User,
+) -> tuple[str | None, str | None]:
+    summary = await category_inventory_summary(guild, member, category_name)
+    if summary["total_units"] == 0:
+        return None, f"{member.mention} ya no tiene objetos de **{category_name}**."
+
+    roles_to_remove: dict[int, discord.Role] = {}
+    for badge in summary["badges"]:
+        badge_role = guild.get_role(badge["badge_role_id"])
+        color_role = guild.get_role(badge["color_role_id"])
+        if badge_role is None:
+            continue
+        if not role_can_be_managed(badge_role):
+            return (
+                None,
+                f"No puedo retirar el rol {badge_role.mention}. Colócalo debajo "
+                "del rol del bot antes de continuar.",
+            )
+        roles_to_remove[badge_role.id] = badge_role
+        if color_role is not None and color_role in member.roles:
+            if not role_can_be_managed(color_role):
+                return (
+                    None,
+                    f"No puedo retirar el color {color_role.mention}. Colócalo "
+                    "debajo del rol del bot antes de continuar.",
+                )
+            roles_to_remove[color_role.id] = color_role
+
+    removed_roles = list(roles_to_remove.values())
+    if removed_roles:
+        await member.remove_roles(
+            *removed_roles,
+            reason=f"Wipe de categoría aplicado por {actor}",
+        )
+    try:
+        removed_inventory = await bot.db.wipe_category_inventory(
+            guild.id,
+            member.id,
+            category_name,
+        )
+    except Exception:
+        if removed_roles:
+            try:
+                await member.add_roles(
+                    *removed_roles,
+                    reason="Restauración por error durante wipe de categoría",
+                )
+            except discord.HTTPException:
+                traceback.print_exc()
+        raise
+
+    removed_badges = len(summary["badges"])
+    removed_modifiers = sum(
+        row["quantity"] for row in removed_inventory["modifiers"]
+    )
+    removed_tickets = sum(
+        row["quantity"] for row in removed_inventory["tickets"]
+    )
+    total_removed = removed_badges + removed_modifiers + removed_tickets
+    await bot.db.record_movement(
+        guild.id,
+        member.id,
+        actor.id,
+        "category_inventory_wipe",
+        -total_removed,
+        (
+            f"Un administrador borró los objetos de la categoría {category_name}: "
+            f"{removed_badges} insignias, {removed_modifiers} modificadores y "
+            f"{removed_tickets} tickets."
+        ),
+    )
+    public_result = (
+        f"🧹 {actor.mention} borró de {member.mention} todos los objetos de "
+        f"**{category_name}**.\n"
+        f"**Insignias:** {removed_badges} · "
+        f"**Modificadores:** {removed_modifiers} · "
+        f"**Tickets:** {removed_tickets} · "
+        f"**Total:** {total_removed}"
+    )
+    await send_audit_log(
+        guild,
+        "Inventario borrado por categoría",
+        f"**Administrador:** {actor.mention}\n"
+        f"**Miembro:** {member.mention}\n"
+        f"**Categoría:** {category_name}\n"
+        f"**Insignias:** {removed_badges}\n"
+        f"**Modificadores:** {removed_modifiers}\n"
+        f"**Tickets:** {removed_tickets}\n"
+        "**Reembolso:** No",
+        color=0xEF4444,
+    )
+    return public_result, None
+
+
+class CategoryWipeConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        author_id: int,
+        guild: discord.Guild,
+        member: discord.Member,
+        category_name: str,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.guild = guild
+        self.member = member
+        self.category_name = category_name
+        self.message: discord.InteractionMessage | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Solo el administrador que inició el wipe puede confirmarlo.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="La confirmación expiró. No se borró ningún objeto.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        await answer(
+            interaction,
+            "Ocurrió un error durante el wipe. Revisa los registros del bot.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Confirmar wipe",
+        style=discord.ButtonStyle.danger,
+        emoji="🧹",
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="Aplicando el wipe...",
+            view=self,
+        )
+        public_result, error = await apply_category_wipe(
+            self.guild,
+            self.member,
+            self.category_name,
+            interaction.user,
+        )
+        if error is not None:
+            await interaction.edit_original_response(
+                content=error,
+                view=None,
+            )
+            self.stop()
+            return
+        await interaction.edit_original_response(
+            content="Wipe completado y anunciado en el canal.",
+            view=None,
+        )
+        if public_result is not None:
+            await interaction.followup.send(
+                public_result,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=True,
+                    roles=False,
+                ),
+            )
+        self.stop()
+
+    @discord.ui.button(
+        label="Cancelar",
+        style=discord.ButtonStyle.secondary,
+        emoji="✖️",
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="Wipe cancelado. No se borró ningún objeto.",
+            view=None,
+        )
+        self.stop()
+
+
+@bot.tree.command(
+    name="wipe",
+    description="Borra de un miembro todos los objetos de una categoría.",
+)
+@app_commands.describe(
+    miembro="Miembro cuyo inventario se limpiará",
+    categoria="Categoría de objetos que se borrará",
+)
+@app_commands.autocomplete(categoria=shop_section_autocomplete)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def wipe(
+    interaction: discord.Interaction,
+    miembro: discord.Member,
+    categoria: str,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    final_section = await resolve_shop_section(
+        guild.id,
+        shop_section_name(categoria),
+    )
+    if final_section is None:
+        await answer(interaction, "Esa categoría no existe.")
+        return
+    summary = await category_inventory_summary(
+        guild,
+        miembro,
+        final_section,
+    )
+    if summary["total_units"] == 0:
+        await answer(
+            interaction,
+            f"{miembro.mention} no tiene objetos de **{final_section}**.",
+        )
+        return
+    view = CategoryWipeConfirmView(
+        interaction.user.id,
+        guild,
+        miembro,
+        final_section,
+    )
+    await interaction.response.send_message(
+        f"⚠️ ¿Seguro que quieres borrar de {miembro.mention} todos los objetos de "
+        f"**{final_section}**?\n"
+        f"**Insignias:** {len(summary['badges'])}\n"
+        f"**Modificadores:** "
+        f"{sum(row['quantity'] for row in summary['modifiers'])}\n"
+        f"**Tickets:** {sum(row['quantity'] for row in summary['tickets'])}\n"
+        f"**Total de unidades:** {summary['total_units']}\n"
+        "Esta operación no entrega reembolsos.",
+        view=view,
+        ephemeral=True,
+    )
+    view.message = await interaction.original_response()
+
+
 @bot.tree.command(
     name="configurarcategoria",
     description="Crea una categoría para organizar la tienda.",
@@ -5377,8 +6027,9 @@ async def configurarinsignia(
 @app_commands.describe(
     nombre="Nombre del modificador",
     comprable="Indica si aparecerá en la tienda",
-    mensajes="Mensajes posibles separados por el símbolo |",
     tipo="Individual para un miembro o Canal para todos los que escriban allí",
+    mensajes="Mensajes separados por |; omite si copiarás otro modificador",
+    copiar_mensajes_de="Modificador existente cuyos mensajes se copiarán",
     probabilidad="Porcentaje (25) o fracción (1/4)",
     cooldown="Segundos mínimos entre mensajes generados",
     duracion="Minutos que permanecerá activo",
@@ -5392,7 +6043,10 @@ async def configurarinsignia(
         app_commands.Choice(name="Canal", value="channel"),
     ],
 )
-@app_commands.autocomplete(apartado=shop_section_autocomplete)
+@app_commands.autocomplete(
+    apartado=shop_section_autocomplete,
+    copiar_mensajes_de=modifier_autocomplete,
+)
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -5400,8 +6054,9 @@ async def configurarmodificador(
     interaction: discord.Interaction,
     nombre: str,
     comprable: bool,
-    mensajes: str,
     tipo: app_commands.Choice[str],
+    mensajes: str | None = None,
+    copiar_mensajes_de: str | None = None,
     probabilidad: str = MODIFIER_PROBABILITY,
     cooldown: app_commands.Range[int, 0, MAX_MODIFIER_COOLDOWN_SECONDS] = MODIFIER_COOLDOWN_SECONDS,
     duracion: app_commands.Range[int, 1, MAX_MODIFIER_DURATION_MINUTES] = MODIFIER_DURATION_MINUTES,
@@ -5424,9 +6079,34 @@ async def configurarmodificador(
     if await bot.db.get_ticket(interaction.guild_id, name_key):
         await answer(interaction, "Ya existe un ticket con ese nombre.")
         return
-    parsed_messages, messages_error = parse_modifier_messages(mensajes)
-    if messages_error is not None or parsed_messages is None:
-        await answer(interaction, messages_error or "Los mensajes no son válidos.")
+    copied_messages_source = None
+    if mensajes is not None and copiar_mensajes_de is not None:
+        await answer(
+            interaction,
+            "Usa **mensajes** o **copiar_mensajes_de**, pero no ambos.",
+        )
+        return
+    if copiar_mensajes_de is not None:
+        source_modifier = await find_modifier(interaction, copiar_mensajes_de)
+        if source_modifier is None:
+            await answer(
+                interaction,
+                "El modificador del que quieres copiar mensajes no existe.",
+            )
+            return
+        parsed_messages = list(source_modifier["messages"])
+        copied_messages_source = source_modifier["name"]
+    elif mensajes is not None:
+        parsed_messages, messages_error = parse_modifier_messages(mensajes)
+        if messages_error is not None or parsed_messages is None:
+            await answer(interaction, messages_error or "Los mensajes no son válidos.")
+            return
+    else:
+        await answer(
+            interaction,
+            "Escribe **mensajes** separados por `|` o selecciona "
+            "**copiar_mensajes_de**.",
+        )
         return
     parsed_probability, probability_error = parse_modifier_probability(probabilidad)
     if probability_error is not None or parsed_probability is None:
@@ -5495,7 +6175,12 @@ async def configurarmodificador(
         f"**Categoría:** {final_section or 'No aplica'}\n"
         f"**Emoji:** {final_emoji or 'Ninguno'}\n"
         f"**Mensajes:** {len(parsed_messages)}\n"
-        f"**Probabilidad:** {modifier_probability_label(probability_numerator, probability_denominator)}\n"
+        + (
+            f"**Mensajes copiados de:** {copied_messages_source}\n"
+            if copied_messages_source is not None
+            else ""
+        )
+        + f"**Probabilidad:** {modifier_probability_label(probability_numerator, probability_denominator)}\n"
         f"**Cooldown:** {cooldown} segundos\n"
         f"**Duración:** {duracion} minutos",
         color=0xA855F7,
@@ -5807,6 +6492,7 @@ async def configurarticket(
     probabilidad="Para modificadores: porcentaje (25) o fracción (1/4)",
     cooldown="Para modificadores: segundos entre intentos",
     duracion="Para modificadores: minutos que permanece activo",
+    copiar_mensajes_de="Para modificadores: copia los mensajes de otro existente",
 )
 @app_commands.choices(
     tipo_modificador=[
@@ -5817,6 +6503,7 @@ async def configurarticket(
 @app_commands.autocomplete(
     objeto=editable_object_autocomplete,
     apartado=shop_section_autocomplete,
+    copiar_mensajes_de=modifier_autocomplete,
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -5838,6 +6525,7 @@ async def editar(
     probabilidad: str | None = None,
     cooldown: int | None = None,
     duracion: int | None = None,
+    copiar_mensajes_de: str | None = None,
 ) -> None:
     assert interaction.guild_id is not None
     guild = interaction.guild
@@ -5859,6 +6547,12 @@ async def editar(
         or current_ticket is not None
         else await find_shop_category(interaction, objeto)
     )
+    if copiar_mensajes_de is not None and current_modifier is None:
+        await answer(
+            interaction,
+            "La opción **copiar_mensajes_de** solo se usa al editar modificadores.",
+        )
+        return
     if current_category is not None:
         category_only_options = (
             rol_insignia,
@@ -6010,7 +6704,22 @@ async def editar(
         if await bot.db.get_ticket(interaction.guild_id, final_name_key):
             await answer(interaction, "Ya existe un ticket con ese nombre.")
             return
-        final_messages = list(current_modifier["messages"])
+        copied_messages_source = None
+        if copiar_mensajes_de is not None:
+            source_modifier = await find_modifier(
+                interaction,
+                copiar_mensajes_de,
+            )
+            if source_modifier is None:
+                await answer(
+                    interaction,
+                    "El modificador del que quieres copiar mensajes no existe.",
+                )
+                return
+            final_messages = list(source_modifier["messages"])
+            copied_messages_source = source_modifier["name"]
+        else:
+            final_messages = list(current_modifier["messages"])
         if probabilidad is not None:
             parsed_probability, probability_error = parse_modifier_probability(probabilidad)
             if probability_error is not None or parsed_probability is None:
@@ -6090,7 +6799,12 @@ async def editar(
             f"**Categoría:** {final_section or 'No aplica'}\n"
             f"**Emoji:** {final_emoji or 'Ninguno'}\n"
             f"**Mensajes:** {len(final_messages)}\n"
-            f"**Probabilidad:** "
+            + (
+                f"**Mensajes copiados de:** {copied_messages_source}\n"
+                if copied_messages_source is not None
+                else ""
+            )
+            + f"**Probabilidad:** "
             f"{modifier_probability_label(final_probability_numerator, final_probability_denominator)}\n"
             f"**Cooldown:** {final_cooldown} segundos\n"
             f"**Duración:** {final_duration} minutos",
@@ -7482,6 +8196,7 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
             value=(
                 "`/inventario [miembro]` · `/objetos` · `/mensajes`\n"
                 "`/darobjeto` · `/quitarobjeto miembro objeto [cantidad]`\n"
+                "`/wipe miembro categoría`\n"
                 "`/duplicar objeto` · `/borrarobjeto [objeto/categoría]`\n"
                 "`/estadoobjetos sección permitir_admins [razón]`\n"
                 "`/estadomodificador` · `/reembolsarmodificador [miembro/canal]`"
@@ -7494,6 +8209,7 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
                 "`/configurarcategoria` · `/configurarinsignia`\n"
                 "`/configurarmodificador` · `/configurarticket`\n"
                 "`/editar` · `/editarmensajes`\n"
+                "`/configurardiaria`\n"
                 "`/añadiradmin` · `/quitaradmin` · `/admins`\n"
                 "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`\n"
                 "`/configurardescuentowhitelist`\n"
@@ -7552,6 +8268,7 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
             name="Monedas y mercado",
             value=(
                 "`/balance` — Consultar tus monedas.\n"
+                "`/diaria` — Reclamar monedas y un objeto aleatorio cada 24 horas.\n"
                 "`/historial` — Ver tus últimos 10 movimientos.\n"
                 "`/ranking` — Ver los balances más altos.\n"
                 "`/tienda` — Abrir el mercado por categorías.\n"
