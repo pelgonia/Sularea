@@ -4031,6 +4031,7 @@ async def historial(interaction: discord.Interaction) -> None:
         "ticket_remove": "➖",
         "daily_reward": "🎁",
         "category_inventory_wipe": "🧹",
+        "category_objects_config_edit": "🛠️",
     }
     embed.description = "\n".join(
         f"{icons.get(row['action'], '•')} {row['description']} "
@@ -7055,6 +7056,503 @@ async def editar(
     await answer(interaction, f"Actualicé la insignia **{final_name}**.")
 
 
+class CategoryEditConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        author_id: int,
+        guild: discord.Guild,
+        category_name: str,
+        changes_text: str,
+        update_options: dict,
+        source_interaction: discord.Interaction,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.guild = guild
+        self.category_name = category_name
+        self.changes_text = changes_text
+        self.update_options = update_options
+        self.source_interaction = source_interaction
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Solo el administrador que inició esta edición puede confirmarla.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        try:
+            await self.source_interaction.edit_original_response(
+                content="La confirmación expiró. No se editó ningún objeto.",
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            await interaction.edit_original_response(
+                content=(
+                    "Ocurrió un error durante la edición por categoría. "
+                    "No se aplicaron cambios parciales."
+                ),
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(
+        label="Confirmar edición",
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="Aplicando la edición por categoría...",
+            view=self,
+        )
+        result = await bot.db.update_objects_by_category(**self.update_options)
+        status = result["status"]
+        publish_success = False
+        if status == "category_missing":
+            response = "Esa categoría ya no existe. No se aplicó ningún cambio."
+        elif status == "empty":
+            response = (
+                f"La categoría **{self.category_name}** ya no contiene objetos."
+            )
+        elif status == "message_source_missing":
+            response = (
+                "El modificador usado como fuente de mensajes ya no existe. "
+                "No se aplicó ningún cambio."
+            )
+        elif status == "target_category_missing":
+            response = (
+                "La categoría de destino ya no existe. "
+                "No se aplicó ningún cambio."
+            )
+        elif status == "color_role_conflict":
+            names = ", ".join(result["conflicting_badges"][:10])
+            response = (
+                "No se aplicó ningún cambio porque el rol de color ahora coincide "
+                f"con el rol de propiedad de: **{names}**."
+            )
+        elif status == "message_cycle":
+            names = ", ".join(result["conflicting_modifiers"][:10])
+            response = (
+                "No se aplicó ningún cambio porque el vínculo de mensajes crearía "
+                f"un ciclo con: **{names}**."
+            )
+        else:
+            publish_success = True
+            total = result["badges"] + result["modifiers"] + result["tickets"]
+            response = (
+                f"Actualicé **{total} objetos** de **{result['category_name']}**: "
+                f"**{result['badges']} insignias**, "
+                f"**{result['modifiers']} modificadores** y "
+                f"**{result['tickets']} tickets**."
+            )
+            await bot.db.record_movement(
+                self.guild.id,
+                None,
+                interaction.user.id,
+                "category_objects_config_edit",
+                None,
+                (
+                    f"Editó {total} objetos de la categoría "
+                    f"{result['category_name']}."
+                ),
+            )
+            await send_audit_log(
+                self.guild,
+                "Objetos editados por categoría",
+                f"**Administrador:** {interaction.user.mention}\n"
+                f"**Categoría original:** {result['category_name']}\n"
+                f"**Insignias:** {result['badges']}\n"
+                f"**Modificadores:** {result['modifiers']}\n"
+                f"**Tickets:** {result['tickets']}\n"
+                f"**Cambios:**\n{self.changes_text}",
+                color=0xF59E0B,
+            )
+        if publish_success:
+            await interaction.edit_original_response(
+                content="Edición completada y anunciada en el canal.",
+                view=None,
+            )
+            try:
+                await interaction.followup.send(response, ephemeral=False)
+            except discord.HTTPException:
+                await interaction.edit_original_response(
+                    content=response,
+                    view=None,
+                )
+        else:
+            await interaction.edit_original_response(content=response, view=None)
+        self.stop()
+
+    @discord.ui.button(
+        label="Cancelar",
+        style=discord.ButtonStyle.secondary,
+        emoji="✖️",
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="Edición cancelada. No se modificó ningún objeto.",
+            view=None,
+        )
+        self.stop()
+
+
+@bot.tree.command(
+    name="editarporcategoria",
+    description="Edita a la vez todos los objetos de una categoría.",
+)
+@app_commands.describe(
+    categoria="Categoría cuyos objetos quieres editar",
+    rol_color="Para insignias: asigna el mismo rol de color",
+    comprable="Cambia si los objetos aparecen en la tienda",
+    permitir_whitelist="Para insignias: permite o impide el acceso por whitelist",
+    precio="Asigna el mismo precio",
+    apartado="Mueve los objetos comprables a otra categoría",
+    emoji="Asigna el mismo emoji; escribe quitar para eliminarlo",
+    descripcion="Para tickets: asigna la misma descripción",
+    activo="Para tickets: permite o impide su uso",
+    tipo_modificador="Para modificadores: Individual o Canal",
+    probabilidad="Para modificadores: porcentaje (25) o fracción (1/4)",
+    cooldown="Para modificadores: segundos entre intentos",
+    duracion="Para modificadores: minutos que permanece activo",
+    copiar_mensajes_de="Para modificadores: vincula una fuente o escribe quitar",
+)
+@app_commands.choices(
+    tipo_modificador=[
+        app_commands.Choice(name="Individual", value="individual"),
+        app_commands.Choice(name="Canal", value="channel"),
+    ],
+)
+@app_commands.autocomplete(
+    categoria=shop_section_autocomplete,
+    apartado=shop_section_autocomplete,
+    copiar_mensajes_de=modifier_link_autocomplete,
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def editarporcategoria(
+    interaction: discord.Interaction,
+    categoria: str,
+    rol_color: discord.Role | None = None,
+    comprable: bool | None = None,
+    permitir_whitelist: bool | None = None,
+    precio: int | None = None,
+    apartado: str | None = None,
+    emoji: str | None = None,
+    descripcion: str | None = None,
+    activo: bool | None = None,
+    tipo_modificador: app_commands.Choice[str] | None = None,
+    probabilidad: str | None = None,
+    cooldown: int | None = None,
+    duracion: int | None = None,
+    copiar_mensajes_de: str | None = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        return
+    source_section = await resolve_shop_section(
+        guild.id,
+        shop_section_name(categoria),
+    )
+    if source_section is None:
+        await answer(interaction, "Esa categoría no existe.")
+        return
+    requested_values = (
+        rol_color,
+        comprable,
+        permitir_whitelist,
+        precio,
+        apartado,
+        emoji,
+        descripcion,
+        activo,
+        tipo_modificador,
+        probabilidad,
+        cooldown,
+        duracion,
+        copiar_mensajes_de,
+    )
+    if all(value is None for value in requested_values):
+        await answer(interaction, "Indica al menos una configuración para cambiar.")
+        return
+    if precio is not None and not 0 <= precio <= MAX_MONEY:
+        await answer(
+            interaction,
+            f"El precio debe estar entre 0 y {money(MAX_MONEY, guild.id)}.",
+        )
+        return
+    if cooldown is not None and not 0 <= cooldown <= MAX_MODIFIER_COOLDOWN_SECONDS:
+        await answer(
+            interaction,
+            f"El cooldown debe estar entre 0 y "
+            f"{MAX_MODIFIER_COOLDOWN_SECONDS} segundos.",
+        )
+        return
+    if duracion is not None and not 1 <= duracion <= MAX_MODIFIER_DURATION_MINUTES:
+        await answer(
+            interaction,
+            f"La duración debe estar entre 1 y "
+            f"{MAX_MODIFIER_DURATION_MINUTES} minutos.",
+        )
+        return
+
+    trigger_numerator = None
+    trigger_denominator = None
+    if probabilidad is not None:
+        parsed_probability, probability_error = parse_modifier_probability(
+            probabilidad
+        )
+        if probability_error is not None or parsed_probability is None:
+            await answer(
+                interaction,
+                probability_error or "La probabilidad no es válida.",
+            )
+            return
+        trigger_numerator, trigger_denominator = parsed_probability
+
+    target_section = None
+    if apartado is not None:
+        target_section = await resolve_shop_section(
+            guild.id,
+            shop_section_name(apartado),
+        )
+        if target_section is None:
+            await answer(
+                interaction,
+                "La categoría de destino no existe. Créala primero con "
+                "`/configurarcategoria`.",
+            )
+            return
+
+    set_emoji = emoji is not None
+    final_emoji = None
+    if set_emoji:
+        emoji_value = edited_badge_emoji(emoji)
+        final_emoji, emoji_error = await resolve_configured_emoji(
+            guild,
+            emoji_value,
+        )
+        if emoji_error is not None:
+            await answer(interaction, emoji_error)
+            return
+        if final_emoji is not None and (
+            len(final_emoji) > 100 or "\n" in final_emoji
+        ):
+            await answer(interaction, "El emoji no es válido o es demasiado largo.")
+            return
+
+    final_description = None
+    if descripcion is not None:
+        final_description = descripcion.strip()
+        if not final_description or len(final_description) > 1000:
+            await answer(
+                interaction,
+                "La descripción debe tener entre 1 y 1.000 caracteres.",
+            )
+            return
+
+    category_objects = await bot.db.list_category_configured_objects(
+        guild.id,
+        source_section,
+    )
+    badge_count = len(category_objects["badges"])
+    modifier_count = len(category_objects["modifiers"])
+    ticket_count = len(category_objects["tickets"])
+    total_count = badge_count + modifier_count + ticket_count
+    if total_count == 0:
+        await answer(
+            interaction,
+            f"La categoría **{source_section}** no contiene objetos configurados.",
+        )
+        return
+    if rol_color is not None and badge_count:
+        if not role_can_be_managed(rol_color):
+            await answer(interaction, "El rol de color debe estar debajo del rol del bot.")
+            return
+        conflicting_badges = [
+            row["name"]
+            for row in category_objects["badges"]
+            if row["badge_role_id"] == rol_color.id
+        ]
+        if conflicting_badges:
+            await answer(
+                interaction,
+                "Ese rol es el rol de propiedad de estas insignias y no puede "
+                f"usarse también como color: **{', '.join(conflicting_badges[:10])}**.",
+            )
+            return
+
+    set_message_source = copiar_mensajes_de is not None
+    message_source_modifier_id = None
+    message_source_label = None
+    if set_message_source:
+        unlink_requested = normalize_name(copiar_mensajes_de or "") in {
+            "quitar",
+            "ninguno",
+            "propios",
+        }
+        if unlink_requested:
+            message_source_label = "Quitar vínculo y conservar mensajes actuales"
+        else:
+            source_modifier = await find_modifier(
+                interaction,
+                copiar_mensajes_de or "",
+            )
+            if source_modifier is None:
+                await answer(
+                    interaction,
+                    "El modificador cuyos mensajes quieres vincular no existe.",
+                )
+                return
+            message_source_modifier_id = source_modifier["id"]
+            message_source_label = f"Vincular a {source_modifier['name']}"
+            if any(
+                row["id"] == message_source_modifier_id
+                for row in category_objects["modifiers"]
+            ):
+                await answer(
+                    interaction,
+                    "La fuente de mensajes pertenece a la misma categoría. "
+                    "Eso haría que intentara vincularse consigo misma; selecciona "
+                    "un modificador de otra categoría.",
+                )
+                return
+
+    common_requested = any(
+        value is not None for value in (comprable, precio, apartado, emoji)
+    )
+    badge_requested = rol_color is not None or permitir_whitelist is not None
+    modifier_requested = any(
+        value is not None
+        for value in (
+            tipo_modificador,
+            probabilidad,
+            cooldown,
+            duracion,
+            copiar_mensajes_de,
+        )
+    )
+    ticket_requested = descripcion is not None or activo is not None
+    applicable_count = (
+        (total_count if common_requested else 0)
+        + (badge_count if badge_requested else 0)
+        + (modifier_count if modifier_requested else 0)
+        + (ticket_count if ticket_requested else 0)
+    )
+    if applicable_count == 0:
+        await answer(
+            interaction,
+            "La categoría no contiene objetos compatibles con las opciones indicadas.",
+        )
+        return
+
+    changes: list[str] = []
+    if comprable is not None:
+        changes.append(f"• Comprable: **{'Sí' if comprable else 'No'}**")
+    if precio is not None:
+        changes.append(f"• Precio: **{money(precio, guild.id)}**")
+    if target_section is not None:
+        changes.append(f"• Nueva categoría: **{target_section}**")
+    if set_emoji:
+        changes.append(f"• Emoji: {final_emoji or '**Ninguno**'}")
+    if rol_color is not None:
+        changes.append(f"• Rol de color de insignias: {rol_color.mention}")
+    if permitir_whitelist is not None:
+        changes.append(
+            f"• Whitelist de insignias: "
+            f"**{'Sí' if permitir_whitelist else 'No'}**"
+        )
+    if tipo_modificador is not None:
+        changes.append(
+            f"• Tipo de modificadores: "
+            f"**{modifier_scope_label(tipo_modificador.value)}**"
+        )
+    if trigger_numerator is not None and trigger_denominator is not None:
+        changes.append(
+            f"• Probabilidad: "
+            f"**{modifier_probability_label(trigger_numerator, trigger_denominator)}**"
+        )
+    if cooldown is not None:
+        changes.append(f"• Cooldown: **{cooldown} segundos**")
+    if duracion is not None:
+        changes.append(f"• Duración: **{duracion} minutos**")
+    if message_source_label is not None:
+        changes.append(f"• Mensajes: **{message_source_label}**")
+    if final_description is not None:
+        changes.append(f"• Descripción de tickets: {final_description[:300]}")
+    if activo is not None:
+        changes.append(f"• Tickets activos: **{'Sí' if activo else 'No'}**")
+    changes_text = "\n".join(changes)
+
+    update_options = {
+        "guild_id": guild.id,
+        "source_shop_section": source_section,
+        "purchasable": comprable,
+        "price": precio,
+        "set_shop_section": apartado is not None,
+        "target_shop_section": target_section,
+        "set_emoji": set_emoji,
+        "emoji": final_emoji,
+        "color_role_id": rol_color.id if rol_color is not None else None,
+        "whitelist_enabled": permitir_whitelist,
+        "trigger_numerator": trigger_numerator,
+        "trigger_denominator": trigger_denominator,
+        "cooldown_seconds": cooldown,
+        "duration_minutes": duracion,
+        "effect_scope": (
+            tipo_modificador.value if tipo_modificador is not None else None
+        ),
+        "set_message_source": set_message_source,
+        "message_source_modifier_id": message_source_modifier_id,
+        "ticket_description": final_description,
+        "ticket_active": activo,
+    }
+    view = CategoryEditConfirmView(
+        interaction.user.id,
+        guild,
+        source_section,
+        changes_text,
+        update_options,
+        interaction,
+    )
+    await interaction.response.send_message(
+        f"⚠️ Vas a editar los objetos de **{source_section}**:\n"
+        f"**{badge_count} insignias**, **{modifier_count} modificadores** y "
+        f"**{ticket_count} tickets**.\n\n{changes_text}\n\n"
+        "Las opciones específicas solo se aplicarán al tipo correspondiente. "
+        "¿Confirmas?",
+        view=view,
+        ephemeral=True,
+    )
+
+
 async def delete_configured_object(
     interaction: discord.Interaction,
     item_type: str,
@@ -8284,7 +8782,7 @@ async def ayuda(interaction: discord.Interaction, admin: bool = False) -> None:
             value=(
                 "`/configurarcategoria` · `/configurarinsignia`\n"
                 "`/configurarmodificador` · `/configurarticket`\n"
-                "`/editar` · `/editarmensajes`\n"
+                "`/editar` · `/editarporcategoria` · `/editarmensajes`\n"
                 "`/configurardiaria`\n"
                 "`/añadiradmin` · `/quitaradmin` · `/admins`\n"
                 "`/añadirwhitelist` · `/quitarwhitelist` · `/whitelist`\n"

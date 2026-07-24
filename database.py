@@ -1448,6 +1448,363 @@ class Database:
                 )
                 return True
 
+    async def list_category_configured_objects(
+        self,
+        guild_id: int,
+        shop_section: str,
+    ) -> dict:
+        category_filter = """
+            guild_id = $1
+            AND LOWER(
+                COALESCE(NULLIF(BTRIM(shop_section), ''), 'General')
+            ) = LOWER($2)
+        """
+        async with self._pool().acquire() as connection:
+            badges = await connection.fetch(
+                f"""
+                SELECT id, name, badge_role_id, color_role_id
+                FROM badges
+                WHERE {category_filter}
+                ORDER BY name
+                """,
+                guild_id,
+                shop_section,
+            )
+            modifiers = await connection.fetch(
+                f"""
+                SELECT id, name, message_source_modifier_id
+                FROM modifiers
+                WHERE {category_filter}
+                ORDER BY name
+                """,
+                guild_id,
+                shop_section,
+            )
+            tickets = await connection.fetch(
+                f"""
+                SELECT id, name
+                FROM tickets
+                WHERE {category_filter}
+                ORDER BY name
+                """,
+                guild_id,
+                shop_section,
+            )
+        return {
+            "badges": badges,
+            "modifiers": modifiers,
+            "tickets": tickets,
+        }
+
+    async def update_objects_by_category(
+        self,
+        guild_id: int,
+        source_shop_section: str,
+        purchasable: bool | None,
+        price: int | None,
+        set_shop_section: bool,
+        target_shop_section: str | None,
+        set_emoji: bool,
+        emoji: str | None,
+        color_role_id: int | None,
+        whitelist_enabled: bool | None,
+        trigger_numerator: int | None,
+        trigger_denominator: int | None,
+        cooldown_seconds: int | None,
+        duration_minutes: int | None,
+        effect_scope: str | None,
+        set_message_source: bool,
+        message_source_modifier_id: int | None,
+        ticket_description: str | None,
+        ticket_active: bool | None,
+    ) -> dict:
+        category_filter = """
+            guild_id = $1
+            AND LOWER(
+                COALESCE(NULLIF(BTRIM(shop_section), ''), 'General')
+            ) = LOWER($2)
+        """
+        async with self._pool().acquire() as connection:
+            async with connection.transaction():
+                category = await connection.fetchrow(
+                    """
+                    SELECT name
+                    FROM shop_categories
+                    WHERE guild_id = $1 AND LOWER(name) = LOWER($2)
+                    FOR SHARE
+                    """,
+                    guild_id,
+                    source_shop_section,
+                )
+                category_name = (
+                    category["name"]
+                    if category is not None
+                    else (
+                        "General"
+                        if source_shop_section.strip().casefold() == "general"
+                        else None
+                    )
+                )
+                if category_name is None:
+                    return {"status": "category_missing"}
+
+                badge_rows = await connection.fetch(
+                    f"""
+                    SELECT id, name, badge_role_id
+                    FROM badges
+                    WHERE {category_filter}
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    source_shop_section,
+                )
+                modifier_rows = await connection.fetch(
+                    f"""
+                    SELECT id, name
+                    FROM modifiers
+                    WHERE {category_filter}
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    source_shop_section,
+                )
+                ticket_rows = await connection.fetch(
+                    f"""
+                    SELECT id, name
+                    FROM tickets
+                    WHERE {category_filter}
+                    FOR UPDATE
+                    """,
+                    guild_id,
+                    source_shop_section,
+                )
+                if not badge_rows and not modifier_rows and not ticket_rows:
+                    return {"status": "empty"}
+
+                if color_role_id is not None:
+                    conflicting_badges = [
+                        row["name"]
+                        for row in badge_rows
+                        if row["badge_role_id"] == color_role_id
+                    ]
+                    if conflicting_badges:
+                        return {
+                            "status": "color_role_conflict",
+                            "conflicting_badges": conflicting_badges,
+                        }
+
+                if set_shop_section and target_shop_section is not None:
+                    target_category_exists = await connection.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM shop_categories
+                            WHERE guild_id = $1
+                              AND LOWER(name) = LOWER($2)
+                        )
+                        """,
+                        guild_id,
+                        target_shop_section,
+                    )
+                    if (
+                        not target_category_exists
+                        and target_shop_section.strip().casefold() != "general"
+                    ):
+                        return {"status": "target_category_missing"}
+
+                if set_message_source and message_source_modifier_id is not None:
+                    source_id = await connection.fetchval(
+                        """
+                        SELECT id
+                        FROM modifiers
+                        WHERE guild_id = $1 AND id = $2
+                        FOR SHARE
+                        """,
+                        guild_id,
+                        message_source_modifier_id,
+                    )
+                    if source_id is None:
+                        return {"status": "message_source_missing"}
+                    source_chain_ids = await connection.fetchval(
+                        """
+                        WITH RECURSIVE source_chain AS (
+                            SELECT id, message_source_modifier_id,
+                                   ARRAY[id]::BIGINT[] AS visited_ids
+                            FROM modifiers
+                            WHERE guild_id = $1 AND id = $2
+
+                            UNION ALL
+
+                            SELECT source.id,
+                                   source.message_source_modifier_id,
+                                   chain.visited_ids || source.id
+                            FROM source_chain AS chain
+                            JOIN modifiers AS source
+                              ON source.id = chain.message_source_modifier_id
+                             AND source.guild_id = $1
+                            WHERE NOT source.id = ANY(chain.visited_ids)
+                              AND CARDINALITY(chain.visited_ids) < 50
+                        )
+                        SELECT COALESCE(
+                            ARRAY_AGG(id),
+                            ARRAY[]::BIGINT[]
+                        )
+                        FROM source_chain
+                        """,
+                        guild_id,
+                        message_source_modifier_id,
+                    )
+                    await connection.fetch(
+                        """
+                        SELECT id
+                        FROM modifiers
+                        WHERE guild_id = $1
+                          AND id = ANY($2::BIGINT[])
+                        FOR SHARE
+                        """,
+                        guild_id,
+                        source_chain_ids,
+                    )
+                    conflicting_modifiers = [
+                        row["name"]
+                        for row in modifier_rows
+                        if row["id"] in source_chain_ids
+                    ]
+                    if conflicting_modifiers:
+                        return {
+                            "status": "message_cycle",
+                            "conflicting_modifiers": conflicting_modifiers,
+                        }
+
+                common_arguments = (
+                    guild_id,
+                    source_shop_section,
+                    purchasable,
+                    price,
+                    set_shop_section,
+                    target_shop_section,
+                    set_emoji,
+                    emoji,
+                )
+                await connection.execute(
+                    f"""
+                    UPDATE badges
+                    SET purchasable = COALESCE($3, purchasable),
+                        price = CASE
+                            WHEN COALESCE($3, purchasable)
+                                THEN COALESCE($4, price)
+                            ELSE 0
+                        END,
+                        shop_section = CASE
+                            WHEN NOT COALESCE($3, purchasable) THEN NULL
+                            WHEN $5 THEN $6
+                            ELSE COALESCE(
+                                NULLIF(BTRIM(shop_section), ''),
+                                $2
+                            )
+                        END,
+                        emoji = CASE WHEN $7 THEN $8 ELSE emoji END,
+                        color_role_id = COALESCE($9, color_role_id),
+                        whitelist_enabled = COALESCE(
+                            $10,
+                            whitelist_enabled
+                        )
+                    WHERE {category_filter}
+                    """,
+                    *common_arguments,
+                    color_role_id,
+                    whitelist_enabled,
+                )
+                await connection.execute(
+                    f"""
+                    UPDATE modifiers
+                    SET purchasable = COALESCE($3, purchasable),
+                        price = CASE
+                            WHEN COALESCE($3, purchasable)
+                                THEN COALESCE($4, price)
+                            ELSE 0
+                        END,
+                        shop_section = CASE
+                            WHEN NOT COALESCE($3, purchasable) THEN NULL
+                            WHEN $5 THEN $6
+                            ELSE COALESCE(
+                                NULLIF(BTRIM(shop_section), ''),
+                                $2
+                            )
+                        END,
+                        emoji = CASE WHEN $7 THEN $8 ELSE emoji END,
+                        trigger_numerator = COALESCE(
+                            $9,
+                            trigger_numerator
+                        ),
+                        trigger_denominator = COALESCE(
+                            $10,
+                            trigger_denominator
+                        ),
+                        cooldown_seconds = COALESCE(
+                            $11,
+                            cooldown_seconds
+                        ),
+                        duration_minutes = COALESCE(
+                            $12,
+                            duration_minutes
+                        ),
+                        effect_scope = COALESCE($13, effect_scope),
+                        messages = CASE
+                            WHEN $14 AND $15 IS NULL
+                                THEN resolve_modifier_messages(id)
+                            WHEN $14 THEN ARRAY[]::TEXT[]
+                            ELSE messages
+                        END,
+                        message_source_modifier_id = CASE
+                            WHEN $14 THEN $15
+                            ELSE message_source_modifier_id
+                        END
+                    WHERE {category_filter}
+                    """,
+                    *common_arguments,
+                    trigger_numerator,
+                    trigger_denominator,
+                    cooldown_seconds,
+                    duration_minutes,
+                    effect_scope,
+                    set_message_source,
+                    message_source_modifier_id,
+                )
+                await connection.execute(
+                    f"""
+                    UPDATE tickets
+                    SET purchasable = COALESCE($3, purchasable),
+                        price = CASE
+                            WHEN COALESCE($3, purchasable)
+                                THEN COALESCE($4, price)
+                            ELSE 0
+                        END,
+                        shop_section = CASE
+                            WHEN NOT COALESCE($3, purchasable) THEN NULL
+                            WHEN $5 THEN $6
+                            ELSE COALESCE(
+                                NULLIF(BTRIM(shop_section), ''),
+                                $2
+                            )
+                        END,
+                        emoji = CASE WHEN $7 THEN $8 ELSE emoji END,
+                        description = COALESCE($9, description),
+                        active = COALESCE($10, active)
+                    WHERE {category_filter}
+                    """,
+                    *common_arguments,
+                    ticket_description,
+                    ticket_active,
+                )
+                return {
+                    "status": "updated",
+                    "category_name": category_name,
+                    "badges": len(badge_rows),
+                    "modifiers": len(modifier_rows),
+                    "tickets": len(ticket_rows),
+                }
+
     async def delete_shop_category(
         self,
         guild_id: int,
